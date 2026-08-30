@@ -27,7 +27,6 @@ export type RenderParameters = {
   theme: ColorTheme;
 };
 
-const MAX_DISPLAY_WIDTH = 1920;
 const WINNER_TEXT_OFFSET = 30;
 const RESULT_PANEL_MAX_WIDTH_RATIO = 0.9;
 const RESULT_PANEL_MAX_HEIGHT_RATIO = 0.8;
@@ -79,13 +78,16 @@ function drawResultCloseCircle(
 
 export class RouletteRenderer {
   protected _canvas!: HTMLCanvasElement;
-  protected _sceneCanvas!: HTMLCanvasElement;
   protected ctx!: CanvasRenderingContext2D;
-  private _displayCtx!: CanvasRenderingContext2D;
   private _logicalWidth = canvasWidth;
   private _logicalHeight = canvasHeight;
   private _renderScale: RenderScale = 0.5;
-  private _renderFactor = 1;
+  private _logicalToPhysicalScale = 1;
+  private _dprMediaQueryList: MediaQueryList | null = null;
+  private _resizeHandler = () => {
+    this.resize();
+    this.watchDevicePixelRatio();
+  };
   public sizeFactor = 1;
 
   protected _images: { [key: string]: HTMLImageElement } = {};
@@ -118,31 +120,52 @@ export class RouletteRenderer {
   }
 
   public resize(entries?: ResizeObserverEntry[]): void {
-    if (!this._canvas || !this._sceneCanvas) return;
+    if (!this._canvas) return;
 
     const realSize = entries?.[0]?.contentRect ?? this._canvas.getBoundingClientRect();
     if (realSize.width <= 0 || realSize.height <= 0) return;
 
-    const displayWidth = Math.min(realSize.width, MAX_DISPLAY_WIDTH);
     // Keep the logical viewport's minimum for framing, but derive the physical
     // backing resolution solely from the display size and selected quality.
     const logicalWidth = Math.max(realSize.width / 2, 640);
     const logicalHeight = (logicalWidth / realSize.width) * realSize.height;
-    const physicalWidth = Math.max(1, Math.round(displayWidth * this._renderScale));
+    const devicePixelRatio =
+      typeof window !== 'undefined' && Number.isFinite(window.devicePixelRatio) && window.devicePixelRatio > 0
+        ? window.devicePixelRatio
+        : 1;
+    const physicalWidth = Math.max(1, Math.round(realSize.width * devicePixelRatio * this._renderScale));
     const physicalHeight = Math.max(1, Math.round((physicalWidth / realSize.width) * realSize.height));
 
     this._logicalWidth = logicalWidth;
     this._logicalHeight = logicalHeight;
-    this._renderFactor = physicalWidth / logicalWidth;
-    this._sceneCanvas.width = physicalWidth;
-    this._sceneCanvas.height = physicalHeight;
+    this._logicalToPhysicalScale = physicalWidth / logicalWidth;
     this.sizeFactor = logicalWidth / realSize.width;
 
-    this._canvas.width = displayWidth;
-    this._canvas.height = (displayWidth / realSize.width) * realSize.height;
-    this._displayCtx.imageSmoothingEnabled = true;
-    if ('imageSmoothingQuality' in this._displayCtx) {
-      this._displayCtx.imageSmoothingQuality = 'high';
+    this._canvas.width = physicalWidth;
+    this._canvas.height = physicalHeight;
+  }
+
+  private watchDevicePixelRatio(): void {
+    if (this._dprMediaQueryList) {
+      if (typeof this._dprMediaQueryList.removeEventListener === 'function') {
+        this._dprMediaQueryList.removeEventListener('change', this._resizeHandler);
+      }
+      if (typeof this._dprMediaQueryList.removeListener === 'function') {
+        this._dprMediaQueryList.removeListener(this._resizeHandler);
+      }
+    }
+    this._dprMediaQueryList = null;
+
+    if (typeof window === 'undefined' || typeof window.matchMedia !== 'function') return;
+
+    const devicePixelRatio =
+      Number.isFinite(window.devicePixelRatio) && window.devicePixelRatio > 0 ? window.devicePixelRatio : 1;
+    this._dprMediaQueryList = window.matchMedia(`(resolution: ${devicePixelRatio}dppx)`);
+
+    if (typeof this._dprMediaQueryList.addEventListener === 'function') {
+      this._dprMediaQueryList.addEventListener('change', this._resizeHandler);
+    } else if (typeof this._dprMediaQueryList.addListener === 'function') {
+      this._dprMediaQueryList.addListener(this._resizeHandler);
     }
   }
 
@@ -150,16 +173,7 @@ export class RouletteRenderer {
     await this._load();
 
     this._canvas = document.createElement('canvas');
-    this._canvas.width = canvasWidth;
-    this._canvas.height = canvasHeight;
-    this._displayCtx = this._canvas.getContext('2d', {
-      alpha: false,
-    }) as CanvasRenderingContext2D;
-
-    this._sceneCanvas = document.createElement('canvas');
-    this._sceneCanvas.width = canvasWidth;
-    this._sceneCanvas.height = canvasHeight;
-    this.ctx = this._sceneCanvas.getContext('2d', {
+    this.ctx = this._canvas.getContext('2d', {
       alpha: false,
     }) as CanvasRenderingContext2D;
 
@@ -168,6 +182,8 @@ export class RouletteRenderer {
     const resizeObserver = new ResizeObserver((entries) => this.resize(entries));
 
     resizeObserver.observe(this._canvas);
+    window.addEventListener('resize', this._resizeHandler);
+    this.watchDevicePixelRatio();
     this.resize();
   }
 
@@ -218,7 +234,7 @@ export class RouletteRenderer {
     const logicalHeight = this.height;
 
     this.ctx.setTransform(1, 0, 0, 1, 0, 0);
-    this.ctx.scale(this._renderFactor, this._renderFactor);
+    this.ctx.scale(this._logicalToPhysicalScale, this._logicalToPhysicalScale);
     this.ctx.fillStyle = this._theme.background;
     this.ctx.fillRect(0, 0, logicalWidth, logicalHeight);
 
@@ -245,8 +261,6 @@ export class RouletteRenderer {
     renderParameters.particleManager.render(this.ctx);
     this.renderWinnerProgress(renderParameters);
     this.renderResult(renderParameters);
-
-    this._displayCtx.drawImage(this._sceneCanvas, 0, 0, this._canvas.width, this._canvas.height);
   }
 
   private renderEntities(entities: MapEntityState[]) {
