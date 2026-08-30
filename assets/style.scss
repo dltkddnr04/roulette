@@ -1,7 +1,6 @@
 :root {
   --copyright-color: white;
 }
-
 :root.light {
   --copyright-color: black;
 }
@@ -65,10 +64,6 @@ div.copyright a {
 
   &.shuffle {
     mask-image: url('images/shuffle.svg');
-  }
-
-  &.megaphone {
-    mask-image: url('images/megaphone.svg');
   }
 
   &.record {
@@ -153,27 +148,6 @@ div.copyright a {
       background: rgba(0, 0, 0, 0.5);
     }
 
-    &#btnShop {
-      height: 35px;
-
-      img {
-        width: 25px;
-        height: 25px;
-      }
-    }
-
-    &.new::before {
-      position: absolute;
-      background: #AA0000;
-      color: white;
-      content: 'NEW';
-      font-size: 9px;
-      padding: 2px 4px;
-      right: -10px;
-      top: -4px;
-      border-radius: 6px;
-      z-index: 1;
-    }
   }
 
   div.theme {
@@ -364,74 +338,6 @@ div.copyright a {
   }
 }
 
-#notice {
-  display: none;
-  position: fixed;
-  overflow: hidden;
-  top: 50%;
-  left: 50%;
-  width: 500px;
-  max-width: 90%;
-  transform: translate(-50%, -50%);
-  background: rgba(255, 255, 255, 0.9);
-  border-radius: 30px;
-  z-index: 1001;
-  padding: 10px 10px;
-  color: #333;
-  flex-direction: column;
-
-  h2 {
-    background-color: #58c9af;
-    margin: -10px -10px 0 -10px;
-    padding: 10px 5px 10px .5em;
-    border-bottom: 4px solid #2c8470;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    color: black;
-    text-transform: uppercase;
-    font-weight: bold;
-    font-size: 2em;
-  }
-
-  div.notice-body {
-    padding: 0 .5em;
-
-    h3 {
-      font-size: 1.5em;
-      margin: .83em 0;
-    }
-  }
-
-  div.notice-action {
-    display: flex;
-    justify-content: center;
-
-    button {
-      color: #fefefe;
-      background: #222;
-      border: none;
-      border-radius: 10px;
-      padding: 5px 10px;
-      position: relative;
-      overflow: hidden;
-      width: 50%;
-      height: 50px;
-      font-size: 20px;
-
-      &:active:after {
-        content: '';
-        position: absolute;
-        left: 0;
-        top: 0;
-        right: 0;
-        bottom: 0;
-        background: rgba(0, 0, 0, 0.5);
-      }
-    }
-  }
-}
-
 @media screen and (max-width: 750px) {
   #settings {
     bottom: 60px;
@@ -524,29 +430,6 @@ div.copyright a {
   }
 
 
-  #notice {
-    position: fixed;
-    box-sizing: border-box;
-    top: 0;
-    left: 0;
-    width: 100%;
-    max-width: 100%;
-    height: 100%;
-    transform: none;
-    background: rgba(255, 255, 255, 0.9);
-    border-radius: 4px;
-    z-index: 1001;
-    padding: 5px 10px;
-    color: #333;
-    display: none;
-    flex-direction: column;
-
-    div.notice-body {
-      flex-grow: 1;
-    }
-
-  }
-
 }
 
 div.toast {
@@ -594,32 +477,4 @@ div.toast {
   margin-bottom: 1em;
   text-decoration: none;
   text-shadow: -2px 0px black, 0px 2px black, 2px 0px black, 0px -2px black;
-}
-
-
-.shop-button {
-  display: flex;
-  flex-direction: row;
-  align-items: center;
-  justify-content: center;
-  padding: .2em .4em .4em .4em;
-  margin: 0 auto;
-  width: fit-content;
-
-  color: white;
-  font-size: 32px;
-  line-height: 48px;
-  font-weight: bold;
-  text-decoration: none;
-
-  img {
-    width: 48px;
-    height: 48px;
-    margin-right: .2em;
-    margin-bottom: -4px;
-  }
-
-  background-color: #0077ff;
-  border: 2px solid black;
-  border-radius: 10px;
 }
