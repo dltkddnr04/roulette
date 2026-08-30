@@ -1,105 +1,47 @@
 # Marble Roulette
 
-A self-hostable marble roulette for visual lucky draws, powered by `box2d-wasm`.
+[lazygyu/roulette](https://github.com/lazygyu/roulette)를 기반으로 한 Marble Roulette 포크입니다.
 
-This repository is a fork of [lazygyu/roulette](https://github.com/lazygyu/roulette). It keeps the original game and map foundation while focusing on self-hosting, predictable simulation timing, high-refresh-rate rendering, and operator-controlled customization.
+원본의 디자인과 사용 방식은 그대로 유지하면서 광고·추적을 제거하고, 고해상도/고주사율 환경에 맞게 렌더링과 시뮬레이션을 개선하고, 자체 호스팅과 로컬 Sponsor 기능을 추가했습니다.
 
-## What changed from upstream
+## 왜 만들었나요?
 
-- Removed the upstream commercial advertising service, preroll/result ad overlays, impression tracking, external keyword/sprite service, and analytics integrations.
-- Added local Sponsor/Branding controls: upload multiple images, persist them as Blobs in IndexedDB, select one from a dropdown, temporarily disable rendering with an `enabled` toggle, and delete selected images.
-- The selected sponsor image is rendered on every `StageDef.adBoards` position as a world-space billboard, preserving its aspect ratio with contain fitting. It naturally follows the camera, zoom, and DPR and is included in recordings.
-- Added Cloudflare Workers Static Assets deployment support.
-- Simplified rendering from a permanent two-canvas pipeline to one visible canvas.
-- Added DPR-aware render quality modes:
-  - **Performance**: `0.5x`
-  - **Native**: `1x`
-- Added render interpolation for marbles and moving map entities.
-- Normalized camera smoothing across display refresh rates.
-- Kept Box2D and game logic on a fixed `10 ms` simulation step.
-- Slow motion and fast-forward change fixed-step cadence instead of changing the Box2D timestep.
-- Preserve unprocessed simulation budget as debt instead of dropping elapsed time after foreground stalls.
-- Perform marble ordering on the fixed simulation clock rather than once per render frame.
-- Remove finished marble bodies before the next physics step so winners cannot affect later collisions.
-- Hardened recording fallback, MIME/container handling, input parsing, asset failures, and rendering edge cases.
-- Normalized map rotation values to radians where legacy data used degree-like values.
+군교회에서 예배 후 점심식사 설거지 담당자를 뽑기 위해 Marble Roulette를 사용하던 중 하필 암호화폐 광고가 나타났습니다.
 
-## Simulation model
+그 자리에서 “상욱 형제, 이 광고 뭡니까? 혹시 상욱 형제가 돈 받은 것은 아니죠?”라는 농담을 전 교인 앞에서 듣고, 그날 광고를 제거하려고 급하게 포크했습니다.
 
-The runtime separates three concerns:
+처음 목적은 정말 광고 제거뿐이었습니다. 그런데 기왕 행사용으로 계속 쓸 거라면 화질도 올려보자는 생각이 들었고, 움직임과 시뮬레이션도 손보기 시작했고, Sponsor 기능까지 추가하게 됐습니다.
 
-1. **Presentation clock** — `requestAnimationFrame`, camera smoothing, and rendering.
-2. **Scheduler budget** — controls how frequently fixed simulation steps are executed for normal, slow-motion, and fast-forward playback.
-3. **Simulation clock** — Box2D and marble game logic always advance in fixed `10 ms` steps.
+**원본 Marble Roulette의 경험과 디자인은 유지하고, 내부를 더 나은 방향으로 바꿉니다.**
 
-Rendering interpolates between simulation snapshots, so a high-refresh-rate display can present smoother motion without changing the physics timestep.
+## 주요 변경점
 
-The project still uses `Math.random()` for shuffle and game randomness. Runs are therefore not seeded or bit-for-bit reproducible; the timing work is intended to prevent render-frame grouping and display refresh rate from unnecessarily influencing simulation order.
+- 상업 광고, 외부 광고/키워드 API, 추적 및 분석 코드 제거
+- DPR-aware 렌더링과 **Performance 0.5x / Native 1x** 화질 모드
+- 고주사율 디스플레이를 위한 렌더 보간과 주사율 독립적인 카메라 움직임
+- Box2D를 고정 **10 ms** 스텝으로 유지하고 렌더링과 시뮬레이션 시간을 분리
+- 로컬 이미지 기반 **Branding & Sponsors** 기능
+- Cloudflare Workers Static Assets 기반 자체 호스팅
+- 입력, 녹화, 에셋 로딩 및 여러 렌더링 예외 처리 강화
 
-## Input
+## 다음 목표
 
-Names may include an optional positive integer weight and/or count:
+방송에서 참가자를 더 쉽게 받을 수 있도록 Twitch/CHZZK 채팅의 `/join` 명령과 QR/Web 참가 기능을 검토하고 있습니다.
 
-```text
-Alice
-Alice/2
-Alice*3
-Alice/2*3
-Alice*3/2
-```
+## 개발
 
-Malformed modifiers, non-positive values, and trailing junk are rejected. A hard safety ceiling of **1000 marbles** prevents accidental or hostile input from creating unbounded arrays and Box2D bodies.
-
-## Requirements
-
-- Node.js
-- Yarn
-- TypeScript
-- Parcel
-- `box2d-wasm`
-
-## Development
-
-```shell
+```sh
 yarn
 yarn dev
 ```
 
-The development server runs on port `1235` by default.
-
-## Build
-
-```shell
-yarn build
-```
-
-The production build is generated in `dist/` with the public URL rooted at `/`.
-
-Useful validation commands:
-
-```shell
-corepack yarn build
-git diff --check
-npx biome check src/
-```
-
-## Cloudflare Workers deployment
-
-The repository includes `wrangler.jsonc` configured to serve `./dist` through Cloudflare Workers Static Assets.
-
-```shell
+```sh
 yarn build
 yarn deploy
 ```
 
-`yarn deploy` runs `wrangler deploy`.
+## 라이선스
 
-## Sponsor / Branding
+[MIT License](LICENSE)로 배포됩니다.
 
-Sponsor images are local and operator-controlled. Multiple images can be uploaded and persist as Blobs in IndexedDB; one can be selected from the dropdown, temporarily disabled with the `enabled` toggle, or deleted. When enabled and an image is selected, that image is rendered with contain fitting on every `StageDef.adBoards` position in world space, so it follows camera movement and zoom and is included in DPR-aware rendering and recordings. If no image is available or selected, nothing is rendered.
-
-This fork has no external advertising API, sponsor fetch, tracking, click links, preroll, or result overlay.
-
-## License
-
-This project remains distributed under the [MIT License](LICENSE). Original project credit belongs to [lazygyu/roulette](https://github.com/lazygyu/roulette).
+원본 프로젝트: [Marble Roulette](https://lazygyu.github.io/roulette/) by [LazyGyu](https://github.com/lazygyu)
