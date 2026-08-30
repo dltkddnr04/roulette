@@ -431,14 +431,21 @@ export class Roulette extends EventTarget {
     this._winnerRange = clipWinnerRange(options.winnerRange, this._marbles.length);
     this._camera.startFollowingMarbles();
 
-    if (this._autoRecording) {
-      this._recorder.start().then(() => {
-        this.physics.start();
-        this._marbles.forEach((marble) => (marble.isActive = true));
-      });
-    } else {
+    const startPhysics = () => {
       this.physics.start();
       this._marbles.forEach((marble) => (marble.isActive = true));
+    };
+
+    if (this._autoRecording) {
+      this._recorder
+        .start()
+        .then(startPhysics)
+        .catch((e) => {
+          console.error('recording failed to start', e);
+          startPhysics();
+        });
+    } else {
+      startPhysics();
     }
   }
 
