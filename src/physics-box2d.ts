@@ -162,8 +162,9 @@ export class Box2dPhysics implements IPhysics {
       const distSq = distVector.LengthSquared();
 
       if (distSq < 100) {
+        const distance = Math.sqrt(distSq);
         distVector.Normalize();
-        const power = 1 - distVector.Length() / 10;
+        const power = 1 - distance / 10;
         distVector.op_mul(power * power * 5);
         body.ApplyLinearImpulseToCenter(distVector, true);
       }

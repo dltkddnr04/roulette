@@ -46,7 +46,8 @@ export class FastForwader implements UIObject {
     return this.bound;
   }
 
-  onMouseDown?(_e?: MouseEventArgs): void {
+  onMouseDown?(e?: MouseEventArgs): void {
+    if (!e) return;
     this.isEnabled = true;
   }
 
