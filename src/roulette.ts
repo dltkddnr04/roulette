@@ -144,6 +144,9 @@ export class Roulette extends EventTarget {
 
       this._capturePreviousTransforms();
       this.physics.step(this._updateInterval / 1000);
+      if (this._marbles.length > 1) {
+        this._marbles.sort((a, b) => b.y - a.y || a.id - b.id);
+      }
       this._currentEntities = this._copyEntityStates(this.physics.getEntities());
       this._updateMarbles(this._updateInterval);
       this._particleManager.update(this._updateInterval);
@@ -163,10 +166,6 @@ export class Roulette extends EventTarget {
     }
     this._elapsed = accumulatedTime;
     const alpha = this._elapsed / stepBudget;
-
-    if (this._marbles.length > 1) {
-      this._marbles.sort((a, b) => b.y - a.y);
-    }
 
     if (this._stage) {
       this._camera.update({
