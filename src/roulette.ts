@@ -58,10 +58,6 @@ export class Roulette extends EventTarget {
   /** 진행 중에는 null, 당첨자가 모두 확정되면 당첨자 배열 */
   private _result: Marble[] | null = null;
 
-  // 구슬 id(= order)는 매 라운드 재사용된다. 리셋 시 취소하지 않으면 이 타이머가
-  // 뒤늦게 발화해 같은 id를 가진 새 라운드의 구슬을 지워버린다
-  private _pendingRemovals: number[] = [];
-
   private _uiObjects: UIObject[] = [];
 
   private _autoRecording: boolean = false;
@@ -136,33 +132,37 @@ export class Roulette extends EventTarget {
     this._elapsed += frameDelta * this._speed * this.fastForwarder.speed;
     this._lastTime = currentTime;
 
-    const interval = (this._updateInterval / 1000) * this._timeScale;
     let accumulatedTime = this._physicsDebt + this._elapsed;
     this._physicsDebt = 0;
     let physicsSteps = 0;
 
-    while (accumulatedTime >= this._updateInterval && physicsSteps < MAX_PHYSICS_STEPS_PER_FRAME) {
+    // Keep each simulation step fixed at 10ms. Slow motion consumes more wall-clock
+    // budget per step, while debt still preserves all unprocessed simulation time.
+    while (physicsSteps < MAX_PHYSICS_STEPS_PER_FRAME) {
+      const stepBudget = this._updateInterval / this._timeScale;
+      if (accumulatedTime < stepBudget) break;
+
       this._capturePreviousTransforms();
-      this.physics.step(interval);
+      this.physics.step(this._updateInterval / 1000);
       this._currentEntities = this._copyEntityStates(this.physics.getEntities());
       this._updateMarbles(this._updateInterval);
       this._particleManager.update(this._updateInterval);
       this._updateEffects(this._updateInterval);
-      accumulatedTime -= this._updateInterval;
+      accumulatedTime -= stepBudget;
       physicsSteps++;
       this._uiObjects.forEach((obj) => obj.update(this._updateInterval));
     }
 
-    // Preserve whole unprocessed steps as debt instead of dropping an arbitrary
-    // amount of simulation time. The per-frame cap prevents a long stall from
-    // monopolizing one frame; subsequent frames gradually catch the simulation up.
-    if (accumulatedTime >= this._updateInterval) {
-      const overdueSteps = Math.floor(accumulatedTime / this._updateInterval);
-      this._physicsDebt = overdueSteps * this._updateInterval;
+    // Preserve whole unprocessed step budgets as debt instead of dropping time.
+    // The per-frame cap prevents a long stall from monopolizing one frame.
+    const stepBudget = this._updateInterval / this._timeScale;
+    if (accumulatedTime >= stepBudget) {
+      const overdueSteps = Math.floor(accumulatedTime / stepBudget);
+      this._physicsDebt = overdueSteps * stepBudget;
       accumulatedTime -= this._physicsDebt;
     }
     this._elapsed = accumulatedTime;
-    const alpha = this._elapsed / this._updateInterval;
+    const alpha = this._elapsed / stepBudget;
 
     if (this._marbles.length > 1) {
       this._marbles.sort((a, b) => b.y - a.y);
@@ -186,6 +186,7 @@ export class Roulette extends EventTarget {
   private _updateMarbles(deltaTime: number) {
     if (!this._stage) return;
 
+    const finishedMarbles: Marble[] = [];
     for (let i = 0; i < this._marbles.length; i++) {
       const marble = this._marbles[i];
       marble.update(deltaTime);
@@ -194,24 +195,23 @@ export class Roulette extends EventTarget {
         this.physics.impact(marble.id);
       }
       if (marble.y > this._stage.goalY) {
+        finishedMarbles.push(marble);
         this._winners.push(marble);
         if (this._isRunning && this._isWinningRank(this._winners.length - 1)) {
           this._particleManager.shot(this._renderer.width, this._renderer.height);
         }
-        this._pendingRemovals.push(
-          window.setTimeout(() => {
-            this.physics.removeMarble(marble.id);
-          }, 500)
-        );
       }
     }
+
+    // Remove from the game list before destroying the body so no later filter or
+    // game-state path reads a goal marble through its missing physics body.
+    this._marbles = this._marbles.filter((marble) => !finishedMarbles.includes(marble));
+    finishedMarbles.forEach((marble) => this.physics.removeMarble(marble.id));
 
     const targetIndex = this._targetIndex;
     const topY = this._marbles[targetIndex] ? this._marbles[targetIndex].y : 0;
     this._goalDist = Math.abs(this._stage.zoomY - topY);
     this._timeScale = this._calcTimeScale();
-
-    this._marbles = this._marbles.filter((marble) => marble.y <= this._stage?.goalY);
 
     this._checkFinish();
   }
@@ -411,8 +411,6 @@ export class Roulette extends EventTarget {
   }
 
   public clearMarbles() {
-    this._pendingRemovals.forEach((id) => window.clearTimeout(id));
-    this._pendingRemovals = [];
     this.physics.clearMarbles();
     this._result = null;
     this._winners = [];
