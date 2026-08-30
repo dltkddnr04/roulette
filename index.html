@@ -233,6 +233,78 @@
       window.roulette.setRenderScale(value);
     });
 
+    const sponsorUpload = document.querySelector('#inSponsorFiles');
+    const sponsorSelector = document.querySelector('#sltSponsor');
+    const sponsorEnabled = document.querySelector('#chkSponsorsEnabled');
+    const sponsorDelete = document.querySelector('#btnDeleteSponsor');
+
+    async function refreshSponsorControls() {
+      try {
+        const state = await window.roulette.getSponsorState();
+        sponsorSelector.innerHTML = '';
+        const noSponsor = document.createElement('option');
+        noSponsor.value = '';
+        noSponsor.textContent = 'No sponsor selected';
+        sponsorSelector.append(noSponsor);
+        state.assets.forEach((asset) => {
+          const option = document.createElement('option');
+          option.value = asset.id;
+          option.textContent = asset.name;
+          sponsorSelector.append(option);
+        });
+        sponsorSelector.value = state.selectedAssetId || '';
+        sponsorEnabled.checked = state.enabled;
+        sponsorDelete.disabled = !state.selectedAssetId;
+      } catch (e) {
+        console.warn('Sponsor controls unavailable', e);
+      }
+    }
+
+    sponsorUpload.addEventListener('change', async (e) => {
+      const files = e.target.files ? Array.from(e.target.files) : [];
+      sponsorUpload.value = '';
+      for (const file of files) {
+        try {
+          await window.roulette.addSponsorAsset(file);
+        } catch (error) {
+          console.warn('Sponsor upload failed', error);
+          simpleToast('Unable to save sponsor image');
+        }
+      }
+      await refreshSponsorControls();
+    });
+
+    sponsorSelector.addEventListener('change', async () => {
+      try {
+        await window.roulette.selectSponsorAsset(sponsorSelector.value || null);
+        await refreshSponsorControls();
+      } catch (e) {
+        console.warn('Sponsor selection failed', e);
+      }
+    });
+
+    sponsorEnabled.addEventListener('change', async () => {
+      try {
+        await window.roulette.setSponsorsEnabled(sponsorEnabled.checked);
+      } catch (e) {
+        console.warn('Sponsor setting failed', e);
+        await refreshSponsorControls();
+      }
+    });
+
+    sponsorDelete.addEventListener('click', async () => {
+      const assetId = sponsorSelector.value;
+      if (!assetId) return;
+      try {
+        await window.roulette.deleteSponsorAsset(assetId);
+        await refreshSponsorControls();
+      } catch (e) {
+        console.warn('Sponsor deletion failed', e);
+      }
+    });
+
+    refreshSponsorControls();
+
     document.querySelector('#in_winningRank').addEventListener('change', () => selectWinnerType('custom'));
     document.querySelector('.btn-last-winner').addEventListener('click', () => selectWinnerType('last'));
     document.querySelector('.btn-first-winner').addEventListener('click', () => selectWinnerType('first'));
@@ -331,6 +403,24 @@
           <option value="0.5">Performance</option>
           <option value="1">Native</option>
         </select>
+      </div>
+      <div class="row row-sponsors">
+        <label>
+          <span>Branding &amp; Sponsors</span>
+        </label>
+        <div class="sponsor-controls">
+          <input type="file" id="inSponsorFiles" accept="image/*" multiple />
+          <select id="sltSponsor">
+            <option value="">No sponsor selected</option>
+          </select>
+          <div class="sponsor-actions">
+            <label class="sponsor-enabled" for="chkSponsorsEnabled">
+              <span>Enabled</span>
+              <input type="checkbox" id="chkSponsorsEnabled" />
+            </label>
+            <button type="button" id="btnDeleteSponsor">Delete selected</button>
+          </div>
+        </div>
       </div>
       <div class="row row-toggles">
         <div class='toggle-item'>

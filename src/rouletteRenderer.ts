@@ -15,6 +15,7 @@ import type { UIObject } from './UIObject';
 export type RenderParameters = {
   camera: Camera;
   stage: StageDef;
+  sponsorImage: HTMLImageElement | null;
   entities: MapEntityState[];
   marbles: Marble[];
   winners: Marble[];
@@ -35,6 +36,8 @@ const RESULT_COLUMN_MAX_WIDTH = 280;
 const PROGRESS_MAX_WIDTH_RATIO = 0.3;
 const PROGRESS_ACCENT = 'rgba(255, 215, 0, 0.8)';
 const CLOSE_HIT_PADDING = 8;
+const DEFAULT_SPONSOR_BOARD_WIDTH = 4;
+const DEFAULT_SPONSOR_BOARD_HEIGHT = 1;
 
 function inRect(rect: Rect | undefined, x: number, y: number): boolean {
   return !!rect && x >= rect.x && x <= rect.x + rect.w && y >= rect.y && y <= rect.y + rect.h;
@@ -249,6 +252,7 @@ export class RouletteRenderer {
     renderParameters.camera.renderScene(
       this.ctx,
       () => {
+        this.renderSponsorBoards(renderParameters.stage, renderParameters.sponsorImage);
         this.onBeforeEntities();
         this.renderEntities(renderParameters.entities);
         this.renderEffects(renderParameters);
@@ -263,6 +267,30 @@ export class RouletteRenderer {
     renderParameters.particleManager.render(this.ctx);
     this.renderWinnerProgress(renderParameters);
     this.renderResult(renderParameters);
+  }
+
+  private renderSponsorBoards(stage: StageDef, image: HTMLImageElement | null): void {
+    if (!image || !image.complete || image.naturalWidth <= 0 || image.naturalHeight <= 0) return;
+    if (!stage.adBoards?.length) return;
+
+    const imageRatio = image.naturalWidth / image.naturalHeight;
+    this.ctx.save();
+    stage.adBoards.forEach((board) => {
+      const width = board.w ?? DEFAULT_SPONSOR_BOARD_WIDTH;
+      const height = board.h ?? DEFAULT_SPONSOR_BOARD_HEIGHT;
+      if (!Number.isFinite(width) || width <= 0 || !Number.isFinite(height) || height <= 0) return;
+
+      const left = board.x - width / 2;
+      const top = board.y - height / 2;
+      this.ctx.fillStyle = '#fff';
+      this.ctx.fillRect(left, top, width, height);
+
+      const boardRatio = width / height;
+      const drawWidth = imageRatio > boardRatio ? width : height * imageRatio;
+      const drawHeight = imageRatio > boardRatio ? width / imageRatio : height;
+      this.ctx.drawImage(image, left + (width - drawWidth) / 2, top + (height - drawHeight) / 2, drawWidth, drawHeight);
+    });
+    this.ctx.restore();
   }
 
   private renderEntities(entities: MapEntityState[]) {

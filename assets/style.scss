@@ -234,6 +234,50 @@ div.copyright a {
           color: white;
         }
       }
+
+      &.row-sponsors {
+        height: auto;
+        align-items: flex-start;
+        padding-top: 5px;
+        padding-bottom: 5px;
+
+        .sponsor-controls {
+          flex: 1 1 auto;
+          min-width: 0;
+          display: flex;
+          flex-direction: column;
+          gap: 4px;
+
+          input[type=file] {
+            width: 100%;
+            color: white;
+          }
+
+          .sponsor-actions {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+
+            .sponsor-enabled {
+              width: auto;
+              flex: 1 1 auto;
+              display: flex;
+              align-items: center;
+              gap: 6px;
+              margin: 0;
+              padding-left: 0;
+
+              span {
+                flex: 1 1 auto;
+              }
+            }
+
+            button {
+              flex: 0 0 auto;
+            }
+          }
+        }
+      }
     }
   }
 
@@ -410,6 +454,15 @@ div.copyright a {
 
         input[type=checkbox] {
           order: 1;
+        }
+      }
+
+      &.row-sponsors {
+        .sponsor-controls .sponsor-actions .sponsor-enabled {
+          width: auto;
+          display: flex;
+          margin-bottom: 0;
+          padding-left: 0;
         }
       }
 

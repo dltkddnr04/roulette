@@ -12,6 +12,7 @@ import { Box2dPhysics } from './physics-box2d';
 import { RankRenderer } from './rankRenderer';
 import { RouletteRenderer } from './rouletteRenderer';
 import { SkillEffect } from './skillEffect';
+import { type SponsorAssetInfo, SponsorManager, type SponsorState } from './sponsorStore';
 import type { ColorTheme } from './types/ColorTheme';
 import type { MapEntityState } from './types/MapEntity.type';
 import type { MouseEventHandlerName, MouseEventName } from './types/mouseEvents.type';
@@ -63,6 +64,7 @@ export class Roulette extends EventTarget {
 
   private _autoRecording: boolean = false;
   private _recorder!: VideoRecorder;
+  private _sponsorManager = new SponsorManager();
 
   private physics!: IPhysics;
 
@@ -304,6 +306,7 @@ export class Roulette extends EventTarget {
     const renderParams = {
       camera: this._camera,
       stage: this._stage,
+      sponsorImage: this._sponsorManager.renderImage,
       entities: this._getInterpolatedEntities(alpha),
       marbles: this._marbles,
       winners: this._winners,
@@ -488,6 +491,26 @@ export class Roulette extends EventTarget {
 
   public setAutoRecording(value: boolean) {
     this._autoRecording = value;
+  }
+
+  public getSponsorState(): Promise<SponsorState> {
+    return this._sponsorManager.getState();
+  }
+
+  public addSponsorAsset(file: File): Promise<SponsorAssetInfo> {
+    return this._sponsorManager.addAsset(file);
+  }
+
+  public selectSponsorAsset(assetId: string | null): Promise<void> {
+    return this._sponsorManager.selectAsset(assetId);
+  }
+
+  public deleteSponsorAsset(assetId: string): Promise<void> {
+    return this._sponsorManager.deleteAsset(assetId);
+  }
+
+  public setSponsorsEnabled(enabled: boolean): Promise<void> {
+    return this._sponsorManager.setEnabled(enabled);
   }
 
   public setRenderScale(value: RenderScale) {
