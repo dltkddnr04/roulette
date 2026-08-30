@@ -8,12 +8,14 @@
     "@parcel/transformer-sass": "^2.16.4",
     "@parcel/transformer-webmanifest": "^2.16.4",
     "parcel": "^2.16.4",
-    "typescript": "^5.6.3"
+    "typescript": "^5.6.3",
+    "wrangler": "4.127.1"
   },
   "scripts": {
     "lint": "biome check --fix src/",
     "dev": "parcel index.html --port 1235",
-    "build": "parcel build index.html --public-url /"
+    "build": "parcel build index.html --public-url /",
+    "deploy": "wrangler deploy"
   },
   "dependencies": {
     "box2d-wasm": "^7.0.0"
