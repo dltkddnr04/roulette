@@ -24,10 +24,6 @@
 - Cloudflare Workers Static Assets 기반 자체 호스팅
 - 입력, 녹화, 에셋 로딩 및 여러 렌더링 예외 처리 강화
 
-## 다음 목표
-
-방송에서 참가자를 더 쉽게 받을 수 있도록 Twitch/CHZZK 채팅의 `/join` 명령과 QR/Web 참가 기능을 검토하고 있습니다.
-
 ## 개발
 
 ```sh
