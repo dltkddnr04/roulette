@@ -3,6 +3,7 @@ import type { IPhysics } from './IPhysics';
 import options from './options';
 import type { ColorTheme } from './types/ColorTheme';
 import type { VectorLike } from './types/VectorLike';
+import { interpolateTransform, type Transform } from './utils/interpolation';
 import { transformGuard } from './utils/transformGuard';
 import { rad } from './utils/utils';
 import { Vector } from './utils/Vector';
@@ -23,6 +24,7 @@ export class Marble {
   private _maxCoolTime = 5000;
   private _stuckTime = 0;
   private lastPosition: VectorLike = { x: 0, y: 0 };
+  private previousPosition: Transform = { x: 0, y: 0, angle: 0 };
   private theme: ColorTheme = Themes.dark;
 
   private physics: IPhysics;
@@ -70,6 +72,19 @@ export class Marble {
     this.id = order;
 
     physics.createMarble(order, 10.25 + (order % 10) * 0.6, maxLine - line + lineDelta);
+    this.resetInterpolation();
+  }
+
+  capturePreviousPosition(): void {
+    this.previousPosition = { ...this.position };
+  }
+
+  resetInterpolation(): void {
+    this.capturePreviousPosition();
+  }
+
+  getRenderPosition(alpha: number): Transform {
+    return interpolateTransform(this.previousPosition, this.position, alpha);
   }
 
   update(deltaTime: number) {
@@ -113,7 +128,8 @@ export class Marble {
     isMinimap: boolean = false,
     skin: CanvasImageSource | undefined,
     viewPort: { x: number; y: number; w: number; h: number; zoom: number },
-    theme: ColorTheme
+    theme: ColorTheme,
+    renderPosition: Transform = this.position
   ) {
     this.theme = theme;
     const viewPortHw = viewPort.w / viewPort.zoom / 2;
@@ -124,31 +140,40 @@ export class Marble {
     const viewPortBottom = viewPort.y + viewPortHh;
     if (
       !isMinimap &&
-      (this.x < viewPortLeft || this.x > viewPortRight || this.y < viewPortTop || this.y > viewPortBottom)
+      (renderPosition.x < viewPortLeft ||
+        renderPosition.x > viewPortRight ||
+        renderPosition.y < viewPortTop ||
+        renderPosition.y > viewPortBottom)
     ) {
       return;
     }
     const transform = ctx.getTransform();
     if (isMinimap) {
-      this._renderMinimap(ctx);
+      this._renderMinimap(ctx, renderPosition);
     } else {
-      this._renderNormal(ctx, zoom, outline, skin);
+      this._renderNormal(ctx, zoom, outline, skin, renderPosition);
     }
     ctx.setTransform(transform);
   }
 
-  private _renderMinimap(ctx: CanvasRenderingContext2D) {
+  private _renderMinimap(ctx: CanvasRenderingContext2D, renderPosition: Transform) {
     ctx.fillStyle = this.color;
-    this._drawMarbleBody(ctx, true);
+    this._drawMarbleBody(ctx, true, renderPosition);
   }
 
-  private _drawMarbleBody(ctx: CanvasRenderingContext2D, isMinimap: boolean) {
+  private _drawMarbleBody(ctx: CanvasRenderingContext2D, isMinimap: boolean, renderPosition: Transform) {
     ctx.beginPath();
-    ctx.arc(this.x, this.y, isMinimap ? this.size : this.size / 2, 0, Math.PI * 2);
+    ctx.arc(renderPosition.x, renderPosition.y, isMinimap ? this.size : this.size / 2, 0, Math.PI * 2);
     ctx.fill();
   }
 
-  private _renderNormal(ctx: CanvasRenderingContext2D, zoom: number, outline: boolean, skin?: CanvasImageSource) {
+  private _renderNormal(
+    ctx: CanvasRenderingContext2D,
+    zoom: number,
+    outline: boolean,
+    skin: CanvasImageSource | undefined,
+    renderPosition: Transform
+  ) {
     const hs = this.size / 2;
 
     ctx.fillStyle = `hsl(${this.hue} 100% ${this.theme.marbleLightness + 25 * Math.min(1, this.impact / 500)}%`;
@@ -157,54 +182,60 @@ export class Marble {
     // ctx.shadowBlur = zoom / 2;
     if (skin) {
       transformGuard(ctx, () => {
-        ctx.translate(this.x, this.y);
-        ctx.rotate(this.angle);
+        ctx.translate(renderPosition.x, renderPosition.y);
+        ctx.rotate(renderPosition.angle);
         ctx.drawImage(skin, -hs, -hs, hs * 2, hs * 2);
       });
     } else {
-      this._drawMarbleBody(ctx, false);
+      this._drawMarbleBody(ctx, false, renderPosition);
     }
 
     ctx.shadowColor = '';
     ctx.shadowBlur = 0;
-    this._drawName(ctx, zoom);
+    this._drawName(ctx, zoom, renderPosition);
 
     if (outline) {
-      this._drawOutline(ctx, 2 / zoom);
+      this._drawOutline(ctx, 2 / zoom, renderPosition);
     }
 
     if (options.useSkills) {
-      this._renderCoolTime(ctx, zoom);
+      this._renderCoolTime(ctx, zoom, renderPosition);
     }
   }
 
-  private _drawName(ctx: CanvasRenderingContext2D, zoom: number) {
+  private _drawName(ctx: CanvasRenderingContext2D, zoom: number, renderPosition: Transform) {
     transformGuard(ctx, () => {
       ctx.font = `12pt sans-serif`;
       ctx.strokeStyle = 'black';
       ctx.lineWidth = 2;
       ctx.fillStyle = this.color;
       ctx.shadowBlur = 0;
-      ctx.translate(this.x, this.y + 0.25);
+      ctx.translate(renderPosition.x, renderPosition.y + 0.25);
       ctx.scale(1 / zoom, 1 / zoom);
       ctx.strokeText(this.name, 0, 0);
       ctx.fillText(this.name, 0, 0);
     });
   }
 
-  private _drawOutline(ctx: CanvasRenderingContext2D, lineWidth: number) {
+  private _drawOutline(ctx: CanvasRenderingContext2D, lineWidth: number, renderPosition: Transform) {
     ctx.beginPath();
     ctx.strokeStyle = this.theme.marbleWinningBorder;
     ctx.lineWidth = lineWidth;
-    ctx.arc(this.x, this.y, this.size / 2, 0, Math.PI * 2);
+    ctx.arc(renderPosition.x, renderPosition.y, this.size / 2, 0, Math.PI * 2);
     ctx.stroke();
   }
 
-  private _renderCoolTime(ctx: CanvasRenderingContext2D, zoom: number) {
+  private _renderCoolTime(ctx: CanvasRenderingContext2D, zoom: number, renderPosition: Transform) {
     ctx.strokeStyle = this.theme.coolTimeIndicator;
     ctx.lineWidth = 1 / zoom;
     ctx.beginPath();
-    ctx.arc(this.x, this.y, this.size / 2 + 2 / zoom, rad(270), rad(270 + (360 * this._coolTime) / this._maxCoolTime));
+    ctx.arc(
+      renderPosition.x,
+      renderPosition.y,
+      this.size / 2 + 2 / zoom,
+      rad(270),
+      rad(270 + (360 * this._coolTime) / this._maxCoolTime)
+    );
     ctx.stroke();
   }
 }

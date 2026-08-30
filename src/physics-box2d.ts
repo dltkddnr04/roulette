@@ -84,6 +84,7 @@ export class Box2dPhysics implements IPhysics {
       body.SetTransform(new this.Box2D.b2Vec2(entity.position.x, entity.position.y), 0);
       this.entities.push({
         body,
+        id: this.entities.length,
         x: entity.position.x,
         y: entity.position.y,
         angle: 0,

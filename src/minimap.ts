@@ -146,7 +146,7 @@ export class Minimap implements UIObject {
   }
 
   private drawMarbles(params: RenderParameters) {
-    const { marbles } = params;
+    const { marbles, alpha } = params;
     const viewPort = {
       x: params.camera.x,
       y: params.camera.y,
@@ -155,7 +155,7 @@ export class Minimap implements UIObject {
       zoom: params.camera.zoom * initialZoom,
     };
     marbles.forEach((marble) => {
-      marble.render(this.ctx, 1, false, true, undefined, viewPort, params.theme);
+      marble.render(this.ctx, 1, false, true, undefined, viewPort, params.theme, marble.getRenderPosition(alpha));
     });
   }
 }

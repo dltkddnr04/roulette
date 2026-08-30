@@ -25,6 +25,7 @@ export type RenderParameters = {
   result: Marble[] | null;
   size: VectorLike;
   theme: ColorTheme;
+  alpha: number;
 };
 
 const WINNER_TEXT_OFFSET = 30;
@@ -310,7 +311,7 @@ export class RouletteRenderer {
     effects.forEach((effect) => effect.render(this.ctx, camera.zoom * initialZoom, this._theme));
   }
 
-  private renderMarbles({ marbles, camera, winnerRange, winners, size }: RenderParameters) {
+  private renderMarbles({ marbles, camera, winnerRange, winners, size, alpha }: RenderParameters) {
     const firstIndex = winnerRange.start - winners.length;
     const lastIndex = winnerRange.end - winners.length;
 
@@ -323,7 +324,8 @@ export class RouletteRenderer {
         false,
         this.getMarbleImage(marble.name),
         viewPort,
-        this._theme
+        this._theme,
+        marble.getRenderPosition(alpha)
       );
     });
   }

@@ -43,6 +43,7 @@ export interface MapEntity {
 }
 
 export interface MapEntityState {
+  id: number;
   x: number;
   y: number;
   angle: number;

@@ -71,15 +71,17 @@ export class Camera {
     stage,
     needToZoom,
     targetIndex,
+    interpolationAlpha,
   }: {
     marbles: Marble[];
     stage: StageDef;
     needToZoom: boolean;
     targetIndex: number;
+    interpolationAlpha: number;
   }) {
     // set target position
     if (!this._locked) {
-      this._calcTargetPositionAndZoom(marbles, stage, needToZoom, targetIndex);
+      this._calcTargetPositionAndZoom(marbles, stage, needToZoom, targetIndex, interpolationAlpha);
     }
 
     // interpolate position
@@ -90,14 +92,20 @@ export class Camera {
     this._zoom = this._interpolation(this._zoom, this._targetZoom);
   }
 
-  private _calcTargetPositionAndZoom(marbles: Marble[], stage: StageDef, needToZoom: boolean, targetIndex: number) {
+  private _calcTargetPositionAndZoom(
+    marbles: Marble[],
+    stage: StageDef,
+    needToZoom: boolean,
+    targetIndex: number,
+    interpolationAlpha: number
+  ) {
     if (!this._shouldFollowMarbles) {
       return;
     }
 
     if (marbles.length > 0) {
       const targetMarble = marbles[targetIndex] ? marbles[targetIndex] : marbles[0];
-      this.setPosition(targetMarble.position);
+      this.setPosition(targetMarble.getRenderPosition(interpolationAlpha));
       if (needToZoom) {
         const goalDist = Math.abs(stage.zoomY - this._position.y);
         this.zoom = Math.max(1, (1 - goalDist / zoomThreshold) * 4);

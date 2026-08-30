@@ -13,9 +13,11 @@ import { RankRenderer } from './rankRenderer';
 import { RouletteRenderer } from './rouletteRenderer';
 import { SkillEffect } from './skillEffect';
 import type { ColorTheme } from './types/ColorTheme';
+import type { MapEntityState } from './types/MapEntity.type';
 import type { MouseEventHandlerName, MouseEventName } from './types/mouseEvents.type';
 import type { UIObject } from './UIObject';
 import { bound } from './utils/bound.decorator';
+import { interpolateTransform } from './utils/interpolation';
 import { parseName, shuffle } from './utils/utils';
 import { VideoRecorder } from './utils/videoRecorder';
 
@@ -26,11 +28,14 @@ function clipWinnerRange({ start, end }: WinnerRange, marbleCount: number): Winn
   return { start: clippedStart, end: Math.min(Math.max(clippedStart, end), last) };
 }
 
+const MAX_PHYSICS_STEPS_PER_FRAME = 8;
+
 export class Roulette extends EventTarget {
   private _marbles: Marble[] = [];
 
   private _lastTime: number = 0;
   private _elapsed: number = 0;
+  private _physicsDebt: number = 0;
 
   private _updateInterval = 10;
   private _timeScale = 1;
@@ -39,6 +44,8 @@ export class Roulette extends EventTarget {
   private _winners: Marble[] = [];
   private _particleManager = new ParticleManager();
   private _stage: StageDef | null = null;
+  private _previousEntities: MapEntityState[] = [];
+  private _currentEntities: MapEntityState[] = [];
 
   protected _camera: Camera = new Camera();
   protected _renderer: RouletteRenderer;
@@ -80,6 +87,7 @@ export class Roulette extends EventTarget {
 
   constructor() {
     super();
+    document.addEventListener('visibilitychange', this._handleVisibilityChange);
     this._renderer = this.createRenderer();
     this._renderer.setRenderScale(options.renderScale);
     this._renderer.init().then(() => {
@@ -108,26 +116,52 @@ export class Roulette extends EventTarget {
   }
 
   @bound
+  private _handleVisibilityChange() {
+    this._lastTime = Date.now();
+    if (document.hidden) return;
+
+    this._elapsed = 0;
+    this._physicsDebt = 0;
+    if (this._isReady) {
+      this._resetInterpolationSnapshots();
+    }
+  }
+
+  @bound
   private _update() {
     if (!this._lastTime) this._lastTime = Date.now();
     const currentTime = Date.now();
 
     this._elapsed += (currentTime - this._lastTime) * this._speed * this.fastForwarder.speed;
-    if (this._elapsed > 100) {
-      this._elapsed %= 100;
-    }
     this._lastTime = currentTime;
 
     const interval = (this._updateInterval / 1000) * this._timeScale;
+    let accumulatedTime = this._physicsDebt + this._elapsed;
+    this._physicsDebt = 0;
+    let physicsSteps = 0;
 
-    while (this._elapsed >= this._updateInterval) {
+    while (accumulatedTime >= this._updateInterval && physicsSteps < MAX_PHYSICS_STEPS_PER_FRAME) {
+      this._capturePreviousTransforms();
       this.physics.step(interval);
+      this._currentEntities = this._copyEntityStates(this.physics.getEntities());
       this._updateMarbles(this._updateInterval);
       this._particleManager.update(this._updateInterval);
       this._updateEffects(this._updateInterval);
-      this._elapsed -= this._updateInterval;
+      accumulatedTime -= this._updateInterval;
+      physicsSteps++;
       this._uiObjects.forEach((obj) => obj.update(this._updateInterval));
     }
+
+    // Preserve whole unprocessed steps as debt instead of dropping an arbitrary
+    // amount of simulation time. The per-frame cap prevents a long stall from
+    // monopolizing one frame; subsequent frames gradually catch the simulation up.
+    if (accumulatedTime >= this._updateInterval) {
+      const overdueSteps = Math.floor(accumulatedTime / this._updateInterval);
+      this._physicsDebt = overdueSteps * this._updateInterval;
+      accumulatedTime -= this._physicsDebt;
+    }
+    this._elapsed = accumulatedTime;
+    const alpha = this._elapsed / this._updateInterval;
 
     if (this._marbles.length > 1) {
       this._marbles.sort((a, b) => b.y - a.y);
@@ -139,10 +173,11 @@ export class Roulette extends EventTarget {
         stage: this._stage,
         needToZoom: this._goalDist < zoomThreshold,
         targetIndex: this._winners.length > 0 ? this._targetIndex : 0,
+        interpolationAlpha: alpha,
       });
     }
 
-    this._render();
+    this._render(alpha);
     window.requestAnimationFrame(this._update);
   }
 
@@ -233,12 +268,41 @@ export class Roulette extends EventTarget {
     this._effects = this._effects.filter((effect) => !effect.isDestroy);
   }
 
-  private _render() {
+  private _copyEntityStates(entities: MapEntityState[]): MapEntityState[] {
+    return entities.map((entity) => ({ ...entity }));
+  }
+
+  private _capturePreviousTransforms() {
+    this._marbles.forEach((marble) => marble.capturePreviousPosition());
+    this._previousEntities = this._copyEntityStates(this._currentEntities);
+  }
+
+  private _resetInterpolationSnapshots() {
+    this._marbles.forEach((marble) => marble.resetInterpolation());
+    const entities = this._copyEntityStates(this.physics.getEntities());
+    this._previousEntities = entities;
+    this._currentEntities = this._copyEntityStates(entities);
+  }
+
+  private _getInterpolatedEntities(alpha: number): MapEntityState[] {
+    const previousById = new Map(this._previousEntities.map((entity) => [entity.id, entity]));
+    return this._currentEntities.map((entity) => {
+      const previous = previousById.get(entity.id);
+      if (!previous) return { ...entity };
+
+      return {
+        ...entity,
+        ...interpolateTransform(previous, entity, alpha),
+      };
+    });
+  }
+
+  private _render(alpha: number) {
     if (!this._stage) return;
     const renderParams = {
       camera: this._camera,
       stage: this._stage,
-      entities: this.physics.getEntities(),
+      entities: this._getInterpolatedEntities(alpha),
       marbles: this._marbles,
       winners: this._winners,
       particleManager: this._particleManager,
@@ -247,6 +311,7 @@ export class Roulette extends EventTarget {
       result: this._result,
       size: { x: this._renderer.width, y: this._renderer.height },
       theme: this._theme,
+      alpha,
     };
     this._renderer.render(renderParams, this._uiObjects);
   }
@@ -339,6 +404,7 @@ export class Roulette extends EventTarget {
     }
 
     this.physics.createStage(this._stage);
+    this._resetInterpolationSnapshots();
     this._camera.initializePosition();
   }
 
@@ -361,6 +427,7 @@ export class Roulette extends EventTarget {
   }
 
   public start() {
+    this._resetInterpolationSnapshots();
     this._isRunning = true;
     this._winnerRange = clipWinnerRange(options.winnerRange, this._marbles.length);
     this._camera.startFollowingMarbles();
@@ -491,6 +558,9 @@ export class Roulette extends EventTarget {
   }
 
   public reset() {
+    this._elapsed = 0;
+    this._physicsDebt = 0;
+    this._lastTime = Date.now();
     this.clearMarbles();
     this._clearMap();
     this._loadMap();
