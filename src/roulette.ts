@@ -131,8 +131,9 @@ export class Roulette extends EventTarget {
   private _update() {
     if (!this._lastTime) this._lastTime = Date.now();
     const currentTime = Date.now();
+    const frameDelta = currentTime - this._lastTime;
 
-    this._elapsed += (currentTime - this._lastTime) * this._speed * this.fastForwarder.speed;
+    this._elapsed += frameDelta * this._speed * this.fastForwarder.speed;
     this._lastTime = currentTime;
 
     const interval = (this._updateInterval / 1000) * this._timeScale;
@@ -174,6 +175,7 @@ export class Roulette extends EventTarget {
         needToZoom: this._goalDist < zoomThreshold,
         targetIndex: this._winners.length > 0 ? this._targetIndex : 0,
         interpolationAlpha: alpha,
+        deltaTime: frameDelta,
       });
     }
 

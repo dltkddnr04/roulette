@@ -3,6 +3,9 @@ import type { StageDef } from './data/maps';
 import type { Marble } from './marble';
 import type { VectorLike } from './types/VectorLike';
 
+const REFERENCE_FRAME_TIME = 1000 / 60;
+const MAX_CAMERA_DELTA_TIME = 100;
+
 export class Camera {
   private _position: VectorLike = { x: 0, y: 0 };
   private _targetPosition: VectorLike = { x: 0, y: 0 };
@@ -72,24 +75,29 @@ export class Camera {
     needToZoom,
     targetIndex,
     interpolationAlpha,
+    deltaTime,
   }: {
     marbles: Marble[];
     stage: StageDef;
     needToZoom: boolean;
     targetIndex: number;
     interpolationAlpha: number;
+    deltaTime: number;
   }) {
     // set target position
     if (!this._locked) {
       this._calcTargetPositionAndZoom(marbles, stage, needToZoom, targetIndex, interpolationAlpha);
     }
 
-    // interpolate position
-    this._position.x = this._interpolation(this.x, this._targetPosition.x, 120);
-    this._position.y = this._interpolation(this.y, this._targetPosition.y);
+    // Clamp camera time only; physics wall-clock/debt handling must remain lossless.
+    const smoothingDeltaTime = Math.min(Math.max(deltaTime, 0), MAX_CAMERA_DELTA_TIME);
+
+    // Exponential smoothing preserves the old 60 FPS response across refresh rates.
+    this._position.x = this._interpolation(this.x, this._targetPosition.x, 120, smoothingDeltaTime);
+    this._position.y = this._interpolation(this.y, this._targetPosition.y, 10, smoothingDeltaTime);
 
     // interpolate zoom
-    this._zoom = this._interpolation(this._zoom, this._targetZoom);
+    this._zoom = this._interpolation(this._zoom, this._targetZoom, 10, smoothingDeltaTime);
   }
 
   private _calcTargetPositionAndZoom(
@@ -117,13 +125,14 @@ export class Camera {
     }
   }
 
-  private _interpolation(current: number, target: number, delta: number = 10) {
+  private _interpolation(current: number, target: number, delta: number, deltaTime: number) {
     const d = target - current;
     if (Math.abs(d) < 1 / initialZoom) {
       return target;
     }
 
-    return current + d / delta;
+    const factor = 1 - (1 - 1 / delta) ** (deltaTime / REFERENCE_FRAME_TIME);
+    return current + d * factor;
   }
 
   renderScene(
