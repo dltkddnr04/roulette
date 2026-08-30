@@ -189,10 +189,13 @@ export class RouletteRenderer {
   }
 
   private async _loadImage(url: string): Promise<HTMLImageElement> {
-    return new Promise((rs) => {
+    return new Promise((resolve, reject) => {
       const img = new Image();
       img.addEventListener('load', () => {
-        rs(img);
+        resolve(img);
+      });
+      img.addEventListener('error', () => {
+        reject(new Error(`Failed to load image: ${url}`));
       });
       img.src = url;
     });
@@ -209,13 +212,21 @@ export class RouletteRenderer {
       { name: '왈도쿤', imgUrl: new URL('../assets/images/waldokun.png', import.meta.url) },
     ].map(({ name, imgUrl }) => {
       return (async () => {
-        this._images[name] = await this._loadImage(imgUrl.toString());
+        try {
+          this._images[name] = await this._loadImage(imgUrl.toString());
+        } catch (e) {
+          console.warn(`Marble skin unavailable: ${name}`, e);
+        }
       })();
     });
 
     loadPromises.push(
       (async () => {
-        await this._loadImage(new URL('../assets/images/ff.svg', import.meta.url).toString());
+        try {
+          await this._loadImage(new URL('../assets/images/ff.svg', import.meta.url).toString());
+        } catch (e) {
+          console.warn('Fast-forward icon unavailable', e);
+        }
       })()
     );
 
@@ -545,7 +556,7 @@ export class RouletteRenderer {
     } else {
       this.ctx.beginPath();
       this.ctx.arc(marbleCenterX, marbleCenterY, marbleSize / 2, 0, Math.PI * 2);
-      this.ctx.fillStyle = `hsl(${winner.hue} 100% ${theme.marbleLightness})`;
+      this.ctx.fillStyle = `hsl(${winner.hue} 100% ${theme.marbleLightness}%)`;
       this.ctx.fill();
     }
 
@@ -562,7 +573,7 @@ export class RouletteRenderer {
 
     this.ctx.fillText('Winner', textRightX, h - 120 + WINNER_TEXT_OFFSET);
     this.ctx.font = 'bold 72px sans-serif';
-    this.ctx.fillStyle = `hsl(${winner.hue} 100% ${theme.marbleLightness})`;
+    this.ctx.fillStyle = `hsl(${winner.hue} 100% ${theme.marbleLightness}%)`;
     if (theme.winnerOutline) {
       this.ctx.strokeText(winner.name, textRightX, h - 55 + WINNER_TEXT_OFFSET);
     }

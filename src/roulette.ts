@@ -29,6 +29,7 @@ function clipWinnerRange({ start, end }: WinnerRange, marbleCount: number): Winn
 }
 
 const MAX_PHYSICS_STEPS_PER_FRAME = 8;
+const MAX_MARBLES = 1000;
 
 export class Roulette extends EventTarget {
   private _marbles: Marble[] = [];
@@ -426,6 +427,8 @@ export class Roulette extends EventTarget {
   }
 
   public start() {
+    if (this._marbles.length === 0) return;
+
     this._resetInterpolationSnapshots();
     this._isRunning = true;
     this._winnerRange = clipWinnerRange(options.winnerRange, this._marbles.length);
@@ -521,6 +524,8 @@ export class Roulette extends EventTarget {
         totalCount += member.count;
       }
     });
+
+    if (!Number.isSafeInteger(totalCount) || totalCount <= 0 || totalCount > MAX_MARBLES) return;
 
     const orders = shuffle(
       Array(totalCount)

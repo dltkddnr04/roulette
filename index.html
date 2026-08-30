@@ -42,13 +42,15 @@
   }
 
   function parseName(nameStr) {
-    const weightRegex = /(\/\d+)/;
-    const countRegex = /(\*\d+)/;
-    const hasWeight = weightRegex.test(nameStr);
-    const hasCount = countRegex.test(nameStr);
-    const name = /^\s*([^\/*]+)?/.exec(nameStr)[1];
-    const weight = hasWeight ? parseInt(weightRegex.exec(nameStr)[1].replace('/', '')) : 1;
-    const count = hasCount ? parseInt(countRegex.exec(nameStr)[1].replace('*', '')) : 1;
+    const nameMatch = /^\s*([^\/*]+)?/.exec(nameStr);
+    const weightMatch = /\/(\d+)/.exec(nameStr);
+    const countMatch = /\*(\d+)/.exec(nameStr);
+    const name = nameMatch && nameMatch[1];
+    const weight = weightMatch ? Number(weightMatch[1]) : 1;
+    const count = countMatch ? Number(countMatch[1]) : 1;
+    if (!name || !Number.isSafeInteger(weight) || weight <= 0 || !Number.isSafeInteger(count) || count <= 0) {
+      return null;
+    }
     return {
       name,
       weight,
@@ -59,7 +61,7 @@
   function getReady() {
     const names = getNames();
     window.roulette.setMarbles(names);
-    ready = names.length > 0;
+    ready = window.roulette.getCount() > 0;
     localStorage.setItem('mbr_names', names.join(','));
     applyWinnerSetting();
   }
@@ -158,6 +160,7 @@
       const nameCounts = {};
       nameSource.forEach(nameSrc => {
         const name = parseName(nameSrc);
+        if (!name) return;
         const key = name.weight > 1 ? `${name.name}/${name.weight}` : name.name;
         if (!nameSet.has(key)) {
           nameSet.add(key);

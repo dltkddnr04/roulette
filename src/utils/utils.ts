@@ -10,12 +10,11 @@ function getRegexValue(regex: RegExp, str: string) {
 export function parseName(nameStr: string) {
   const weightRegex = /\/(\d+)/;
   const countRegex = /\*(\d+)/;
-  const hasWeight = weightRegex.test(nameStr);
-  const hasCount = countRegex.test(nameStr);
   const name = getRegexValue(/^\s*([^/*]+)?/, nameStr);
   if (!name) return null;
-  const weight = hasWeight ? parseInt(getRegexValue(weightRegex, nameStr), 10) : 1;
-  const count = hasCount ? parseInt(getRegexValue(countRegex, nameStr), 10) : 1;
+  const weight = weightRegex.test(nameStr) ? Number(getRegexValue(weightRegex, nameStr)) : 1;
+  const count = countRegex.test(nameStr) ? Number(getRegexValue(countRegex, nameStr)) : 1;
+  if (!Number.isSafeInteger(weight) || weight <= 0 || !Number.isSafeInteger(count) || count <= 0) return null;
   return {
     name,
     weight,

@@ -102,7 +102,7 @@ export class RankRenderer implements UIObject {
     winners.forEach((marble: { hue: number; name: string }, rank: number) => {
       const y = rank * this.fontHeight;
       if (y >= startY && y <= startY + height) {
-        ctx.fillStyle = `hsl(${marble.hue} 100% ${theme.marbleLightness}`;
+        ctx.fillStyle = `hsl(${marble.hue} 100% ${theme.marbleLightness}%)`;
         ctx.strokeText(`${this.isWinningRank(rank) ? '☆' : '\u2714'} ${marble.name} #${rank + 1}`, startX, 20 + y);
         ctx.fillText(`${this.isWinningRank(rank) ? '☆' : '\u2714'} ${marble.name} #${rank + 1}`, startX, 20 + y);
       }
@@ -111,7 +111,7 @@ export class RankRenderer implements UIObject {
     marbles.forEach((marble: { hue: number; name: string }, rank: number) => {
       const y = (rank + winners.length) * this.fontHeight;
       if (y >= startY && y <= startY + height) {
-        ctx.fillStyle = `hsl(${marble.hue} 100% ${theme.marbleLightness}`;
+        ctx.fillStyle = `hsl(${marble.hue} 100% ${theme.marbleLightness}%)`;
         ctx.strokeText(`${marble.name} #${rank + 1 + winners.length}`, startX, 20 + y);
         ctx.fillText(`${marble.name} #${rank + 1 + winners.length}`, startX, 20 + y);
       }

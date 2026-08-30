@@ -176,7 +176,7 @@ export class Marble {
   ) {
     const hs = this.size / 2;
 
-    ctx.fillStyle = `hsl(${this.hue} 100% ${this.theme.marbleLightness + 25 * Math.min(1, this.impact / 500)}%`;
+    ctx.fillStyle = `hsl(${this.hue} 100% ${this.theme.marbleLightness + 25 * Math.min(1, this.impact / 500)}%)`;
 
     // ctx.shadowColor = this.color;
     // ctx.shadowBlur = zoom / 2;
