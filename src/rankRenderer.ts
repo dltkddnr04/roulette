@@ -103,7 +103,9 @@ export class RankRenderer implements UIObject {
       const y = rank * this.fontHeight;
       if (y >= startY && y <= startY + height) {
         ctx.fillStyle = `hsl(${marble.hue} 100% ${theme.marbleLightness}%)`;
-        ctx.strokeText(`${this.isWinningRank(rank) ? '☆' : '\u2714'} ${marble.name} #${rank + 1}`, startX, 20 + y);
+        if (theme.rankStroke) {
+          ctx.strokeText(`${this.isWinningRank(rank) ? '☆' : '\u2714'} ${marble.name} #${rank + 1}`, startX, 20 + y);
+        }
         ctx.fillText(`${this.isWinningRank(rank) ? '☆' : '\u2714'} ${marble.name} #${rank + 1}`, startX, 20 + y);
       }
     });
@@ -112,7 +114,9 @@ export class RankRenderer implements UIObject {
       const y = (rank + winners.length) * this.fontHeight;
       if (y >= startY && y <= startY + height) {
         ctx.fillStyle = `hsl(${marble.hue} 100% ${theme.marbleLightness}%)`;
-        ctx.strokeText(`${marble.name} #${rank + 1 + winners.length}`, startX, 20 + y);
+        if (theme.rankStroke) {
+          ctx.strokeText(`${marble.name} #${rank + 1 + winners.length}`, startX, 20 + y);
+        }
         ctx.fillText(`${marble.name} #${rank + 1 + winners.length}`, startX, 20 + y);
       }
     });

@@ -220,16 +220,6 @@ export class RouletteRenderer {
       })();
     });
 
-    loadPromises.push(
-      (async () => {
-        try {
-          await this._loadImage(new URL('../assets/images/ff.svg', import.meta.url).toString());
-        } catch (e) {
-          console.warn('Fast-forward icon unavailable', e);
-        }
-      })()
-    );
-
     await Promise.all(loadPromises);
   }
 

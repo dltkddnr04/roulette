@@ -10,9 +10,16 @@ export class FastForwader implements UIObject {
     h: 0,
   };
   private icon: HTMLImageElement;
+  private iconLoaded = false;
 
   constructor() {
     this.icon = new Image();
+    this.icon.addEventListener('load', () => {
+      this.iconLoaded = true;
+    });
+    this.icon.addEventListener('error', () => {
+      this.iconLoaded = false;
+    });
     this.icon.src = new URL('../assets/images/ff.svg', import.meta.url).toString();
   }
 
@@ -33,7 +40,7 @@ export class FastForwader implements UIObject {
     const centerX = this.bound.x + this.bound.w / 2;
     const centerY = this.bound.y + this.bound.h / 2;
 
-    if (this.isEnabled) {
+    if (this.isEnabled && this.iconLoaded) {
       ctx.save();
       ctx.strokeStyle = 'white';
       ctx.globalAlpha = 0.5;
