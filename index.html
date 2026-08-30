@@ -134,6 +134,9 @@
     }
     console.log('initializing start');
 
+    const renderScaleSelector = document.querySelector('#sltRenderScale');
+    renderScaleSelector.value = String(window.options.renderScale);
+
     const urlParams = new URLSearchParams(window.location.search);
     const namesFromUrl = urlParams.get('names');
 
@@ -203,6 +206,31 @@
       window.options.darkMode = e.target.matches(':checked');
       window.roulette.setTheme(window.options.darkMode ? 'dark' : 'light');
       document.documentElement.classList.toggle('light', !window.options.darkMode);
+    });
+
+    renderScaleSelector.addEventListener('change', (e) => {
+      const selected = e.target.value;
+      let value;
+      switch (selected) {
+        case '0.5':
+          value = 0.5;
+          break;
+        case '1':
+          value = 1;
+          break;
+        case '2':
+          value = 2;
+          break;
+        default:
+          return;
+      }
+
+      try {
+        localStorage.setItem('mbr_render_scale', selected);
+      } catch {
+        // Storage may be unavailable; the current session can still use the new scale.
+      }
+      window.roulette.setRenderScale(value);
     });
 
     document.querySelector('#in_winningRank').addEventListener('change', () => selectWinnerType('custom'));
@@ -294,6 +322,16 @@
           <span data-trans>Map</span>
         </label>
         <select id="sltMap"></select>
+      </div>
+      <div class="row">
+        <label for='sltRenderScale'>
+          <span data-trans>Render quality</span>
+        </label>
+        <select id="sltRenderScale">
+          <option value="0.5">Performance</option>
+          <option value="1">Native</option>
+          <option value="2">Supersampling</option>
+        </select>
       </div>
       <div class="row row-toggles">
         <div class='toggle-item'>

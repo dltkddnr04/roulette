@@ -4,7 +4,7 @@ import type { StageDef } from './data/maps';
 import type { GameObject } from './gameObject';
 import type { Marble } from './marble';
 import { MINIMAP_INSET, MINIMAP_WIDTH } from './minimap';
-import type { WinnerRange } from './options';
+import { isRenderScale, type RenderScale, type WinnerRange } from './options';
 import type { ParticleManager } from './particleManager';
 import type { ColorTheme } from './types/ColorTheme';
 import type { MapEntityState } from './types/MapEntity.type';
@@ -82,6 +82,10 @@ export class RouletteRenderer {
   protected _sceneCanvas!: HTMLCanvasElement;
   protected ctx!: CanvasRenderingContext2D;
   private _displayCtx!: CanvasRenderingContext2D;
+  private _logicalWidth = canvasWidth;
+  private _logicalHeight = canvasHeight;
+  private _renderScale: RenderScale = 0.5;
+  private _renderFactor = 1;
   public sizeFactor = 1;
 
   protected _images: { [key: string]: HTMLImageElement } = {};
@@ -91,11 +95,11 @@ export class RouletteRenderer {
   private _lastResult: Marble[] | null = null;
 
   get width() {
-    return this._sceneCanvas.width;
+    return this._logicalWidth;
   }
 
   get height() {
-    return this._sceneCanvas.height;
+    return this._logicalHeight;
   }
 
   get canvas() {
@@ -104,6 +108,39 @@ export class RouletteRenderer {
 
   set theme(value: ColorTheme) {
     this._theme = value;
+  }
+
+  public setRenderScale(value: RenderScale): void {
+    if (!isRenderScale(value)) return;
+
+    this._renderScale = value;
+    this._renderFactor = value / 0.5;
+    this.resize();
+  }
+
+  public resize(entries?: ResizeObserverEntry[]): void {
+    if (!this._canvas || !this._sceneCanvas) return;
+
+    const realSize = entries?.[0]?.contentRect ?? this._canvas.getBoundingClientRect();
+    if (realSize.width <= 0 || realSize.height <= 0) return;
+
+    const physicalWidth = Math.max(
+      1,
+      Math.round(Math.max(realSize.width * this._renderScale, 640 * this._renderFactor))
+    );
+    const physicalHeight = Math.max(1, Math.round((physicalWidth / realSize.width) * realSize.height));
+    const logicalWidth = physicalWidth / this._renderFactor;
+    const logicalHeight = physicalHeight / this._renderFactor;
+
+    this._logicalWidth = logicalWidth;
+    this._logicalHeight = logicalHeight;
+    this._sceneCanvas.width = physicalWidth;
+    this._sceneCanvas.height = physicalHeight;
+    this.sizeFactor = logicalWidth / realSize.width;
+
+    const displayWidth = Math.min(realSize.width, MAX_DISPLAY_WIDTH);
+    this._canvas.width = displayWidth;
+    this._canvas.height = (displayWidth / realSize.width) * realSize.height;
   }
 
   async init() {
@@ -125,25 +162,10 @@ export class RouletteRenderer {
 
     document.body.appendChild(this._canvas);
 
-    const resizing = (entries?: ResizeObserverEntry[]) => {
-      const realSize = entries ? entries[0].contentRect : this._canvas.getBoundingClientRect();
-      if (realSize.width <= 0 || realSize.height <= 0) return;
-
-      const width = Math.max(realSize.width / 2, 640);
-      const height = (width / realSize.width) * realSize.height;
-      this._sceneCanvas.width = width;
-      this._sceneCanvas.height = height;
-      this.sizeFactor = width / realSize.width;
-
-      const displayWidth = Math.min(realSize.width, MAX_DISPLAY_WIDTH);
-      this._canvas.width = displayWidth;
-      this._canvas.height = (displayWidth / realSize.width) * realSize.height;
-    };
-
-    const resizeObserver = new ResizeObserver(resizing);
+    const resizeObserver = new ResizeObserver((entries) => this.resize(entries));
 
     resizeObserver.observe(this._canvas);
-    resizing();
+    this.resize();
   }
 
   private async _loadImage(url: string): Promise<HTMLImageElement> {
@@ -189,8 +211,13 @@ export class RouletteRenderer {
 
   render(renderParameters: RenderParameters, uiObjects: UIObject[]) {
     this._theme = renderParameters.theme;
+    const logicalWidth = this.width;
+    const logicalHeight = this.height;
+
+    this.ctx.setTransform(1, 0, 0, 1, 0, 0);
+    this.ctx.scale(this._renderFactor, this._renderFactor);
     this.ctx.fillStyle = this._theme.background;
-    this.ctx.fillRect(0, 0, this._sceneCanvas.width, this._sceneCanvas.height);
+    this.ctx.fillRect(0, 0, logicalWidth, logicalHeight);
 
     this.ctx.save();
     this.ctx.scale(initialZoom, initialZoom);
@@ -198,18 +225,20 @@ export class RouletteRenderer {
     this.ctx.textBaseline = 'top';
     this.ctx.font = '0.4pt sans-serif';
     this.ctx.lineWidth = 3 / (renderParameters.camera.zoom + initialZoom);
-    renderParameters.camera.renderScene(this.ctx, () => {
-      this.onBeforeEntities();
-      this.renderEntities(renderParameters.entities);
-      this.renderEffects(renderParameters);
-      this.renderMarbles(renderParameters);
-    });
+    renderParameters.camera.renderScene(
+      this.ctx,
+      () => {
+        this.onBeforeEntities();
+        this.renderEntities(renderParameters.entities);
+        this.renderEffects(renderParameters);
+        this.renderMarbles(renderParameters);
+      },
+      { x: logicalWidth, y: logicalHeight }
+    );
     this.ctx.restore();
     this.onAfterScene();
 
-    uiObjects.forEach((obj) =>
-      obj.render(this.ctx, renderParameters, this._sceneCanvas.width, this._sceneCanvas.height)
-    );
+    uiObjects.forEach((obj) => obj.render(this.ctx, renderParameters, logicalWidth, logicalHeight));
     renderParameters.particleManager.render(this.ctx);
     this.renderWinnerProgress(renderParameters);
     this.renderResult(renderParameters);
@@ -318,8 +347,8 @@ export class RouletteRenderer {
     if (end <= start) return; // 1명 추첨은 기존 하단 Winner 표시를 쓴다
 
     const ctx = this.ctx;
-    const w = this._sceneCanvas.width;
-    const h = this._sceneCanvas.height;
+    const w = this.width;
+    const h = this.height;
 
     const lineHeight = Math.min(24, Math.max(14, h * 0.042));
     const pad = lineHeight * 0.6;
@@ -403,8 +432,8 @@ export class RouletteRenderer {
   /** 당첨자가 여러명일 때 화면 중앙에 목록 팝업을 그린다 */
   private renderWinnerList(winners: Marble[], { theme, winnerRange }: RenderParameters) {
     const ctx = this.ctx;
-    const w = this._sceneCanvas.width;
-    const h = this._sceneCanvas.height;
+    const w = this.width;
+    const h = this.height;
 
     const lineHeight = Math.min(32, Math.max(16, h * 0.05));
     const padding = lineHeight;
@@ -473,19 +502,17 @@ export class RouletteRenderer {
   }
 
   private renderWinner(winner: Marble, theme: ColorTheme) {
+    const w = this.width;
+    const h = this.height;
+
     this.ctx.save();
     this.ctx.fillStyle = theme.winnerBackground;
-    this.ctx.fillRect(
-      this._sceneCanvas.width / 2,
-      this._sceneCanvas.height - winnerAreaHeight,
-      this._sceneCanvas.width / 2,
-      winnerAreaHeight
-    );
+    this.ctx.fillRect(w / 2, h - winnerAreaHeight, w / 2, winnerAreaHeight);
 
     // Draw marble image or colored circle
     const marbleSize = 100;
-    const marbleCenterX = this._sceneCanvas.width - marbleSize / 2 - 20;
-    const marbleCenterY = this._sceneCanvas.height - winnerAreaHeight / 2;
+    const marbleCenterX = w - marbleSize / 2 - 20;
+    const marbleCenterY = h - winnerAreaHeight / 2;
     const marbleImage = this.getMarbleImage(winner.name);
 
     if (marbleImage) {
@@ -511,16 +538,16 @@ export class RouletteRenderer {
     this.ctx.lineWidth = 4;
     const textRightX = marbleCenterX - marbleSize / 2 - 20;
     if (theme.winnerOutline) {
-      this.ctx.strokeText('Winner', textRightX, this._sceneCanvas.height - 120 + WINNER_TEXT_OFFSET);
+      this.ctx.strokeText('Winner', textRightX, h - 120 + WINNER_TEXT_OFFSET);
     }
 
-    this.ctx.fillText('Winner', textRightX, this._sceneCanvas.height - 120 + WINNER_TEXT_OFFSET);
+    this.ctx.fillText('Winner', textRightX, h - 120 + WINNER_TEXT_OFFSET);
     this.ctx.font = 'bold 72px sans-serif';
     this.ctx.fillStyle = `hsl(${winner.hue} 100% ${theme.marbleLightness})`;
     if (theme.winnerOutline) {
-      this.ctx.strokeText(winner.name, textRightX, this._sceneCanvas.height - 55 + WINNER_TEXT_OFFSET);
+      this.ctx.strokeText(winner.name, textRightX, h - 55 + WINNER_TEXT_OFFSET);
     }
-    this.ctx.fillText(winner.name, textRightX, this._sceneCanvas.height - 55 + WINNER_TEXT_OFFSET);
+    this.ctx.fillText(winner.name, textRightX, h - 55 + WINNER_TEXT_OFFSET);
     this.ctx.restore();
   }
 }

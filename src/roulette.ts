@@ -6,7 +6,7 @@ import type { GameObject } from './gameObject';
 import type { IPhysics } from './IPhysics';
 import { Marble } from './marble';
 import { Minimap } from './minimap';
-import options, { type WinnerRange } from './options';
+import options, { isRenderScale, type RenderScale, type WinnerRange } from './options';
 import { ParticleManager } from './particleManager';
 import { Box2dPhysics } from './physics-box2d';
 import { RankRenderer } from './rankRenderer';
@@ -81,6 +81,7 @@ export class Roulette extends EventTarget {
   constructor() {
     super();
     this._renderer = this.createRenderer();
+    this._renderer.setRenderScale(options.renderScale);
     this._renderer.init().then(() => {
       this._init().then(() => {
         this._isReady = true;
@@ -411,6 +412,13 @@ export class Roulette extends EventTarget {
 
   public setAutoRecording(value: boolean) {
     this._autoRecording = value;
+  }
+
+  public setRenderScale(value: RenderScale) {
+    if (!isRenderScale(value)) return;
+
+    options.renderScale = value;
+    this._renderer.setRenderScale(value);
   }
 
   public setMarbles(names: string[]) {

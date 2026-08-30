@@ -118,12 +118,18 @@ export class Camera {
     return current + d / delta;
   }
 
-  renderScene(ctx: CanvasRenderingContext2D, callback: (ctx: CanvasRenderingContext2D) => void) {
+  renderScene(
+    ctx: CanvasRenderingContext2D,
+    callback: (ctx: CanvasRenderingContext2D) => void,
+    viewportSize?: VectorLike
+  ) {
     const zoomFactor = initialZoom * 2 * this._zoom;
+    const viewportWidth = viewportSize?.x ?? ctx.canvas.width;
+    const viewportHeight = viewportSize?.y ?? ctx.canvas.height;
     ctx.save();
     ctx.translate(-this.x * this._zoom, -this.y * this._zoom);
     ctx.scale(this.zoom, this.zoom);
-    ctx.translate(ctx.canvas.width / zoomFactor, ctx.canvas.height / zoomFactor);
+    ctx.translate(viewportWidth / zoomFactor, viewportHeight / zoomFactor);
     callback(ctx);
     ctx.restore();
   }
