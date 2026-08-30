@@ -114,7 +114,6 @@ export class RouletteRenderer {
     if (!isRenderScale(value)) return;
 
     this._renderScale = value;
-    this._renderFactor = value / 0.5;
     this.resize();
   }
 
@@ -124,23 +123,27 @@ export class RouletteRenderer {
     const realSize = entries?.[0]?.contentRect ?? this._canvas.getBoundingClientRect();
     if (realSize.width <= 0 || realSize.height <= 0) return;
 
-    const physicalWidth = Math.max(
-      1,
-      Math.round(Math.max(realSize.width * this._renderScale, 640 * this._renderFactor))
-    );
+    const displayWidth = Math.min(realSize.width, MAX_DISPLAY_WIDTH);
+    // Keep the logical viewport's minimum for framing, but derive the physical
+    // backing resolution solely from the display size and selected quality.
+    const logicalWidth = Math.max(realSize.width / 2, 640);
+    const logicalHeight = (logicalWidth / realSize.width) * realSize.height;
+    const physicalWidth = Math.max(1, Math.round(displayWidth * this._renderScale));
     const physicalHeight = Math.max(1, Math.round((physicalWidth / realSize.width) * realSize.height));
-    const logicalWidth = physicalWidth / this._renderFactor;
-    const logicalHeight = physicalHeight / this._renderFactor;
 
     this._logicalWidth = logicalWidth;
     this._logicalHeight = logicalHeight;
+    this._renderFactor = physicalWidth / logicalWidth;
     this._sceneCanvas.width = physicalWidth;
     this._sceneCanvas.height = physicalHeight;
     this.sizeFactor = logicalWidth / realSize.width;
 
-    const displayWidth = Math.min(realSize.width, MAX_DISPLAY_WIDTH);
     this._canvas.width = displayWidth;
     this._canvas.height = (displayWidth / realSize.width) * realSize.height;
+    this._displayCtx.imageSmoothingEnabled = true;
+    if ('imageSmoothingQuality' in this._displayCtx) {
+      this._displayCtx.imageSmoothingQuality = 'high';
+    }
   }
 
   async init() {
