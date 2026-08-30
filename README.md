@@ -7,7 +7,8 @@ This repository is a fork of [lazygyu/roulette](https://github.com/lazygyu/roule
 ## What changed from upstream
 
 - Removed the upstream commercial advertising service, preroll/result ad overlays, impression tracking, external keyword/sprite service, and analytics integrations.
-- Preserved map-level `adBoards` metadata for a future user-defined Sponsor/Branding feature. The custom sponsor UI/storage/rendering is not implemented yet.
+- Added local Sponsor/Branding controls: upload multiple images, persist them as Blobs in IndexedDB, select one from a dropdown, temporarily disable rendering with an `enabled` toggle, and delete selected images.
+- The selected sponsor image is rendered on every `StageDef.adBoards` position as a world-space billboard, preserving its aspect ratio with contain fitting. It naturally follows the camera, zoom, and DPR and is included in recordings.
 - Added Cloudflare Workers Static Assets deployment support.
 - Simplified rendering from a permanent two-canvas pipeline to one visible canvas.
 - Added DPR-aware render quality modes:
@@ -93,9 +94,11 @@ yarn deploy
 
 `yarn deploy` runs `wrangler deploy`.
 
-## Sponsor / Branding direction
+## Sponsor / Branding
 
-The upstream advertising network is intentionally not part of this fork. Future Sponsor/Branding support is intended to be operator-controlled and self-contained, using the existing in-map billboard positions instead of restoring the upstream preroll/result advertising system.
+Sponsor images are local and operator-controlled. Multiple images can be uploaded and persist as Blobs in IndexedDB; one can be selected from the dropdown, temporarily disabled with the `enabled` toggle, or deleted. When enabled and an image is selected, that image is rendered with contain fitting on every `StageDef.adBoards` position in world space, so it follows camera movement and zoom and is included in DPR-aware rendering and recordings. If no image is available or selected, nothing is rendered.
+
+This fork has no external advertising API, sponsor fetch, tracking, click links, preroll, or result overlay.
 
 ## License
 
