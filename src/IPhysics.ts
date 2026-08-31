@@ -1,14 +1,15 @@
 import type { StageDef } from './data/maps';
-import type { MapEntityState } from './types/MapEntity.type';
+import type { MapEntityRenderState } from './types/MapEntity.type';
+import type { Transform } from './utils/interpolation';
 
 export interface IPhysics {
   init(): Promise<void>;
 
-  clear(): void;
+  clearEntities(): void;
 
   clearMarbles(): void;
 
-  createStage(stage: StageDef): void;
+  loadStage(stage: StageDef): void;
 
   createMarble(id: number, x: number, y: number): void;
 
@@ -16,9 +17,9 @@ export interface IPhysics {
 
   removeMarble(id: number): void;
 
-  getMarblePosition(id: number): { x: number; y: number; angle: number };
+  getMarblePosition(id: number): Transform | undefined;
 
-  getEntities(): MapEntityState[];
+  getEntityRenderStates(): MapEntityRenderState[];
 
   impact(id: number): void;
 

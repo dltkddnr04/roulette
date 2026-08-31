@@ -1,6 +1,6 @@
 import { initialZoom, zoomThreshold } from './data/constants';
 import type { StageDef } from './data/maps';
-import type { Marble } from './marble';
+import type { MarbleRenderState } from './types/MarbleRenderState.type';
 import type { VectorLike } from './types/VectorLike';
 
 const REFERENCE_FRAME_TIME = 1000 / 60;
@@ -14,39 +14,28 @@ export class Camera {
   private _locked = false;
   private _shouldFollowMarbles = false;
 
-  get zoom() {
+  get zoom(): number {
     return this._zoom;
   }
 
-  set zoom(v: number) {
-    this._targetZoom = v;
-  }
-
-  get x() {
+  get x(): number {
     return this._position.x;
   }
 
-  set x(v: number) {
-    this._targetPosition.x = v;
-  }
-
-  get y() {
+  get y(): number {
     return this._position.y;
   }
 
-  set y(v: number) {
-    this._targetPosition.y = v;
+  get position(): VectorLike {
+    return { x: this._position.x, y: this._position.y };
   }
 
-  get position() {
-    return this._position;
+  setTargetPosition(v: VectorLike): void {
+    this._targetPosition = { x: v.x, y: v.y };
   }
 
-  setPosition(v: VectorLike, force: boolean = false) {
-    if (force) {
-      return (this._position = { x: v.x, y: v.y });
-    }
-    return (this._targetPosition = { x: v.x, y: v.y });
+  setTargetZoom(v: number): void {
+    this._targetZoom = v;
   }
 
   lock(v: boolean) {
@@ -70,23 +59,21 @@ export class Camera {
   }
 
   update({
-    marbles,
+    marbleRenderStates,
     stage,
     needToZoom,
     targetIndex,
-    interpolationAlpha,
     deltaTime,
   }: {
-    marbles: Marble[];
+    marbleRenderStates: MarbleRenderState[];
     stage: StageDef;
     needToZoom: boolean;
     targetIndex: number;
-    interpolationAlpha: number;
     deltaTime: number;
   }) {
     // set target position
     if (!this._locked) {
-      this._calcTargetPositionAndZoom(marbles, stage, needToZoom, targetIndex, interpolationAlpha);
+      this._calcTargetPositionAndZoom(marbleRenderStates, stage, needToZoom, targetIndex);
     }
 
     // Clamp camera time only; physics wall-clock/debt handling must remain lossless.
@@ -101,27 +88,26 @@ export class Camera {
   }
 
   private _calcTargetPositionAndZoom(
-    marbles: Marble[],
+    marbleRenderStates: MarbleRenderState[],
     stage: StageDef,
     needToZoom: boolean,
-    targetIndex: number,
-    interpolationAlpha: number
+    targetIndex: number
   ) {
     if (!this._shouldFollowMarbles) {
       return;
     }
 
-    if (marbles.length > 0) {
-      const targetMarble = marbles[targetIndex] ? marbles[targetIndex] : marbles[0];
-      this.setPosition(targetMarble.getRenderPosition(interpolationAlpha));
+    if (marbleRenderStates.length > 0) {
+      const targetMarble = marbleRenderStates[targetIndex] ? marbleRenderStates[targetIndex] : marbleRenderStates[0];
+      this.setTargetPosition(targetMarble.position);
       if (needToZoom) {
-        const goalDist = Math.abs(stage.zoomY - this._position.y);
-        this.zoom = Math.max(1, (1 - goalDist / zoomThreshold) * 4);
+        const goalDist = Math.abs(stage.camera.zoomTriggerY - this._position.y);
+        this.setTargetZoom(Math.max(1, (1 - goalDist / zoomThreshold) * 4));
       } else {
-        this.zoom = 1;
+        this.setTargetZoom(1);
       }
     } else {
-      this.zoom = 1;
+      this.setTargetZoom(1);
     }
   }
 

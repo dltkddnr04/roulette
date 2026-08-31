@@ -1,7 +1,8 @@
 import { initialZoom } from './data/constants';
+import { renderMarble } from './marbleRenderer';
 import type { RenderParameters } from './rouletteRenderer';
 import type { ColorTheme } from './types/ColorTheme';
-import type { MapEntityState } from './types/MapEntity.type';
+import type { MapEntityRenderState } from './types/MapEntity.type';
 import type { Rect } from './types/rect.type';
 import type { VectorLike } from './types/VectorLike';
 import type { UIObject } from './UIObject';
@@ -68,7 +69,7 @@ export class Minimap implements UIObject {
     if (!ctx) return;
     const { stage } = params;
     if (!stage) return;
-    this.boundingBox.h = stage.goalY * MINIMAP_SCALE;
+    this.boundingBox.h = stage.finish.y * MINIMAP_SCALE;
 
     this.lastParams = params;
 
@@ -77,7 +78,7 @@ export class Minimap implements UIObject {
     ctx.fillStyle = params.theme.minimapBackground;
     ctx.translate(MINIMAP_INSET, MINIMAP_INSET);
     ctx.scale(MINIMAP_SCALE, MINIMAP_SCALE);
-    ctx.fillRect(0, 0, MINIMAP_UNITS, stage.goalY);
+    ctx.fillRect(0, 0, MINIMAP_UNITS, stage.finish.y);
 
     this.ctx.lineWidth = 3 / (params.camera.zoom + initialZoom);
     this.drawEntities(params.entities, params.theme);
@@ -104,7 +105,7 @@ export class Minimap implements UIObject {
     this.ctx.restore();
   }
 
-  private drawEntities(entities: MapEntityState[], theme: ColorTheme) {
+  private drawEntities(entities: MapEntityRenderState[], theme: ColorTheme) {
     this.ctx.save();
     entities.forEach((entity) => {
       this.ctx.save();
@@ -117,8 +118,8 @@ export class Minimap implements UIObject {
       const shape = entity.shape;
       switch (shape.type) {
         case 'box': {
-          const w = shape.width * 2;
-          const h = shape.height * 2;
+          const w = shape.halfWidth * 2;
+          const h = shape.halfHeight * 2;
           this.ctx.rotate(shape.rotation);
           this.ctx.fillRect(-w / 2, -h / 2, w, h);
           break;
@@ -146,7 +147,7 @@ export class Minimap implements UIObject {
   }
 
   private drawMarbles(params: RenderParameters) {
-    const { marbles, alpha } = params;
+    const { marbles } = params;
     const viewPort = {
       x: params.camera.x,
       y: params.camera.y,
@@ -155,7 +156,14 @@ export class Minimap implements UIObject {
       zoom: params.camera.zoom * initialZoom,
     };
     marbles.forEach((marble) => {
-      marble.render(this.ctx, 1, false, true, undefined, viewPort, params.theme, marble.getRenderPosition(alpha));
+      renderMarble(this.ctx, marble, {
+        zoom: 1,
+        outline: false,
+        isMinimap: true,
+        viewPort,
+        theme: params.theme,
+        skillsEnabled: false,
+      });
     });
   }
 }

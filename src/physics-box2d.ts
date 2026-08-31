@@ -1,27 +1,35 @@
 import Box2DFactory from 'box2d-wasm';
+import { MARBLE_PHYSICS_RADIUS } from './data/constants';
 import type { StageDef } from './data/maps';
 import type { IPhysics } from './IPhysics';
-import type { MapEntity, MapEntityState } from './types/MapEntity.type';
+import type { MapEntity, MapEntityRenderState } from './types/MapEntity.type';
+import type { Transform } from './utils/interpolation';
+import type { RandomSource } from './utils/random';
 
 export class Box2dPhysics implements IPhysics {
+  private readonly randomSource: RandomSource;
   private Box2D!: typeof Box2D & EmscriptenModule;
   private gravity!: Box2D.b2Vec2;
   private world!: Box2D.b2World;
 
   private marbleMap: { [id: number]: Box2D.b2Body } = {};
-  private entities: ({ body: Box2D.b2Body } & MapEntityState)[] = [];
+  private entities: {
+    body: Box2D.b2Body;
+    renderState: MapEntityRenderState;
+    destroyOnContact: boolean;
+  }[] = [];
 
   private deleteCandidates: Box2D.b2Body[] = [];
+
+  constructor(randomSource: RandomSource) {
+    this.randomSource = randomSource;
+  }
 
   async init(): Promise<void> {
     this.Box2D = await Box2DFactory();
     this.gravity = new this.Box2D.b2Vec2(0, 10);
     this.world = new this.Box2D.b2World(this.gravity);
     console.log('box2d ready');
-  }
-
-  clear(): void {
-    this.clearEntities();
   }
 
   clearMarbles(): void {
@@ -31,11 +39,12 @@ export class Box2dPhysics implements IPhysics {
     this.marbleMap = {};
   }
 
-  createStage(stage: StageDef): void {
+  loadStage(stage: StageDef): void {
+    this.clearEntities();
     this.createEntities(stage.entities);
   }
 
-  createEntities(entities?: MapEntity[]) {
+  private createEntities(entities?: MapEntity[]) {
     if (!entities) return;
 
     const bodyTypes = {
@@ -49,19 +58,17 @@ export class Box2dPhysics implements IPhysics {
       const body = this.world.CreateBody(bodyDef);
 
       const fixtureDef = new this.Box2D.b2FixtureDef();
-      fixtureDef.set_density(entity.props.density);
       fixtureDef.set_restitution(entity.props.restitution);
 
       let shape;
       switch (entity.shape.type) {
         case 'box':
           shape = new this.Box2D.b2PolygonShape();
-          shape.SetAsBox(entity.shape.width, entity.shape.height, 0, entity.shape.rotation);
+          shape.SetAsBox(entity.shape.halfWidth, entity.shape.halfHeight, 0, entity.shape.rotation);
           fixtureDef.set_shape(shape);
           body.CreateFixture(fixtureDef);
           break;
         case 'polyline':
-          shape = new this.Box2D.b2EdgeShape();
           for (let i = 0; i < entity.shape.points.length - 1; i++) {
             const p1 = entity.shape.points[i];
             const p2 = entity.shape.points[i + 1];
@@ -69,7 +76,8 @@ export class Box2dPhysics implements IPhysics {
             const v2 = new this.Box2D.b2Vec2(p2[0], p2[1]);
             const edge = new this.Box2D.b2EdgeShape();
             edge.SetTwoSided(v1, v2);
-            body.CreateFixture(edge, 1);
+            fixtureDef.set_shape(edge);
+            body.CreateFixture(fixtureDef);
           }
           break;
         case 'circle':
@@ -80,21 +88,29 @@ export class Box2dPhysics implements IPhysics {
           break;
       }
 
-      body.SetAngularVelocity(entity.props.angularVelocity);
+      if (entity.props.angularVelocity !== undefined) {
+        body.SetAngularVelocity(entity.props.angularVelocity);
+      }
       body.SetTransform(new this.Box2D.b2Vec2(entity.position.x, entity.position.y), 0);
       this.entities.push({
         body,
-        id: this.entities.length,
-        x: entity.position.x,
-        y: entity.position.y,
-        angle: 0,
-        shape: entity.shape,
-        life: entity.props.life ?? -1,
+        renderState: {
+          id: this.entities.length,
+          x: entity.position.x,
+          y: entity.position.y,
+          angle: 0,
+          shape: entity.shape,
+        },
+        destroyOnContact: entity.props.destroyOnContact ?? false,
       });
     });
   }
 
-  clearEntities() {
+  clearEntities(): void {
+    this.deleteCandidates.forEach((body) => {
+      this.world.DestroyBody(body);
+    });
+    this.deleteCandidates = [];
     this.entities.forEach((entity) => {
       this.world.DestroyBody(entity.body);
     });
@@ -102,15 +118,19 @@ export class Box2dPhysics implements IPhysics {
   }
 
   createMarble(id: number, x: number, y: number): void {
+    if (this.marbleMap[id]) {
+      throw new Error(`Marble with id ${id} already exists`);
+    }
+
     const circleShape = new this.Box2D.b2CircleShape();
-    circleShape.set_m_radius(0.25);
+    circleShape.set_m_radius(MARBLE_PHYSICS_RADIUS);
 
     const bodyDef = new this.Box2D.b2BodyDef();
     bodyDef.set_type(this.Box2D.b2_dynamicBody);
     bodyDef.set_position(new this.Box2D.b2Vec2(x, y));
 
     const body = this.world.CreateBody(bodyDef);
-    body.CreateFixture(circleShape, 1 + Math.random());
+    body.CreateFixture(circleShape, 1 + this.randomSource.next());
     body.SetAwake(false);
     body.SetEnabled(false);
     this.marbleMap[id] = body;
@@ -119,7 +139,10 @@ export class Box2dPhysics implements IPhysics {
   shakeMarble(id: number): void {
     const body = this.marbleMap[id];
     if (body) {
-      body.ApplyLinearImpulseToCenter(new this.Box2D.b2Vec2(Math.random() * 10 - 5, Math.random() * 10 - 5), true);
+      body.ApplyLinearImpulseToCenter(
+        new this.Box2D.b2Vec2(this.randomSource.next() * 10 - 5, this.randomSource.next() * 10 - 5),
+        true
+      );
     }
   }
 
@@ -131,21 +154,19 @@ export class Box2dPhysics implements IPhysics {
     }
   }
 
-  getMarblePosition(id: number): { x: number; y: number; angle: number } {
+  getMarblePosition(id: number): Transform | undefined {
     const marble = this.marbleMap[id];
-    if (marble) {
-      const pos = marble.GetPosition();
-      return { x: pos.x, y: pos.y, angle: marble.GetAngle() };
-    } else {
-      return { x: 0, y: 0, angle: 0 };
-    }
+    if (!marble) return undefined;
+
+    const pos = marble.GetPosition();
+    return { x: pos.x, y: pos.y, angle: marble.GetAngle() };
   }
 
-  getEntities(): MapEntityState[] {
-    return this.entities.map((entity) => {
+  getEntityRenderStates(): MapEntityRenderState[] {
+    return this.entities.map(({ body, renderState }) => {
       return {
-        ...entity,
-        angle: entity.body.GetAngle(),
+        ...renderState,
+        angle: body.GetAngle(),
       };
     });
   }
@@ -189,7 +210,7 @@ export class Box2dPhysics implements IPhysics {
 
     for (let i = this.entities.length - 1; i >= 0; i--) {
       const entity = this.entities[i];
-      if (entity.life > 0) {
+      if (entity.destroyOnContact) {
         const edge = entity.body.GetContactList();
         if (edge.contact?.IsTouching()) {
           this.deleteCandidates.push(entity.body);

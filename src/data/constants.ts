@@ -6,6 +6,8 @@ export const canvasHeight = 900;
 export const zoomThreshold = 5;
 export const STUCK_DELAY = 5000;
 export const winnerAreaHeight = 168;
+export const MARBLE_PHYSICS_RADIUS = 0.25;
+export const MARBLE_RENDER_DIAMETER = MARBLE_PHYSICS_RADIUS * 2;
 
 export enum Skills {
   None,

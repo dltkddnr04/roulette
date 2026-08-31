@@ -7,7 +7,7 @@ function getBrowserLocale() {
   return navigator.language.split('-')[0];
 }
 
-function translateElement(element: Element) {
+export function translateElement(element: Element) {
   if (!(element instanceof HTMLElement) || !locale) return;
 
   const prop = element.getAttribute('data-trans');
@@ -29,22 +29,17 @@ function translatePage() {
   document.querySelectorAll('[data-trans]').forEach(translateElement);
 }
 
-function setLocale(newLocale: string) {
+export function setLocale(newLocale: string) {
   if (newLocale === locale) return;
-
-  document.documentElement.lang = newLocale;
 
   const newLocaleLower = newLocale.toLocaleLowerCase();
 
   locale = newLocaleLower in Translations ? (newLocaleLower as TranslatedLanguages) : defaultLocale;
+  document.documentElement.lang = locale;
   translatePage();
 }
 
-document.addEventListener('DOMContentLoaded', () => {
-  console.log('localization loaded');
+export function initializeLocale() {
   const browserLocale = getBrowserLocale();
-  console.log('detected locale: ', browserLocale);
   setLocale(browserLocale);
-});
-
-(window as any).translateElement = translateElement;
+}

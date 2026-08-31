@@ -16,6 +16,8 @@ export type SponsorState = SponsorSettings & {
   assets: SponsorAssetInfo[];
 };
 
+import { readLocalStorage, writeLocalStorage } from './utils/storage';
+
 const DATABASE_NAME = 'marble-roulette-sponsors';
 const DATABASE_VERSION = 1;
 const ASSET_STORE_NAME = 'assets';
@@ -27,7 +29,7 @@ class SponsorStorage {
   private open(): Promise<IDBDatabase> {
     if (this.databasePromise) return this.databasePromise;
 
-    this.databasePromise = new Promise((resolve, reject) => {
+    const databasePromise = new Promise<IDBDatabase>((resolve, reject) => {
       if (typeof indexedDB === 'undefined') {
         reject(new Error('IndexedDB is not supported'));
         return;
@@ -46,7 +48,8 @@ class SponsorStorage {
       throw error;
     });
 
-    return this.databasePromise;
+    this.databasePromise = databasePromise;
+    return databasePromise;
   }
 
   private async request<T>(mode: IDBTransactionMode, operation: (store: IDBObjectStore) => IDBRequest<T>): Promise<T> {
@@ -222,8 +225,7 @@ export class SponsorManager {
 
   private loadSettings(): SponsorSettings {
     try {
-      if (typeof localStorage === 'undefined') return { enabled: false, selectedAssetId: null };
-      const value = localStorage.getItem(SETTINGS_STORAGE_KEY);
+      const value = readLocalStorage(SETTINGS_STORAGE_KEY);
       if (!value) return { enabled: false, selectedAssetId: null };
       const parsed = JSON.parse(value) as { enabled?: unknown; selectedAssetId?: unknown };
       return {
@@ -236,12 +238,6 @@ export class SponsorManager {
   }
 
   private saveSettings(): void {
-    try {
-      if (typeof localStorage !== 'undefined') {
-        localStorage.setItem(SETTINGS_STORAGE_KEY, JSON.stringify(this.settings));
-      }
-    } catch {
-      // Storage may be unavailable; the current session can still use sponsors.
-    }
+    writeLocalStorage(SETTINGS_STORAGE_KEY, JSON.stringify(this.settings));
   }
 }

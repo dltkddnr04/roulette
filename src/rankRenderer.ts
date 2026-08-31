@@ -1,6 +1,6 @@
-import type { Marble } from './marble';
 import type { WinnerRange } from './options';
 import type { RenderParameters } from './rouletteRenderer';
+import type { MarblePresentationState } from './types/MarbleRenderState.type';
 import type { Rect } from './types/rect.type';
 import type { MouseEventArgs, UIObject } from './UIObject';
 import { bound } from './utils/bound.decorator';
@@ -12,8 +12,8 @@ export class RankRenderer implements UIObject {
   private _userMoved = 0;
   private _currentWinner = -1;
   private maxY = 0;
-  private winners: Marble[] = [];
-  private marbles: Marble[] = [];
+  private winners: readonly MarblePresentationState[] = [];
+  private marbles: readonly MarblePresentationState[] = [];
   private winnerRange: WinnerRange = { start: 0, end: 0 };
   private messageHandler?: (msg: string) => void;
 

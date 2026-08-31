@@ -1,79 +1,61 @@
 import { Camera } from './camera';
-import { canvasHeight, canvasWidth, initialZoom, Skills, Themes, zoomThreshold } from './data/constants';
-import { type StageDef, stages } from './data/maps';
+import { canvasHeight, canvasWidth, initialZoom, Themes, zoomThreshold } from './data/constants';
+import { stages } from './data/maps';
 import { FastForwader } from './fastForwader';
 import type { GameObject } from './gameObject';
-import type { IPhysics } from './IPhysics';
-import { Marble } from './marble';
 import { Minimap } from './minimap';
 import options, { isRenderScale, type RenderScale, type WinnerRange } from './options';
 import { ParticleManager } from './particleManager';
-import { Box2dPhysics } from './physics-box2d';
+import { FIXED_PHYSICS_INTERVAL, type RaceRenderState } from './raceSimulation';
 import { RankRenderer } from './rankRenderer';
 import { RouletteRenderer } from './rouletteRenderer';
+import { RoundSession, type RoundState } from './roundSession';
 import { SkillEffect } from './skillEffect';
 import { type SponsorAssetInfo, SponsorManager, type SponsorState } from './sponsorStore';
 import type { ColorTheme } from './types/ColorTheme';
-import type { MapEntityState } from './types/MapEntity.type';
 import type { MouseEventHandlerName, MouseEventName } from './types/mouseEvents.type';
 import type { UIObject } from './UIObject';
 import { bound } from './utils/bound.decorator';
-import { interpolateTransform } from './utils/interpolation';
-import { parseName, shuffle } from './utils/utils';
+import type { Seed } from './utils/random';
 import { VideoRecorder } from './utils/videoRecorder';
 
-/** 입력 범위를 실제 구슬 수에 맞춰 자른다. 범위를 넘기면 뒤쪽이 잘린다 */
-function clipWinnerRange({ start, end }: WinnerRange, marbleCount: number): WinnerRange {
-  const last = Math.max(0, marbleCount - 1);
-  const clippedStart = Math.min(Math.max(0, start), last);
-  return { start: clippedStart, end: Math.min(Math.max(clippedStart, end), last) };
-}
-
-const MAX_PHYSICS_STEPS_PER_FRAME = 8;
-const MAX_MARBLES = 1000;
+export type { RoundState } from './roundSession';
 
 export class Roulette extends EventTarget {
-  private _marbles: Marble[] = [];
+  private _roundSession = new RoundSession();
 
   private _lastTime: number = 0;
-  private _elapsed: number = 0;
-  private _physicsDebt: number = 0;
 
-  private _updateInterval = 10;
-  private _timeScale = 1;
   private _speed = 1;
 
-  private _winners: Marble[] = [];
   private _particleManager = new ParticleManager();
-  private _stage: StageDef | null = null;
-  private _previousEntities: MapEntityState[] = [];
-  private _currentEntities: MapEntityState[] = [];
 
   protected _camera: Camera = new Camera();
   protected _renderer: RouletteRenderer;
 
   private _effects: GameObject[] = [];
 
-  private _winnerRange: WinnerRange = { start: 0, end: 0 };
   private _goalDist: number = Infinity;
-  private _isRunning: boolean = false;
-  /** 진행 중에는 null, 당첨자가 모두 확정되면 당첨자 배열 */
-  private _result: Marble[] | null = null;
 
   private _uiObjects: UIObject[] = [];
 
   private _autoRecording: boolean = false;
   private _recorder!: VideoRecorder;
+  private _recordingStopTimer: ReturnType<typeof setTimeout> | null = null;
+  private _recordingStartGeneration: number | null = null;
+  private _activeRecordingGeneration: number | null = null;
   private _sponsorManager = new SponsorManager();
 
-  private physics!: IPhysics;
-
-  private _isReady: boolean = false;
   protected fastForwarder!: FastForwader;
   protected _theme: ColorTheme = Themes.dark;
 
-  get isReady() {
-    return this._isReady;
+  /** Renderer/physics 초기화 완료 여부이며, 현재 round가 start 가능한지는 의미하지 않는다. */
+  public get isReady(): boolean {
+    return this._roundSession.isInitialized;
+  }
+
+  public get roundState(): RoundState {
+    return this._roundSession.roundState;
   }
 
   protected createRenderer(): RouletteRenderer {
@@ -91,7 +73,7 @@ export class Roulette extends EventTarget {
     this._renderer.setRenderScale(options.renderScale);
     this._renderer.init().then(() => {
       this._init().then(() => {
-        this._isReady = true;
+        this._roundSession.markReady();
         this._update();
       });
     });
@@ -119,10 +101,9 @@ export class Roulette extends EventTarget {
     this._lastTime = Date.now();
     if (document.hidden) return;
 
-    this._elapsed = 0;
-    this._physicsDebt = 0;
-    if (this._isReady) {
-      this._resetInterpolationSnapshots();
+    this._roundSession.resetTiming();
+    if (this._roundSession.isInitialized) {
+      this._roundSession.resetInterpolationSnapshots();
     }
   }
 
@@ -132,134 +113,102 @@ export class Roulette extends EventTarget {
     const currentTime = Date.now();
     const frameDelta = currentTime - this._lastTime;
 
-    this._elapsed += frameDelta * this._speed * this.fastForwarder.speed;
     this._lastTime = currentTime;
 
-    let accumulatedTime = this._physicsDebt + this._elapsed;
-    this._physicsDebt = 0;
-    let physicsSteps = 0;
+    const alpha = this._roundSession.advance(frameDelta, this._speed, this.fastForwarder.speed, {
+      onImpact: (position) => {
+        this._effects.push(new SkillEffect(position.x, position.y));
+      },
+      onFinish: (_marble, isWinningRank) => {
+        if (isWinningRank) {
+          this._particleManager.shot(this._renderer.width, this._renderer.height);
+        }
+      },
+      afterStep: () => {
+        const targetIndex = this._targetIndex;
+        const topY = this._roundSession.getActiveMarbleY(targetIndex) ?? 0;
+        const stage = this._roundSession.currentStage;
+        this._goalDist = Math.abs(stage ? stage.camera.zoomTriggerY - topY : Infinity);
+        const timeScale = this._calcTimeScale();
+        this._checkFinish();
+        return timeScale;
+      },
+      onStepComplete: () => {
+        this._particleManager.update(FIXED_PHYSICS_INTERVAL);
+        this._updateEffects(FIXED_PHYSICS_INTERVAL);
+        this._uiObjects.forEach((obj) => obj.update(FIXED_PHYSICS_INTERVAL));
+      },
+    });
 
-    // Keep each simulation step fixed at 10ms. Slow motion consumes more wall-clock
-    // budget per step, while debt still preserves all unprocessed simulation time.
-    while (physicsSteps < MAX_PHYSICS_STEPS_PER_FRAME) {
-      const stepBudget = this._updateInterval / this._timeScale;
-      if (accumulatedTime < stepBudget) break;
-
-      this._capturePreviousTransforms();
-      this.physics.step(this._updateInterval / 1000);
-      if (this._marbles.length > 1) {
-        this._marbles.sort((a, b) => b.y - a.y || a.id - b.id);
-      }
-      this._currentEntities = this._copyEntityStates(this.physics.getEntities());
-      this._updateMarbles(this._updateInterval);
-      this._particleManager.update(this._updateInterval);
-      this._updateEffects(this._updateInterval);
-      accumulatedTime -= stepBudget;
-      physicsSteps++;
-      this._uiObjects.forEach((obj) => obj.update(this._updateInterval));
-    }
-
-    // Preserve whole unprocessed step budgets as debt instead of dropping time.
-    // The per-frame cap prevents a long stall from monopolizing one frame.
-    const stepBudget = this._updateInterval / this._timeScale;
-    if (accumulatedTime >= stepBudget) {
-      const overdueSteps = Math.floor(accumulatedTime / stepBudget);
-      this._physicsDebt = overdueSteps * stepBudget;
-      accumulatedTime -= this._physicsDebt;
-    }
-    this._elapsed = accumulatedTime;
-    const alpha = this._elapsed / stepBudget;
-
-    if (this._stage) {
+    const renderStates = this._roundSession.getRenderStates(alpha);
+    const stage = this._roundSession.currentStage;
+    if (stage) {
       this._camera.update({
-        marbles: this._marbles,
-        stage: this._stage,
+        marbleRenderStates: renderStates.marbles,
+        stage,
         needToZoom: this._goalDist < zoomThreshold,
-        targetIndex: this._winners.length > 0 ? this._targetIndex : 0,
-        interpolationAlpha: alpha,
+        targetIndex: this._roundSession.getWinners().length > 0 ? this._targetIndex : 0,
         deltaTime: frameDelta,
       });
     }
 
-    this._render(alpha);
+    this._render(alpha, renderStates);
     window.requestAnimationFrame(this._update);
-  }
-
-  private _updateMarbles(deltaTime: number) {
-    if (!this._stage) return;
-
-    const finishedMarbles: Marble[] = [];
-    for (let i = 0; i < this._marbles.length; i++) {
-      const marble = this._marbles[i];
-      marble.update(deltaTime);
-      if (marble.skill === Skills.Impact) {
-        this._effects.push(new SkillEffect(marble.x, marble.y));
-        this.physics.impact(marble.id);
-      }
-      if (marble.y > this._stage.goalY) {
-        finishedMarbles.push(marble);
-        this._winners.push(marble);
-        if (this._isRunning && this._isWinningRank(this._winners.length - 1)) {
-          this._particleManager.shot(this._renderer.width, this._renderer.height);
-        }
-      }
-    }
-
-    // Remove from the game list before destroying the body so no later filter or
-    // game-state path reads a goal marble through its missing physics body.
-    this._marbles = this._marbles.filter((marble) => !finishedMarbles.includes(marble));
-    finishedMarbles.forEach((marble) => this.physics.removeMarble(marble.id));
-
-    const targetIndex = this._targetIndex;
-    const topY = this._marbles[targetIndex] ? this._marbles[targetIndex].y : 0;
-    this._goalDist = Math.abs(this._stage.zoomY - topY);
-    this._timeScale = this._calcTimeScale();
-
-    this._checkFinish();
   }
 
   /** 카메라와 슬로우모션이 주목할 구슬 = 당첨 커트라인에 걸쳐있는 구슬 */
   private get _targetIndex() {
-    return this._winnerRange.end - this._winners.length;
+    return this._roundSession.getTargetIndex();
   }
 
-  private _isWinningRank(rank: number) {
-    return rank >= this._winnerRange.start && rank <= this._winnerRange.end;
+  private _clearRecordingStopTimer() {
+    if (this._recordingStopTimer === null) return;
+
+    clearTimeout(this._recordingStopTimer);
+    this._recordingStopTimer = null;
+  }
+
+  private _invalidateRecording() {
+    this._clearRecordingStopTimer();
+    this._recordingStartGeneration = null;
+    this._activeRecordingGeneration = null;
+    if (this._recorder?.isRecording) {
+      this._recorder.stop();
+    }
   }
 
   private _checkFinish() {
-    if (!this._isRunning) return;
-    const { start, end } = this._winnerRange;
+    const finish = this._roundSession.checkFinish();
+    if (!finish) return;
 
-    // 남은 구슬이 1개면 그 등수는 골인하지 않아도 확정된다. 2개 이상 남았다면 그들 사이의
-    // 순위는 물리로만 정해지므로 예측하지 않는다 (당첨 범위 안에서도 순위는 의미를 가진다)
-    const early = this._winners.length > 0 && this._marbles.length === 1;
-    const ranked = early ? [...this._winners, this._marbles[0]] : this._winners;
-    if (ranked.length <= end) return;
-
-    if (early && this._isWinningRank(this._winners.length)) {
+    if (finish.earlyWinning) {
       this._particleManager.shot(this._renderer.width, this._renderer.height);
     }
 
-    this._result = ranked.slice(start, end + 1);
-    this._isRunning = false;
-    this.dispatchEvent(
-      new CustomEvent('goal', {
-        detail: { winner: this._result[0].name, winners: this._result.map((m) => m.name) },
-      })
-    );
-    setTimeout(() => {
+    this._clearRecordingStopTimer();
+    this._recordingStopTimer = setTimeout(() => {
+      this._recordingStopTimer = null;
+      this._activeRecordingGeneration = null;
       this._recorder.stop();
     }, 1000);
+    this.dispatchEvent(
+      new CustomEvent('goal', {
+        detail: { winner: finish.result[0].name, winners: finish.result.map((m) => m.name) },
+      })
+    );
   }
 
   private _calcTimeScale(): number {
-    if (!this._stage) return 1;
+    const stage = this._roundSession.currentStage;
+    if (!stage) return 1;
     const targetIndex = this._targetIndex;
-    if (this._winners.length < this._winnerRange.end + 1 && this._goalDist < zoomThreshold) {
+    const targetMarbleY = this._roundSession.getActiveMarbleY(targetIndex);
+    const winnerRange = this._roundSession.getWinnerRange();
+    if (this._roundSession.getWinners().length < winnerRange.end + 1 && this._goalDist < zoomThreshold) {
       if (
-        this._marbles[targetIndex].y > this._stage.zoomY - zoomThreshold * 1.2 &&
-        (this._marbles[targetIndex - 1] || this._marbles[targetIndex + 1])
+        targetMarbleY !== undefined &&
+        targetMarbleY > stage.camera.zoomTriggerY - zoomThreshold * 1.2 &&
+        (this._roundSession.hasActiveMarbleAt(targetIndex - 1) || this._roundSession.hasActiveMarbleAt(targetIndex + 1))
       ) {
         return Math.max(0.2, this._goalDist / zoomThreshold);
       }
@@ -272,48 +221,21 @@ export class Roulette extends EventTarget {
     this._effects = this._effects.filter((effect) => !effect.isDestroy);
   }
 
-  private _copyEntityStates(entities: MapEntityState[]): MapEntityState[] {
-    return entities.map((entity) => ({ ...entity }));
-  }
-
-  private _capturePreviousTransforms() {
-    this._marbles.forEach((marble) => marble.capturePreviousPosition());
-    this._previousEntities = this._copyEntityStates(this._currentEntities);
-  }
-
-  private _resetInterpolationSnapshots() {
-    this._marbles.forEach((marble) => marble.resetInterpolation());
-    const entities = this._copyEntityStates(this.physics.getEntities());
-    this._previousEntities = entities;
-    this._currentEntities = this._copyEntityStates(entities);
-  }
-
-  private _getInterpolatedEntities(alpha: number): MapEntityState[] {
-    const previousById = new Map(this._previousEntities.map((entity) => [entity.id, entity]));
-    return this._currentEntities.map((entity) => {
-      const previous = previousById.get(entity.id);
-      if (!previous) return { ...entity };
-
-      return {
-        ...entity,
-        ...interpolateTransform(previous, entity, alpha),
-      };
-    });
-  }
-
-  private _render(alpha: number) {
-    if (!this._stage) return;
+  private _render(alpha: number, renderStates: RaceRenderState) {
+    const stage = this._roundSession.currentStage;
+    if (!stage) return;
+    const winners = this._roundSession.getWinners();
     const renderParams = {
       camera: this._camera,
-      stage: this._stage,
+      stage,
       sponsorImage: this._sponsorManager.renderImage,
-      entities: this._getInterpolatedEntities(alpha),
-      marbles: this._marbles,
-      winners: this._winners,
+      entities: renderStates.entities,
+      marbles: renderStates.marbles,
+      winners,
       particleManager: this._particleManager,
       effects: this._effects,
-      winnerRange: this._winnerRange,
-      result: this._result,
+      winnerRange: this._roundSession.getWinnerRange(),
+      result: this._roundSession.getResult(),
       size: { x: this._renderer.width, y: this._renderer.height },
       theme: this._theme,
       alpha,
@@ -324,15 +246,14 @@ export class Roulette extends EventTarget {
   private async _init() {
     this._recorder = new VideoRecorder(this._renderer.canvas);
 
-    this.physics = new Box2dPhysics();
-    await this.physics.init();
+    await this._roundSession.init();
 
     this.addUiObject(new RankRenderer());
     this.attachEvent();
     const minimap = new Minimap();
     minimap.onViewportChange((pos) => {
       if (pos) {
-        this._camera.setPosition(pos, false);
+        this._camera.setTargetPosition(pos);
         this._camera.lock(true);
       } else {
         this._camera.lock(false);
@@ -341,8 +262,8 @@ export class Roulette extends EventTarget {
     this.addUiObject(minimap);
     this.fastForwarder = this.createFastForwader();
     this.addUiObject(this.fastForwarder);
-    this._stage = stages[0];
-    this._loadMap();
+    this._roundSession.loadStage(stages[0]);
+    this._camera.initializePosition();
   }
 
   @bound
@@ -403,24 +324,15 @@ export class Roulette extends EventTarget {
     });
   }
 
-  private _loadMap() {
-    if (!this._stage) {
-      throw new Error('No map has been selected');
-    }
-
-    this.physics.createStage(this._stage);
-    this._resetInterpolationSnapshots();
-    this._camera.initializePosition();
-  }
-
   public clearMarbles() {
-    this.physics.clearMarbles();
-    this._result = null;
-    this._winners = [];
-    this._marbles = [];
+    if (!this._roundSession.isInitialized) return;
+
+    this._invalidateRecording();
+    this._roundSession.clearMarbles();
   }
 
   public async startRecording() {
+    if (!this._roundSession.isInitialized) return;
     if (!this._autoRecording) return;
     try {
       await this._recorder.start();
@@ -430,23 +342,46 @@ export class Roulette extends EventTarget {
   }
 
   public start() {
-    if (this._marbles.length === 0) return;
+    const roundGeneration = this._roundSession.prepareStart();
+    if (roundGeneration === null) return;
 
-    this._resetInterpolationSnapshots();
-    this._isRunning = true;
-    this._winnerRange = clipWinnerRange(options.winnerRange, this._marbles.length);
+    this._clearRecordingStopTimer();
     this._camera.startFollowingMarbles();
 
     const startPhysics = () => {
-      this.physics.start();
-      this._marbles.forEach((marble) => (marble.isActive = true));
+      this._roundSession.activate(roundGeneration);
     };
 
     if (this._autoRecording) {
+      this._recordingStartGeneration = roundGeneration;
       this._recorder
         .start()
-        .then(startPhysics)
+        .then(() => {
+          if (this._recordingStartGeneration !== roundGeneration) {
+            if (
+              this._recordingStartGeneration === null &&
+              this._activeRecordingGeneration === null &&
+              this._recorder.isRecording
+            ) {
+              this._recorder.stop();
+            }
+            return;
+          }
+          this._recordingStartGeneration = null;
+          if (!this._roundSession.isRunning(roundGeneration)) {
+            if (this._recorder.isRecording) this._recorder.stop();
+            return;
+          }
+          this._activeRecordingGeneration = roundGeneration;
+          startPhysics();
+        })
         .catch((e) => {
+          if (this._recordingStartGeneration !== roundGeneration) return;
+          this._recordingStartGeneration = null;
+          if (!this._roundSession.isRunning(roundGeneration)) {
+            if (this._recorder.isRecording) this._recorder.stop();
+            return;
+          }
           console.error('recording failed to start', e);
           startPhysics();
         });
@@ -475,18 +410,25 @@ export class Roulette extends EventTarget {
     return this._speed;
   }
 
+  public setSeed(seed: Seed) {
+    this._roundSession.setSeed(seed);
+  }
+
+  public getSeed(): Seed {
+    return this._roundSession.getSeed();
+  }
+
   public setWinningRank(rank: number) {
     this.setWinnerRange(rank, rank);
   }
 
   public setWinnerRange(start: number, end: number) {
-    options.winnerRange = { start, end };
-    this._winnerRange = clipWinnerRange(options.winnerRange, this._marbles.length);
+    this._roundSession.setWinnerRange(start, end);
   }
 
   /** 실제 구슬 수에 맞춰 잘린 범위 (0-based, 양끝 포함) */
   public getWinnerRange(): WinnerRange {
-    return { ...this._winnerRange };
+    return this._roundSession.getWinnerRange();
   }
 
   public setAutoRecording(value: boolean) {
@@ -521,88 +463,35 @@ export class Roulette extends EventTarget {
   }
 
   public setMarbles(names: string[]) {
-    this.reset();
-    const arr = names.slice();
+    if (!this._roundSession.isInitialized) return;
 
-    let maxWeight = -Infinity;
-    let minWeight = Infinity;
-
-    const members = arr
-      .map((nameString) => {
-        const result = parseName(nameString);
-        if (!result) return null;
-        const { name, weight, count } = result;
-        if (weight > maxWeight) maxWeight = weight;
-        if (weight < minWeight) minWeight = weight;
-        return { name, weight, count };
-      })
-      .filter((member) => !!member);
-
-    const gap = maxWeight - minWeight;
-
-    let totalCount = 0;
-    members.forEach((member) => {
-      if (member) {
-        member.weight = 0.1 + (gap ? (member.weight - minWeight) / gap : 0);
-        totalCount += member.count;
-      }
-    });
-
-    if (!Number.isSafeInteger(totalCount) || totalCount <= 0 || totalCount > MAX_MARBLES) return;
-
-    const orders = shuffle(
-      Array(totalCount)
-        .fill(0)
-        .map((_, i) => i)
-    );
-    members.forEach((member) => {
-      if (member) {
-        for (let j = 0; j < member.count; j++) {
-          const order = orders.pop() || 0;
-          this._marbles.push(new Marble(this.physics, order, totalCount, member.name, member.weight));
-        }
-      }
-    });
+    this._invalidateRecording();
+    const spawnLayout = this._roundSession.setParticipants(names);
+    if (!spawnLayout) return;
 
     // 카메라를 구슬 생성 위치 중앙으로 이동 + 줌인
-    if (totalCount > 0) {
-      const cols = Math.min(totalCount, 10);
-      const rows = Math.ceil(totalCount / 10);
-      const lineDelta = -Math.max(0, Math.ceil(rows - 5));
-      const centerX = 10.25 + (cols - 1) * 0.3;
-      const centerY = (1 + rows) / 2 + lineDelta;
+    const margin = 3;
+    const viewW = canvasWidth / initialZoom;
+    const viewH = canvasHeight / initialZoom;
+    const zoom = Math.max(
+      1.5,
+      Math.min(Math.min(viewW / (spawnLayout.width + margin * 2), viewH / (spawnLayout.height + margin * 2)), 3)
+    );
 
-      const spawnWidth = Math.max((cols - 1) * 0.6, 1);
-      const spawnHeight = Math.max(rows - 1, 1);
-      const margin = 3;
-      const viewW = canvasWidth / initialZoom;
-      const viewH = canvasHeight / initialZoom;
-      const zoom = Math.max(
-        1.5,
-        Math.min(Math.min(viewW / (spawnWidth + margin * 2), viewH / (spawnHeight + margin * 2)), 3)
-      );
-
-      this._camera.initializePosition({ x: centerX, y: centerY }, zoom);
-    }
-  }
-
-  private _clearMap() {
-    this.physics.clear();
-    this._marbles = [];
+    this._camera.initializePosition(spawnLayout.center, zoom);
   }
 
   public reset() {
-    this._elapsed = 0;
-    this._physicsDebt = 0;
+    if (!this._roundSession.isInitialized) return;
+
+    this._invalidateRecording();
+    this._roundSession.reset();
     this._lastTime = Date.now();
-    this.clearMarbles();
-    this._clearMap();
-    this._loadMap();
     this._goalDist = Infinity;
   }
 
   public getCount() {
-    return this._marbles.length;
+    return this._roundSession.getCount();
   }
 
   public getMaps() {
@@ -615,20 +504,22 @@ export class Roulette extends EventTarget {
   }
 
   public getCurrentMap() {
-    if (!this._stage) return null;
+    const stage = this._roundSession.currentStage;
+    if (!stage) return null;
     return {
-      index: stages.indexOf(this._stage),
-      title: this._stage.title,
+      index: stages.indexOf(stage),
+      title: stage.title,
     };
   }
 
   public setMap(index: number) {
+    if (!this._roundSession.isInitialized) return;
+
     if (index < 0 || index > stages.length - 1) {
       throw new Error('Incorrect map number');
     }
-    const names = this._marbles.map((marble) => marble.name);
-    this._stage = stages[index];
-    this.setMarbles(names);
+    this._invalidateRecording();
+    this._roundSession.setMap(stages[index]);
     this._camera.initializePosition();
   }
 }

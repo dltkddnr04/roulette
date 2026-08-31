@@ -2,12 +2,13 @@ import type { Camera } from './camera';
 import { canvasHeight, canvasWidth, initialZoom, Themes, winnerAreaHeight } from './data/constants';
 import type { StageDef } from './data/maps';
 import type { GameObject } from './gameObject';
-import type { Marble } from './marble';
+import { renderMarble } from './marbleRenderer';
 import { MINIMAP_INSET, MINIMAP_WIDTH } from './minimap';
-import { isRenderScale, type RenderScale, type WinnerRange } from './options';
+import options, { isRenderScale, type RenderScale, type WinnerRange } from './options';
 import type { ParticleManager } from './particleManager';
 import type { ColorTheme } from './types/ColorTheme';
-import type { MapEntityState } from './types/MapEntity.type';
+import type { MapEntityRenderState } from './types/MapEntity.type';
+import type { MarblePresentationState, MarbleRenderState } from './types/MarbleRenderState.type';
 import type { Rect } from './types/rect.type';
 import type { VectorLike } from './types/VectorLike';
 import type { UIObject } from './UIObject';
@@ -16,14 +17,14 @@ export type RenderParameters = {
   camera: Camera;
   stage: StageDef;
   sponsorImage: HTMLImageElement | null;
-  entities: MapEntityState[];
-  marbles: Marble[];
-  winners: Marble[];
+  entities: MapEntityRenderState[];
+  marbles: MarbleRenderState[];
+  winners: readonly MarblePresentationState[];
   particleManager: ParticleManager;
   effects: GameObject[];
   winnerRange: WinnerRange;
   /** 진행 중에는 null, 당첨자가 모두 확정되면 당첨자 배열 */
-  result: Marble[] | null;
+  result: readonly MarblePresentationState[] | null;
   size: VectorLike;
   theme: ColorTheme;
   alpha: number;
@@ -98,7 +99,7 @@ export class RouletteRenderer {
   protected _theme: ColorTheme = Themes.dark;
   private _resultCloseRect: Rect | null = null;
   private _resultPopupClosed = false;
-  private _lastResult: Marble[] | null = null;
+  private _lastResult: readonly MarblePresentationState[] | null = null;
 
   get width() {
     return this._logicalWidth;
@@ -271,11 +272,11 @@ export class RouletteRenderer {
 
   private renderSponsorBoards(stage: StageDef, image: HTMLImageElement | null): void {
     if (!image || !image.complete || image.naturalWidth <= 0 || image.naturalHeight <= 0) return;
-    if (!stage.adBoards?.length) return;
+    if (!stage.branding?.length) return;
 
     const imageRatio = image.naturalWidth / image.naturalHeight;
     this.ctx.save();
-    stage.adBoards.forEach((board) => {
+    stage.branding.forEach((board) => {
       const width = board.w ?? DEFAULT_SPONSOR_BOARD_WIDTH;
       const height = board.h ?? DEFAULT_SPONSOR_BOARD_HEIGHT;
       if (!Number.isFinite(width) || width <= 0 || !Number.isFinite(height) || height <= 0) return;
@@ -293,7 +294,7 @@ export class RouletteRenderer {
     this.ctx.restore();
   }
 
-  private renderEntities(entities: MapEntityState[]) {
+  private renderEntities(entities: MapEntityRenderState[]) {
     this.ctx.save();
     entities.forEach((entity) => {
       const transform = this.ctx.getTransform();
@@ -317,8 +318,8 @@ export class RouletteRenderer {
           }
           break;
         case 'box': {
-          const w = shape.width * 2;
-          const h = shape.height * 2;
+          const w = shape.halfWidth * 2;
+          const h = shape.halfHeight * 2;
           this.ctx.rotate(shape.rotation);
           this.ctx.fillRect(-w / 2, -h / 2, w, h);
           this.ctx.strokeRect(-w / 2, -h / 2, w, h);
@@ -340,22 +341,21 @@ export class RouletteRenderer {
     effects.forEach((effect) => effect.render(this.ctx, camera.zoom * initialZoom, this._theme));
   }
 
-  private renderMarbles({ marbles, camera, winnerRange, winners, size, alpha }: RenderParameters) {
+  private renderMarbles({ marbles, camera, winnerRange, winners, size }: RenderParameters) {
     const firstIndex = winnerRange.start - winners.length;
     const lastIndex = winnerRange.end - winners.length;
 
     const viewPort = { x: camera.x, y: camera.y, w: size.x, h: size.y, zoom: camera.zoom * initialZoom };
     marbles.forEach((marble, i) => {
-      marble.render(
-        this.ctx,
-        camera.zoom * initialZoom,
-        i >= firstIndex && i <= lastIndex,
-        false,
-        this.getMarbleImage(marble.name),
+      renderMarble(this.ctx, marble, {
+        zoom: camera.zoom * initialZoom,
+        outline: i >= firstIndex && i <= lastIndex,
+        isMinimap: false,
+        skin: this.getMarbleImage(marble.name),
         viewPort,
-        this._theme,
-        marble.getRenderPosition(alpha)
-      );
+        theme: this._theme,
+        skillsEnabled: options.useSkills,
+      });
     });
   }
 
@@ -478,7 +478,7 @@ export class RouletteRenderer {
   }
 
   /** 당첨자가 여러명일 때 화면 중앙에 목록 팝업을 그린다 */
-  private renderWinnerList(winners: Marble[], { theme, winnerRange }: RenderParameters) {
+  private renderWinnerList(winners: readonly MarblePresentationState[], { theme, winnerRange }: RenderParameters) {
     const ctx = this.ctx;
     const w = this.width;
     const h = this.height;
@@ -549,7 +549,7 @@ export class RouletteRenderer {
     ctx.restore();
   }
 
-  private renderWinner(winner: Marble, theme: ColorTheme) {
+  private renderWinner(winner: MarblePresentationState, theme: ColorTheme) {
     const w = this.width;
     const h = this.height;
 

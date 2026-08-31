@@ -10,8 +10,8 @@ export interface EntityShapeBase {
 
 export interface EntityBoxShape extends EntityShapeBase {
   type: 'box';
-  width: number;
-  height: number;
+  halfWidth: number;
+  halfHeight: number;
   rotation: number;
 }
 
@@ -22,31 +22,44 @@ export interface EntityCircleShape extends EntityShapeBase {
 
 export interface EntityPolylineShape extends EntityShapeBase {
   type: 'polyline';
-  rotation: number;
   points: [number, number][];
 }
 
 export type EntityShape = EntityBoxShape | EntityCircleShape | EntityPolylineShape;
 
-export type EntityPhysicalProps = {
-  density: number;
+type EntityPhysicalPropsBase = {
   restitution: number;
-  angularVelocity: number;
-  life?: number;
+  destroyOnContact?: boolean;
 };
 
-export interface MapEntity {
-  position: VectorLike;
-  type: 'static' | 'kinematic';
-  shape: EntityShape;
-  props: EntityPhysicalProps;
-}
+export type StaticPhysicalProps = EntityPhysicalPropsBase & {
+  angularVelocity?: never;
+};
 
-export interface MapEntityState {
+export type KinematicPhysicalProps = EntityPhysicalPropsBase & {
+  angularVelocity?: number;
+};
+
+export type EntityPhysicalProps = StaticPhysicalProps | KinematicPhysicalProps;
+
+export type MapEntity =
+  | {
+      position: VectorLike;
+      type: 'static';
+      shape: EntityShape;
+      props: StaticPhysicalProps;
+    }
+  | {
+      position: VectorLike;
+      type: 'kinematic';
+      shape: EntityShape;
+      props: KinematicPhysicalProps;
+    };
+
+export interface MapEntityRenderState {
   id: number;
   x: number;
   y: number;
   angle: number;
   shape: EntityShape;
-  life: number;
 }
