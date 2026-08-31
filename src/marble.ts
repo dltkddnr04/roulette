@@ -39,16 +39,8 @@ export class Marble {
     return this.position.x;
   }
 
-  set x(v: number) {
-    this.position.x = v;
-  }
-
   get y() {
     return this.position.y;
-  }
-
-  set y(v: number) {
-    this.position.y = v;
   }
 
   get angle() {
