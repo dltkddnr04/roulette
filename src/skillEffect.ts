@@ -1,10 +1,15 @@
-import type { GameObject } from './gameObject';
-import type { ColorTheme } from './types/ColorTheme';
 import type { VectorLike } from './types/VectorLike';
 
 const lifetime = 500;
 
-export class SkillEffect implements GameObject {
+export type SkillEffectRenderState = Readonly<{
+  x: number;
+  y: number;
+  size: number;
+  alpha: number;
+}>;
+
+export class SkillEffect {
   private _size: number = 0;
   position: VectorLike;
   private _elapsed: number = 0;
@@ -22,15 +27,13 @@ export class SkillEffect implements GameObject {
     }
   }
 
-  render(ctx: CanvasRenderingContext2D, zoom: number, theme: ColorTheme) {
-    ctx.save();
+  getRenderState(): SkillEffectRenderState {
     const rate = this._elapsed / lifetime;
-    ctx.globalAlpha = 1 - rate * rate;
-    ctx.strokeStyle = theme.skillColor;
-    ctx.lineWidth = 1 / zoom;
-    ctx.beginPath();
-    ctx.arc(this.position.x, this.position.y, this._size, 0, Math.PI * 2);
-    ctx.stroke();
-    ctx.restore();
+    return {
+      x: this.position.x,
+      y: this.position.y,
+      size: this._size,
+      alpha: 1 - rate * rate,
+    };
   }
 }

@@ -4,6 +4,13 @@ import { Vector } from './utils/Vector';
 
 const lifetime = 3000;
 
+export type ParticleRenderState = Readonly<{
+  x: number;
+  y: number;
+  color: string;
+  alpha: number;
+}>;
+
 export class Particle {
   private _elapsed: number = 0;
   position: VectorLike = { x: 0, y: 0 };
@@ -33,11 +40,12 @@ export class Particle {
     }
   }
 
-  render(ctx: CanvasRenderingContext2D) {
-    ctx.save();
-    ctx.globalAlpha = 1 - (this._elapsed / lifetime) ** 2;
-    ctx.fillStyle = this.color;
-    ctx.fillRect(this.position.x, this.position.y, 20, 20);
-    ctx.restore();
+  getRenderState(): ParticleRenderState {
+    return {
+      x: this.position.x,
+      y: this.position.y,
+      color: this.color,
+      alpha: 1 - (this._elapsed / lifetime) ** 2,
+    };
   }
 }

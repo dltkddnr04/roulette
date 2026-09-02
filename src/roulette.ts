@@ -2,15 +2,13 @@ import { Camera } from './camera';
 import { canvasHeight, canvasWidth, initialZoom, Themes, zoomThreshold } from './data/constants';
 import { stages } from './data/maps';
 import { FastForwader } from './fastForwader';
-import type { GameObject } from './gameObject';
 import { Minimap } from './minimap';
 import options, { isRenderScale, type RenderScale, type WinnerRange } from './options';
-import { ParticleManager } from './particleManager';
+import { PresentationEffects } from './presentationEffects';
 import { FIXED_PHYSICS_INTERVAL, type RaceRenderState } from './raceSimulation';
 import { RankRenderer } from './rankRenderer';
 import { RouletteRenderer } from './rouletteRenderer';
 import { RoundSession, type RoundState } from './roundSession';
-import { SkillEffect } from './skillEffect';
 import { type SponsorAssetInfo, SponsorManager, type SponsorState } from './sponsorStore';
 import type { ColorTheme } from './types/ColorTheme';
 import type { MouseEventHandlerName, MouseEventName } from './types/mouseEvents.type';
@@ -28,12 +26,10 @@ export class Roulette extends EventTarget {
 
   private _speed = 1;
 
-  private _particleManager = new ParticleManager();
+  private _presentationEffects = new PresentationEffects();
 
   protected _camera: Camera = new Camera();
   protected _renderer: RouletteRenderer;
-
-  private _effects: GameObject[] = [];
 
   private _goalDist: number = Infinity;
 
@@ -90,7 +86,6 @@ export class Roulette extends EventTarget {
     }
     if (obj.onMessage) {
       obj.onMessage((msg) => {
-        console.log('onMessage', msg);
         this.dispatchEvent(new CustomEvent('message', { detail: msg }));
       });
     }
@@ -117,11 +112,11 @@ export class Roulette extends EventTarget {
 
     const alpha = this._roundSession.advance(frameDelta, this._speed, this.fastForwarder.speed, {
       onImpact: (position) => {
-        this._effects.push(new SkillEffect(position.x, position.y));
+        this._presentationEffects.addImpact(position);
       },
       onFinish: (_marble, isWinningRank) => {
         if (isWinningRank) {
-          this._particleManager.shot(this._renderer.width, this._renderer.height);
+          this._presentationEffects.shot(this._renderer.width, this._renderer.height);
         }
       },
       afterStep: () => {
@@ -134,8 +129,7 @@ export class Roulette extends EventTarget {
         return timeScale;
       },
       onStepComplete: () => {
-        this._particleManager.update(FIXED_PHYSICS_INTERVAL);
-        this._updateEffects(FIXED_PHYSICS_INTERVAL);
+        this._presentationEffects.update(FIXED_PHYSICS_INTERVAL);
         this._uiObjects.forEach((obj) => obj.update(FIXED_PHYSICS_INTERVAL));
       },
     });
@@ -182,7 +176,7 @@ export class Roulette extends EventTarget {
     if (!finish) return;
 
     if (finish.earlyWinning) {
-      this._particleManager.shot(this._renderer.width, this._renderer.height);
+      this._presentationEffects.shot(this._renderer.width, this._renderer.height);
     }
 
     this._clearRecordingStopTimer();
@@ -216,11 +210,6 @@ export class Roulette extends EventTarget {
     return 1;
   }
 
-  private _updateEffects(deltaTime: number) {
-    this._effects.forEach((effect) => effect.update(deltaTime));
-    this._effects = this._effects.filter((effect) => !effect.isDestroy);
-  }
-
   private _render(alpha: number, renderStates: RaceRenderState) {
     const stage = this._roundSession.currentStage;
     if (!stage) return;
@@ -232,8 +221,7 @@ export class Roulette extends EventTarget {
       entities: renderStates.entities,
       marbles: renderStates.marbles,
       winners,
-      particleManager: this._particleManager,
-      effects: this._effects,
+      effects: this._presentationEffects.getRenderState(),
       winnerRange: this._roundSession.getWinnerRange(),
       result: this._roundSession.getResult(),
       size: { x: this._renderer.width, y: this._renderer.height },
@@ -328,6 +316,7 @@ export class Roulette extends EventTarget {
     if (!this._roundSession.isInitialized) return;
 
     this._invalidateRecording();
+    this._presentationEffects.clear();
     this._roundSession.clearMarbles();
   }
 
@@ -466,6 +455,7 @@ export class Roulette extends EventTarget {
     if (!this._roundSession.isInitialized) return;
 
     this._invalidateRecording();
+    this._presentationEffects.clear();
     const spawnLayout = this._roundSession.setParticipants(names);
     if (!spawnLayout) return;
 
@@ -485,6 +475,7 @@ export class Roulette extends EventTarget {
     if (!this._roundSession.isInitialized) return;
 
     this._invalidateRecording();
+    this._presentationEffects.clear();
     this._roundSession.reset();
     this._lastTime = Date.now();
     this._goalDist = Infinity;
@@ -519,6 +510,7 @@ export class Roulette extends EventTarget {
       throw new Error('Incorrect map number');
     }
     this._invalidateRecording();
+    this._presentationEffects.clear();
     this._roundSession.setMap(stages[index]);
     this._camera.initializePosition();
   }

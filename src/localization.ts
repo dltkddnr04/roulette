@@ -29,6 +29,10 @@ function translatePage() {
   document.querySelectorAll('[data-trans]').forEach(translateElement);
 }
 
+export function translateTree(root: ParentNode): void {
+  root.querySelectorAll('[data-trans]').forEach(translateElement);
+}
+
 export function setLocale(newLocale: string) {
   if (newLocale === locale) return;
 

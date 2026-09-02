@@ -1,3 +1,4 @@
+import type { ParticleRenderState } from './particle';
 import { Particle } from './particle';
 
 export class ParticleManager {
@@ -10,8 +11,12 @@ export class ParticleManager {
     this._particles = this._particles.filter((particle) => !particle.isDestroy);
   }
 
-  render(ctx: CanvasRenderingContext2D) {
-    this._particles.forEach((particle) => particle.render(ctx));
+  clear(): void {
+    this._particles = [];
+  }
+
+  getRenderStates(): readonly ParticleRenderState[] {
+    return this._particles.map((particle) => particle.getRenderState());
   }
 
   shot(x: number, y: number) {

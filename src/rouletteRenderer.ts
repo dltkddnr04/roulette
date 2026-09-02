@@ -1,11 +1,11 @@
 import type { Camera } from './camera';
 import { canvasHeight, canvasWidth, initialZoom, Themes, winnerAreaHeight } from './data/constants';
 import type { StageDef } from './data/maps';
-import type { GameObject } from './gameObject';
 import { renderMarble } from './marbleRenderer';
 import { MINIMAP_INSET, MINIMAP_WIDTH } from './minimap';
 import options, { isRenderScale, type RenderScale, type WinnerRange } from './options';
-import type { ParticleManager } from './particleManager';
+import type { PresentationEffectsRenderState } from './presentationEffects';
+import type { SkillEffectRenderState } from './skillEffect';
 import type { ColorTheme } from './types/ColorTheme';
 import type { MapEntityRenderState } from './types/MapEntity.type';
 import type { MarblePresentationState, MarbleRenderState } from './types/MarbleRenderState.type';
@@ -20,8 +20,7 @@ export type RenderParameters = {
   entities: MapEntityRenderState[];
   marbles: MarbleRenderState[];
   winners: readonly MarblePresentationState[];
-  particleManager: ParticleManager;
-  effects: GameObject[];
+  effects: PresentationEffectsRenderState;
   winnerRange: WinnerRange;
   /** 진행 중에는 null, 당첨자가 모두 확정되면 당첨자 배열 */
   result: readonly MarblePresentationState[] | null;
@@ -265,7 +264,7 @@ export class RouletteRenderer {
     this.onAfterScene();
 
     uiObjects.forEach((obj) => obj.render(this.ctx, renderParameters, logicalWidth, logicalHeight));
-    renderParameters.particleManager.render(this.ctx);
+    this.renderParticles(renderParameters.effects);
     this.renderWinnerProgress(renderParameters);
     this.renderResult(renderParameters);
   }
@@ -338,7 +337,30 @@ export class RouletteRenderer {
   }
 
   private renderEffects({ effects, camera }: RenderParameters) {
-    effects.forEach((effect) => effect.render(this.ctx, camera.zoom * initialZoom, this._theme));
+    effects.skillEffects.forEach((effect) => {
+      this.renderSkillEffect(effect, camera.zoom * initialZoom);
+    });
+  }
+
+  private renderSkillEffect(effect: SkillEffectRenderState, zoom: number) {
+    this.ctx.save();
+    this.ctx.globalAlpha = effect.alpha;
+    this.ctx.strokeStyle = this._theme.skillColor;
+    this.ctx.lineWidth = 1 / zoom;
+    this.ctx.beginPath();
+    this.ctx.arc(effect.x, effect.y, effect.size, 0, Math.PI * 2);
+    this.ctx.stroke();
+    this.ctx.restore();
+  }
+
+  private renderParticles({ particles }: PresentationEffectsRenderState) {
+    particles.forEach((particle) => {
+      this.ctx.save();
+      this.ctx.globalAlpha = particle.alpha;
+      this.ctx.fillStyle = particle.color;
+      this.ctx.fillRect(particle.x, particle.y, 20, 20);
+      this.ctx.restore();
+    });
   }
 
   private renderMarbles({ marbles, camera, winnerRange, winners, size }: RenderParameters) {

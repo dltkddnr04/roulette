@@ -7,6 +7,8 @@
     "@parcel/packager-raw-url": "^2.16.4",
     "@parcel/transformer-sass": "^2.16.4",
     "@parcel/transformer-webmanifest": "^2.16.4",
+    "@types/react": "^19.1.10",
+    "@types/react-dom": "^19.1.7",
     "parcel": "^2.16.4",
     "typescript": "^5.6.3",
     "wrangler": "4.127.1"
@@ -20,6 +22,8 @@
     "deploy": "wrangler deploy"
   },
   "dependencies": {
-    "box2d-wasm": "^7.0.0"
+    "box2d-wasm": "^7.0.0",
+    "react": "^19.1.1",
+    "react-dom": "^19.1.1"
   }
 }
