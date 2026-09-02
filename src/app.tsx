@@ -131,6 +131,7 @@ function WinnerSettings({
           <input
             type="number"
             id="in_winningRank"
+            className={winnerType === 'custom' ? 'active' : ''}
             value={rank}
             min="1"
             onChange={(event) => onRankChange(event.currentTarget.value)}
