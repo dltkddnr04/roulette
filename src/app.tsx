@@ -370,6 +370,7 @@ export function App({ roulette }: { roulette: Roulette }) {
   const [toast, setToast] = useState<string | null>(null);
   const [toastId, setToastId] = useState(0);
   const toastTimer = useRef<number | null>(null);
+  const settingsTimer = useRef<number | null>(null);
 
   useEffect(() => {
     if (rootRef.current) translateTree(rootRef.current);
@@ -462,7 +463,11 @@ export function App({ roulette }: { roulette: Roulette }) {
 
   useEffect(() => {
     const onGoal = () => {
-      window.setTimeout(() => setSettingsHidden(false), 3000);
+      if (settingsTimer.current !== null) window.clearTimeout(settingsTimer.current);
+      settingsTimer.current = window.setTimeout(() => {
+        settingsTimer.current = null;
+        setSettingsHidden(false);
+      }, 3000);
     };
     const onMessage = (event: Event) => {
       const message = (event as CustomEvent<string>).detail;
@@ -473,6 +478,10 @@ export function App({ roulette }: { roulette: Roulette }) {
     return () => {
       roulette.removeEventListener('goal', onGoal);
       roulette.removeEventListener('message', onMessage);
+      if (settingsTimer.current !== null) {
+        window.clearTimeout(settingsTimer.current);
+        settingsTimer.current = null;
+      }
     };
   }, [roulette, showToast]);
 

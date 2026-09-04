@@ -295,45 +295,50 @@ export class RouletteRenderer {
 
   private renderEntities(entities: MapEntityRenderState[]) {
     this.ctx.save();
-    entities.forEach((entity) => {
-      const transform = this.ctx.getTransform();
-      this.ctx.translate(entity.x, entity.y);
-      this.ctx.rotate(entity.angle);
-      this.ctx.fillStyle = entity.shape.color ?? this._theme.entity[entity.shape.type].fill;
-      this.ctx.strokeStyle = entity.shape.color ?? this._theme.entity[entity.shape.type].outline;
-      this.ctx.shadowBlur = this._theme.entity[entity.shape.type].bloomRadius;
-      this.ctx.shadowColor =
-        entity.shape.bloomColor ?? entity.shape.color ?? this._theme.entity[entity.shape.type].bloom;
-      const shape = entity.shape;
-      switch (shape.type) {
-        case 'polyline':
-          if (shape.points.length > 0) {
-            this.ctx.beginPath();
-            this.ctx.moveTo(shape.points[0][0], shape.points[0][1]);
-            for (let i = 1; i < shape.points.length; i++) {
-              this.ctx.lineTo(shape.points[i][0], shape.points[i][1]);
+    try {
+      entities.forEach((entity) => {
+        const transform = this.ctx.getTransform();
+        try {
+          this.ctx.translate(entity.x, entity.y);
+          this.ctx.rotate(entity.angle);
+          this.ctx.fillStyle = entity.shape.color ?? this._theme.entity[entity.shape.type].fill;
+          this.ctx.strokeStyle = entity.shape.color ?? this._theme.entity[entity.shape.type].outline;
+          this.ctx.shadowBlur = this._theme.entity[entity.shape.type].bloomRadius;
+          this.ctx.shadowColor =
+            entity.shape.bloomColor ?? entity.shape.color ?? this._theme.entity[entity.shape.type].bloom;
+          const shape = entity.shape;
+          switch (shape.type) {
+            case 'polyline':
+              if (shape.points.length > 0) {
+                this.ctx.beginPath();
+                this.ctx.moveTo(shape.points[0][0], shape.points[0][1]);
+                for (let i = 1; i < shape.points.length; i++) {
+                  this.ctx.lineTo(shape.points[i][0], shape.points[i][1]);
+                }
+                this.ctx.stroke();
+              }
+              break;
+            case 'box': {
+              const w = shape.halfWidth * 2;
+              const h = shape.halfHeight * 2;
+              this.ctx.rotate(shape.rotation);
+              this.ctx.fillRect(-w / 2, -h / 2, w, h);
+              this.ctx.strokeRect(-w / 2, -h / 2, w, h);
+              break;
             }
-            this.ctx.stroke();
+            case 'circle':
+              this.ctx.beginPath();
+              this.ctx.arc(0, 0, shape.radius, 0, Math.PI * 2, false);
+              this.ctx.stroke();
+              break;
           }
-          break;
-        case 'box': {
-          const w = shape.halfWidth * 2;
-          const h = shape.halfHeight * 2;
-          this.ctx.rotate(shape.rotation);
-          this.ctx.fillRect(-w / 2, -h / 2, w, h);
-          this.ctx.strokeRect(-w / 2, -h / 2, w, h);
-          break;
+        } finally {
+          this.ctx.setTransform(transform);
         }
-        case 'circle':
-          this.ctx.beginPath();
-          this.ctx.arc(0, 0, shape.radius, 0, Math.PI * 2, false);
-          this.ctx.stroke();
-          break;
-      }
-
-      this.ctx.setTransform(transform);
-    });
-    this.ctx.restore();
+      });
+    } finally {
+      this.ctx.restore();
+    }
   }
 
   private renderEffects({ effects, camera }: RenderParameters) {

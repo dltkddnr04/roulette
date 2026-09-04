@@ -106,29 +106,32 @@ export function renderMarble(
 
   const transform = ctx.getTransform();
   const halfSize = state.size / 2;
-  ctx.fillStyle = `hsl(${state.hue} 100% ${theme.marbleLightness + 25 * Math.min(1, state.impact / 500)}%)`;
+  try {
+    ctx.fillStyle = `hsl(${state.hue} 100% ${theme.marbleLightness + 25 * Math.min(1, state.impact / 500)}%)`;
 
-  if (skin) {
-    transformGuard(ctx, () => {
-      ctx.translate(position.x, position.y);
-      ctx.rotate(position.angle);
-      ctx.drawImage(skin, -halfSize, -halfSize, state.size, state.size);
-    });
-  } else {
-    drawMarbleBody(ctx, state, false, position);
+    if (skin) {
+      transformGuard(ctx, () => {
+        ctx.translate(position.x, position.y);
+        ctx.rotate(position.angle);
+        ctx.drawImage(skin, -halfSize, -halfSize, state.size, state.size);
+      });
+    } else {
+      drawMarbleBody(ctx, state, false, position);
+    }
+
+    ctx.shadowColor = '';
+    ctx.shadowBlur = 0;
+    drawName(ctx, state, zoom, position);
+
+    if (outline) {
+      ctx.strokeStyle = theme.marbleWinningBorder;
+      drawOutline(ctx, state, 2 / zoom, position);
+    }
+
+    if (skillsEnabled) {
+      renderCoolTime(ctx, state, zoom, theme, position);
+    }
+  } finally {
+    ctx.setTransform(transform);
   }
-
-  ctx.shadowColor = '';
-  ctx.shadowBlur = 0;
-  drawName(ctx, state, zoom, position);
-
-  if (outline) {
-    ctx.strokeStyle = theme.marbleWinningBorder;
-    drawOutline(ctx, state, 2 / zoom, position);
-  }
-
-  if (skillsEnabled) {
-    renderCoolTime(ctx, state, zoom, theme, position);
-  }
-  ctx.setTransform(transform);
 }

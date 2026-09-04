@@ -41,6 +41,6 @@
     }
   },
   "files": {
-    "includes": ["src/**", "!src/custom/vendor/**"]
+    "includes": ["src/**", "test/**", "!src/custom/vendor/**"]
   }
 }

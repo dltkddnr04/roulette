@@ -59,8 +59,16 @@ class SponsorStorage {
       try {
         const transaction = database.transaction(ASSET_STORE_NAME, mode);
         const request = operation(transaction.objectStore(ASSET_STORE_NAME));
-        request.onsuccess = () => resolve(request.result);
+        let result!: T;
+        let requestCompleted = false;
+        request.onsuccess = () => {
+          result = request.result;
+          requestCompleted = true;
+        };
         request.onerror = () => reject(request.error ?? new Error('Sponsor storage request failed'));
+        transaction.oncomplete = () => {
+          if (requestCompleted) resolve(result);
+        };
         transaction.onerror = () => reject(transaction.error ?? new Error('Sponsor storage transaction failed'));
         transaction.onabort = () => reject(transaction.error ?? new Error('Sponsor storage transaction aborted'));
       } catch (error) {

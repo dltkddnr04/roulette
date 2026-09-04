@@ -41,11 +41,16 @@ export class RankRenderer implements UIObject {
 
         tsv.unshift(['Rank', 'Name', 'Winner'].join('\t'));
 
-        navigator.clipboard.writeText(tsv.join('\n')).then(() => {
-          if (this.messageHandler) {
-            this.messageHandler('The result has been copied');
-          }
-        });
+        void navigator.clipboard
+          .writeText(tsv.join('\n'))
+          .then(() => {
+            if (this.messageHandler) {
+              this.messageHandler('The result has been copied');
+            }
+          })
+          .catch(() => {
+            // Clipboard permissions can be denied without affecting the race.
+          });
       }
     }
   }

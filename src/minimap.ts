@@ -8,7 +8,7 @@ import type { VectorLike } from './types/VectorLike';
 import type { UIObject } from './UIObject';
 import { bound } from './utils/bound.decorator';
 
-const MINIMAP_SCALE = 4;
+export const MINIMAP_SCALE = 4;
 const MINIMAP_UNITS = 26;
 /** 미니맵은 좌측에 세로로 긴 스트립이다. 다른 HUD가 피해가려면 이 값이 필요하다 */
 export const MINIMAP_INSET = 10;
@@ -59,8 +59,8 @@ export class Minimap implements UIObject {
     };
     if (this._onViewportChangeHandler) {
       this._onViewportChangeHandler({
-        x: this.mousePosition.x / 4,
-        y: this.mousePosition.y / 4,
+        x: this.mousePosition.x / MINIMAP_SCALE,
+        y: this.mousePosition.y / MINIMAP_SCALE,
       });
     }
   }

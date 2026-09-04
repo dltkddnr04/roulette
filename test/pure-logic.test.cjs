@@ -51,10 +51,10 @@ test('parseName preserves supported participant syntax and rejects malformed mod
 });
 
 test('participant normalization safely aggregates special names without changing order', () => {
-  assert.deepEqual(
-    normalizeParticipantNames(['__proto__', '__proto__*2', 'A/2', 'A/2*2', 'A*3/2']),
-    ['__proto__*3', 'A/2*6']
-  );
+  assert.deepEqual(normalizeParticipantNames(['__proto__', '__proto__*2', 'A/2', 'A/2*2', 'A*3/2']), [
+    '__proto__*3',
+    'A/2*6',
+  ]);
 });
 
 test('spawn layout produces one position per participant', () => {
@@ -103,19 +103,14 @@ test('marble exposes a presentation snapshot without canvas responsibilities', (
 
 test('seeded random uses the stable mulberry32-v1 sequence', () => {
   const expected = [
-    0.26642920868471265,
-    0.0003297457005828619,
-    0.22327202744781971,
-    0.1462021479383111,
-    0.46732782293111086,
-    0.5450490827206522,
-    0.6152513844426721,
-    0.6489853798411787,
-    0.45600721263326705,
-    0.581218967679888,
+    0.26642920868471265, 0.0003297457005828619, 0.22327202744781971, 0.1462021479383111, 0.46732782293111086,
+    0.5450490827206522, 0.6152513844426721, 0.6489853798411787, 0.45600721263326705, 0.581218967679888,
   ];
   const first = createSeededRandom(0);
-  assert.deepEqual(expected.map(() => first.next()), expected);
+  assert.deepEqual(
+    expected.map(() => first.next()),
+    expected
+  );
 
   const numeric = createSeededRandom(123456);
   const numericAgain = createSeededRandom(123456);
@@ -198,7 +193,10 @@ test('setSeed supports deterministic rebuild and auto-seed replay', () => {
   };
   const stage = { finish: { y: 100 }, entities: [] };
   const participants = [{ name: 'Alice', weight: 1, count: 2 }];
-  const spawn = [{ x: 1, y: 1 }, { x: 2, y: 1 }];
+  const spawn = [
+    { x: 1, y: 1 },
+    { x: 2, y: 1 },
+  ];
   const snapshot = (simulation) =>
     simulation.getRenderStates(0).marbles.map(({ id, coolTime, position }) => ({ id, coolTime, position }));
 
