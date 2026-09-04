@@ -17,7 +17,7 @@ export type RoundFinish = {
   earlyWinning: boolean;
 };
 
-const MAX_MARBLES = 1000;
+export const MAX_MARBLES = 1000;
 
 function clipWinnerRange(start: number, end: number, marbleCount: number): { start: number; end: number } {
   const last = Math.max(0, marbleCount - 1);
@@ -67,6 +67,10 @@ export class RoundSession {
     return this.seed;
   }
 
+  getSeedMode(): 'random' | 'explicit' {
+    return this.simulation.getSeedMode();
+  }
+
   async init(): Promise<void> {
     await this.simulation.init();
   }
@@ -83,6 +87,22 @@ export class RoundSession {
   setSeed(seed: Seed): void {
     this.seed = seed;
     this.simulation.setSeed(seed);
+  }
+
+  useRandomSeed(): void {
+    this.simulation.useRandomSeed();
+  }
+
+  getParticipantInputs(): readonly string[] {
+    return this.participantInputs.slice();
+  }
+
+  setSkillsEnabled(enabled: boolean): void {
+    this.simulation.setSkillsEnabled(enabled);
+  }
+
+  getSkillsEnabled(): boolean {
+    return this.simulation.getSkillsEnabled();
   }
 
   setWinnerRange(start: number, end: number): void {

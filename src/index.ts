@@ -2,7 +2,7 @@ import { createElement } from 'react';
 import { createRoot } from 'react-dom/client';
 import { App } from './app';
 import { initializeLocale } from './localization';
-import options, { isRenderScale, type RenderScale } from './options';
+import { isRenderScale, type RenderScale } from './options';
 import { Roulette } from './roulette';
 import { readLocalStorage } from './utils/storage';
 
@@ -20,8 +20,7 @@ function readRenderScale(): RenderScale {
   return isRenderScale(value) ? value : 0.5;
 }
 
-options.renderScale = readRenderScale();
-const roulette = new Roulette();
+const roulette = new Roulette(readRenderScale());
 window.roulette = roulette;
 
 document.addEventListener('DOMContentLoaded', () => {

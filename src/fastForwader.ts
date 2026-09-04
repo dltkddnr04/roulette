@@ -29,6 +29,14 @@ export class FastForwader implements UIObject {
     return this.isEnabled ? 2 : 1;
   }
 
+  public get enabled(): boolean {
+    return this.isEnabled;
+  }
+
+  public setEnabled(enabled: boolean): void {
+    this.isEnabled = enabled;
+  }
+
   update(_deltaTime: number): void {}
 
   render(ctx: CanvasRenderingContext2D, _params: RenderParameters, width: number, height: number): void {
@@ -55,10 +63,10 @@ export class FastForwader implements UIObject {
 
   onMouseDown?(e?: MouseEventArgs): void {
     if (!e) return;
-    this.isEnabled = true;
+    this.setEnabled(true);
   }
 
   onMouseUp?(_e?: MouseEventArgs): void {
-    this.isEnabled = false;
+    this.setEnabled(false);
   }
 }

@@ -3,10 +3,11 @@ import { canvasHeight, canvasWidth, initialZoom, Themes, zoomThreshold } from '.
 import { stages } from './data/maps';
 import { FastForwader } from './fastForwader';
 import { Minimap } from './minimap';
-import options, { isRenderScale, type RenderScale, type WinnerRange } from './options';
+import { isRenderScale, type RenderScale, type WinnerRange } from './options';
 import { PresentationEffects } from './presentationEffects';
 import { FIXED_PHYSICS_INTERVAL, type RaceRenderState } from './raceSimulation';
 import { RankRenderer } from './rankRenderer';
+import { type ReplayDescriptor, type RouletteState, type ThemeName, validateReplayDescriptor } from './replay';
 import { RouletteRenderer } from './rouletteRenderer';
 import { RoundSession, type RoundState } from './roundSession';
 import { type SponsorAssetInfo, SponsorManager, type SponsorState } from './sponsorStore';
@@ -17,6 +18,7 @@ import { bound } from './utils/bound.decorator';
 import type { Seed } from './utils/random';
 import { VideoRecorder } from './utils/videoRecorder';
 
+export type { ReplayDescriptor, ReplayDescriptorV1, RouletteState, ThemeName } from './replay';
 export type { RoundState } from './roundSession';
 
 export class Roulette extends EventTarget {
@@ -44,6 +46,8 @@ export class Roulette extends EventTarget {
 
   protected fastForwarder!: FastForwader;
   protected _theme: ColorTheme = Themes.dark;
+  private _themeName: ThemeName = 'dark';
+  private _renderScale: RenderScale;
 
   /** Renderer/physics 초기화 완료 여부이며, 현재 round가 start 가능한지는 의미하지 않는다. */
   public get isReady(): boolean {
@@ -62,11 +66,12 @@ export class Roulette extends EventTarget {
     return new FastForwader();
   }
 
-  constructor() {
+  constructor(renderScale: RenderScale = 0.5) {
     super();
+    this._renderScale = renderScale;
     document.addEventListener('visibilitychange', this._handleVisibilityChange);
     this._renderer = this.createRenderer();
-    this._renderer.setRenderScale(options.renderScale);
+    this._renderer.setRenderScale(renderScale);
     this._renderer.init().then(() => {
       this._init().then(() => {
         this._roundSession.markReady();
@@ -227,6 +232,7 @@ export class Roulette extends EventTarget {
       size: { x: this._renderer.width, y: this._renderer.height },
       theme: this._theme,
       alpha,
+      skillsEnabled: this._roundSession.getSkillsEnabled(),
     };
     this._renderer.render(renderParams, this._uiObjects);
   }
@@ -394,8 +400,13 @@ export class Roulette extends EventTarget {
     return this._renderer.getResultCloseHitAt(e.offsetX * sizeFactor, e.offsetY * sizeFactor);
   }
 
-  public setTheme(themeName: keyof typeof Themes) {
+  public setTheme(themeName: ThemeName) {
     this._theme = Themes[themeName];
+    this._themeName = themeName;
+  }
+
+  public getTheme(): ThemeName {
+    return this._themeName;
   }
 
   public getSpeed() {
@@ -408,6 +419,14 @@ export class Roulette extends EventTarget {
 
   public getSeed(): Seed {
     return this._roundSession.getSeed();
+  }
+
+  public useRandomSeed(): void {
+    this._roundSession.useRandomSeed();
+  }
+
+  public getSeedMode(): 'random' | 'explicit' {
+    return this._roundSession.getSeedMode();
   }
 
   public setWinningRank(rank: number) {
@@ -425,6 +444,26 @@ export class Roulette extends EventTarget {
 
   public setAutoRecording(value: boolean) {
     this._autoRecording = value;
+  }
+
+  public getAutoRecording(): boolean {
+    return this._autoRecording;
+  }
+
+  public setSkillsEnabled(enabled: boolean): void {
+    this._roundSession.setSkillsEnabled(enabled);
+  }
+
+  public getSkillsEnabled(): boolean {
+    return this._roundSession.getSkillsEnabled();
+  }
+
+  public setFastForward(enabled: boolean): void {
+    this.fastForwarder?.setEnabled(enabled);
+  }
+
+  public getFastForward(): boolean {
+    return this.fastForwarder?.enabled ?? false;
   }
 
   public getSponsorState(): Promise<SponsorState> {
@@ -450,8 +489,12 @@ export class Roulette extends EventTarget {
   public setRenderScale(value: RenderScale) {
     if (!isRenderScale(value)) return;
 
-    options.renderScale = value;
+    this._renderScale = value;
     this._renderer.setRenderScale(value);
+  }
+
+  public getRenderScale(): RenderScale {
+    return this._renderScale;
   }
 
   public setMarbles(names: string[]) {
@@ -486,6 +529,58 @@ export class Roulette extends EventTarget {
 
   public getCount() {
     return this._roundSession.getCount();
+  }
+
+  public getState(): RouletteState {
+    return {
+      roundState: this.roundState,
+      map: this.getCurrentMap(),
+      count: this.getCount(),
+      seed: this.getSeed(),
+      seedMode: this.getSeedMode(),
+      winnerRange: this.getWinnerRange(),
+      speed: this.getSpeed(),
+      fastForward: this.getFastForward(),
+      skillsEnabled: this.getSkillsEnabled(),
+      renderScale: this.getRenderScale(),
+      autoRecording: this.getAutoRecording(),
+      theme: this.getTheme(),
+    };
+  }
+
+  public exportReplay(): ReplayDescriptor {
+    const map = this.getCurrentMap();
+    if (!map) throw new Error('Cannot export replay before initialization');
+
+    const participants = this._roundSession.getParticipantInputs();
+    if (participants.length === 0) {
+      throw new Error('Cannot export replay without participants');
+    }
+
+    return validateReplayDescriptor(
+      {
+        version: 1,
+        seed: this.getSeed(),
+        mapIndex: map.index,
+        participants: participants.slice(),
+        winnerRange: this.getWinnerRange(),
+        skillsEnabled: this.getSkillsEnabled(),
+      },
+      stages.length
+    );
+  }
+
+  public loadReplay(value: unknown): void {
+    if (!this._roundSession.isInitialized) throw new Error('Cannot load replay before initialization');
+    const replay = validateReplayDescriptor(value, stages.length);
+
+    // Apply the explicit seed before any rebuild so map/participant changes do
+    // not consume an auto-generated seed or alter the replay stream.
+    this.setSeed(replay.seed);
+    this.setSkillsEnabled(replay.skillsEnabled);
+    this.setMap(replay.mapIndex);
+    this.setMarbles(replay.participants.slice());
+    this.setWinnerRange(replay.winnerRange.start, replay.winnerRange.end);
   }
 
   public getMaps() {

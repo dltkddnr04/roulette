@@ -1,7 +1,7 @@
 import type { ChangeEvent } from 'react';
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { translateElement, translateTree } from './localization';
-import options, { isRenderScale, type RenderScale, type WinnerRange } from './options';
+import { isRenderScale, type RenderScale, type WinnerRange } from './options';
 import type { Roulette } from './roulette';
 import type { SponsorState } from './sponsorStore';
 import { getParticipantNames, normalizeParticipantNames } from './utils/participants';
@@ -362,10 +362,10 @@ export function App({ roulette }: { roulette: Roulette }) {
   const [rangeStart, setRangeStart] = useState('1');
   const [rangeEnd, setRangeEnd] = useState('3');
   const [mapIndex, setMapIndex] = useState(0);
-  const [renderScale, setRenderScale] = useState(options.renderScale);
-  const [autoRecording, setAutoRecording] = useState(false);
-  const [useSkills, setUseSkills] = useState(options.useSkills);
-  const [darkMode, setDarkMode] = useState(true);
+  const [renderScale, setRenderScale] = useState(roulette.getRenderScale());
+  const [autoRecording, setAutoRecording] = useState(roulette.getAutoRecording());
+  const [useSkills, setUseSkills] = useState(roulette.getSkillsEnabled());
+  const [darkMode, setDarkMode] = useState(roulette.getTheme() === 'dark');
   const [sponsorState, setSponsorState] = useState<SponsorState | null>(null);
   const [toast, setToast] = useState<string | null>(null);
   const [toastId, setToastId] = useState(0);
@@ -577,7 +577,7 @@ export function App({ roulette }: { roulette: Roulette }) {
           }}
           useSkills={useSkills}
           onSkillsChange={(value) => {
-            options.useSkills = value;
+            roulette.setSkillsEnabled(value);
             setUseSkills(value);
           }}
           darkMode={darkMode}

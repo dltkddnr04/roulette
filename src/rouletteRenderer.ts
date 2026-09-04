@@ -3,7 +3,7 @@ import { canvasHeight, canvasWidth, initialZoom, Themes, winnerAreaHeight } from
 import type { StageDef } from './data/maps';
 import { renderMarble } from './marbleRenderer';
 import { MINIMAP_INSET, MINIMAP_WIDTH } from './minimap';
-import options, { isRenderScale, type RenderScale, type WinnerRange } from './options';
+import { isRenderScale, type RenderScale, type WinnerRange } from './options';
 import type { PresentationEffectsRenderState } from './presentationEffects';
 import type { SkillEffectRenderState } from './skillEffect';
 import type { ColorTheme } from './types/ColorTheme';
@@ -27,6 +27,7 @@ export type RenderParameters = {
   size: VectorLike;
   theme: ColorTheme;
   alpha: number;
+  skillsEnabled: boolean;
 };
 
 const WINNER_TEXT_OFFSET = 30;
@@ -368,7 +369,7 @@ export class RouletteRenderer {
     });
   }
 
-  private renderMarbles({ marbles, camera, winnerRange, winners, size }: RenderParameters) {
+  private renderMarbles({ marbles, camera, winnerRange, winners, size, skillsEnabled }: RenderParameters) {
     const firstIndex = winnerRange.start - winners.length;
     const lastIndex = winnerRange.end - winners.length;
 
@@ -381,7 +382,7 @@ export class RouletteRenderer {
         skin: this.getMarbleImage(marble.name),
         viewPort,
         theme: this._theme,
-        skillsEnabled: options.useSkills,
+        skillsEnabled,
       });
     });
   }

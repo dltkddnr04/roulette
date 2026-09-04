@@ -58,6 +58,7 @@ export class RaceSimulation {
   private elapsed = 0;
   private physicsDebt = 0;
   private timeScale = 1;
+  private skillsEnabled = true;
   private stage: StageDef | null = null;
   private seed: Seed;
   // An omitted seed gets a new seed whenever participants are rebuilt; an
@@ -87,6 +88,22 @@ export class RaceSimulation {
 
   getSeed(): Seed {
     return this.seed;
+  }
+
+  getSeedMode(): 'random' | 'explicit' {
+    return this.hasExplicitSeed ? 'explicit' : 'random';
+  }
+
+  useRandomSeed(): void {
+    this.hasExplicitSeed = false;
+  }
+
+  setSkillsEnabled(enabled: boolean): void {
+    this.skillsEnabled = enabled;
+  }
+
+  getSkillsEnabled(): boolean {
+    return this.skillsEnabled;
   }
 
   async init(): Promise<void> {
@@ -223,7 +240,7 @@ export class RaceSimulation {
     const finishY = this.stage?.finish.y;
 
     for (const marble of this.marbles) {
-      marble.update(FIXED_PHYSICS_INTERVAL);
+      marble.update(FIXED_PHYSICS_INTERVAL, this.skillsEnabled);
       if (marble.skill) {
         const position = marble.getSimulationPosition();
         callbacks.onImpact({ x: position.x, y: position.y });

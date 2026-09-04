@@ -37,6 +37,7 @@ const { getMarbleSpawnLayout } = loadTypeScriptModule('src/utils/marbleSpawn.ts'
 const { Marble } = loadTypeScriptModule('src/marble.ts');
 const { getStepBudget, preservePhysicsDebt, RaceSimulation } = loadTypeScriptModule('src/raceSimulation.ts');
 const { RoundSession } = loadTypeScriptModule('src/roundSession.ts');
+const { validateReplayDescriptor } = loadTypeScriptModule('src/replay.ts');
 const { createSeededRandom } = loadTypeScriptModule('src/utils/random.ts');
 
 test('parseName preserves supported participant syntax and rejects malformed modifiers', () => {
@@ -48,6 +49,27 @@ test('parseName preserves supported participant syntax and rejects malformed mod
   assert.equal(parseName('Alice/1.5'), null);
   assert.equal(parseName('Alice*2abc'), null);
   assert.equal(parseName('Alice*2*3'), null);
+});
+
+test('replay descriptor validates simulation inputs and returns defensive copies', () => {
+  const input = {
+    version: 1,
+    seed: 'demo',
+    mapIndex: 0,
+    participants: ['Alice/2*3', 'Bob*2'],
+    winnerRange: { start: 0, end: 1 },
+    skillsEnabled: true,
+  };
+  const descriptor = validateReplayDescriptor(input, 4);
+
+  assert.deepEqual(descriptor, input);
+  assert.notEqual(descriptor.participants, input.participants);
+  assert.notEqual(descriptor.winnerRange, input.winnerRange);
+  assert.deepEqual(validateReplayDescriptor(JSON.parse(JSON.stringify(descriptor)), 4), descriptor);
+  assert.throws(() => validateReplayDescriptor({ ...input, version: 2 }, 4), /unsupported version/);
+  assert.throws(() => validateReplayDescriptor({ ...input, participants: ['Alice/1.5'] }, 4), /participants/);
+  assert.throws(() => validateReplayDescriptor({ ...input, seed: Number.NaN }, 4), /seed/);
+  assert.throws(() => validateReplayDescriptor({ ...input, winnerRange: { start: 2, end: 1 } }, 4), /winnerRange/);
 });
 
 test('participant normalization safely aggregates special names without changing order', () => {
@@ -201,6 +223,7 @@ test('setSeed supports deterministic rebuild and auto-seed replay', () => {
     simulation.getRenderStates(0).marbles.map(({ id, coolTime, position }) => ({ id, coolTime, position }));
 
   const simulation = new RaceSimulation(createPhysics(), 'api-seed');
+  assert.equal(simulation.getSeedMode(), 'explicit');
   simulation.loadStage(stage);
   simulation.replaceMarbles(participants, 2, spawn);
   const first = snapshot(simulation);
@@ -211,7 +234,12 @@ test('setSeed supports deterministic rebuild and auto-seed replay', () => {
   simulation.replaceMarbles(participants, 2, spawn);
   assert.notDeepEqual(snapshot(simulation), first);
 
+  simulation.useRandomSeed();
+  assert.equal(simulation.getSeedMode(), 'random');
+  assert.equal(simulation.getSeed(), 'other-api-seed');
+
   const auto = new RaceSimulation(createPhysics());
+  assert.equal(auto.getSeedMode(), 'random');
   auto.loadStage(stage);
   auto.replaceMarbles(participants, 2, spawn);
   const generatedSeed = auto.getSeed();
@@ -267,6 +295,11 @@ test('RoundSession owns round lifecycle and participant rebuild state', async ()
   const session = new RoundSession(new RaceSimulation(physics, 'round-session-seed'));
 
   assert.equal(session.roundState, 'initializing');
+  assert.equal(session.getSeedMode(), 'explicit');
+  session.setSkillsEnabled(false);
+  assert.equal(session.getSkillsEnabled(), false);
+  session.setSkillsEnabled(true);
+  assert.equal(session.getSkillsEnabled(), true);
   assert.equal(session.setParticipants(['Alice']), null);
 
   await session.init();

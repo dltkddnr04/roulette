@@ -1,6 +1,5 @@
 import { MARBLE_RENDER_DIAMETER, Skills, STUCK_DELAY } from './data/constants';
 import type { IPhysics } from './IPhysics';
-import options from './options';
 import type { MarblePresentationState, MarbleRenderState } from './types/MarbleRenderState.type';
 import type { VectorLike } from './types/VectorLike';
 import type { Transform } from './utils/interpolation';
@@ -95,7 +94,7 @@ export class Marble {
     return position;
   }
 
-  update(deltaTime: number) {
+  update(deltaTime: number, skillsEnabled = true) {
     if (this.isActive && Vector.lenSq(Vector.sub(this.lastPosition, this.requirePosition())) < 0.00001) {
       this._stuckTime += deltaTime;
 
@@ -114,7 +113,7 @@ export class Marble {
       this.impact = Math.max(0, this.impact - deltaTime);
     }
     if (!this.isActive) return;
-    if (options.useSkills) {
+    if (skillsEnabled) {
       this._updateSkillInformation(deltaTime);
     }
   }
