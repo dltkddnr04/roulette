@@ -27,8 +27,7 @@ export class Box2dPhysics implements IPhysics {
 
   async init(): Promise<void> {
     this.Box2D = await Box2DFactory();
-    this.gravity = new this.Box2D.b2Vec2(0, 10);
-    this.world = new this.Box2D.b2World(this.gravity);
+    this.resetWorld();
   }
 
   clearMarbles(): void {
@@ -38,8 +37,21 @@ export class Box2dPhysics implements IPhysics {
     this.marbleMap = {};
   }
 
+  resetWorld(): void {
+    this.marbleMap = {};
+    this.entities = [];
+    this.deleteCandidates = [];
+
+    if (this.world) {
+      this.world.__destroy__();
+    }
+
+    this.gravity = new this.Box2D.b2Vec2(0, 10);
+    this.world = new this.Box2D.b2World(this.gravity);
+  }
+
   loadStage(stage: StageDef): void {
-    this.clearEntities();
+    this.resetWorld();
     this.createEntities(stage.entities);
   }
 

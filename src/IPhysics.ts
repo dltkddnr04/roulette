@@ -9,6 +9,8 @@ export interface IPhysics {
 
   clearMarbles(): void;
 
+  resetWorld(): void;
+
   loadStage(stage: StageDef): void;
 
   createMarble(id: number, x: number, y: number): void;

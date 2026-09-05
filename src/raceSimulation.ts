@@ -158,6 +158,7 @@ export class RaceSimulation {
   resetTiming(): void {
     this.elapsed = 0;
     this.physicsDebt = 0;
+    this.timeScale = 1;
   }
 
   resetInterpolationSnapshots(): void {

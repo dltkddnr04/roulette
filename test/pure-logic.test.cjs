@@ -519,3 +519,109 @@ test('real Box2D races are bit-identical for the same seed across frame cadences
   assert.equal(runWithStall.frameDiagnostics.find(({ frame }) => frame === 1).steps, 8);
   assert.ok(runWithStall.frameDiagnostics.find(({ frame }) => frame === 1).debt > 0);
 });
+
+test('repeated replay rebuilds on one real Box2D simulation are bit-identical', async () => {
+  const stage = {
+    title: 'replay lifecycle determinism test',
+    finish: { y: 2.5 },
+    camera: { zoomTriggerY: 2 },
+    spawn: {
+      origin: { x: 10.25, y: 1 },
+      maxColumns: 10,
+      columnSpacing: 0.6,
+      rowSpacing: 1,
+      maxUnshiftedRows: 5,
+    },
+    entities: [
+      {
+        type: 'static',
+        position: { x: 10.85, y: 1.8 },
+        shape: { type: 'box', halfWidth: 1, halfHeight: 0.1, rotation: 0 },
+        props: { restitution: 0, destroyOnContact: true },
+      },
+    ],
+  };
+  const participants = [
+    { name: 'Alice', weight: 0.1, count: 1 },
+    { name: 'Bob', weight: 0.5, count: 1 },
+    { name: 'Carol', weight: 1, count: 1 },
+  ];
+  const spawn = [
+    { x: 10.25, y: 1 },
+    { x: 10.85, y: 1 },
+    { x: 11.45, y: 1 },
+  ];
+  const seed = 'repeated-replay';
+  const targetSteps = 160;
+  const simulation = new RaceSimulation(undefined, 'initial-seed');
+
+  const originalFetch = globalThis.fetch;
+  const originalLog = console.log;
+  globalThis.fetch = undefined;
+  console.log = () => {};
+  try {
+    await simulation.init();
+  } finally {
+    globalThis.fetch = originalFetch;
+    console.log = originalLog;
+  }
+
+  const run = () => {
+    simulation.resetTiming();
+    simulation.loadStage(stage);
+    simulation.setSeed(seed);
+    simulation.setSkillsEnabled(true);
+    simulation.replaceMarbles(participants, 3, spawn);
+    simulation.start();
+
+    const finished = [];
+    const trace = [];
+    let steps = 0;
+    let firstFrameSteps;
+    let frame = 0;
+    while (trace.length < targetSteps || simulation.physicsDebt !== 0) {
+      if (trace.length > 2000) throw new Error('repeated replay test did not settle');
+      const stepsBeforeFrame = steps;
+      simulation.advance(1000 / 60, 1, 1, {
+        onImpact() {},
+        onFinish(marble) {
+          finished.push(marble.id);
+        },
+        afterStep() {
+          return trace.length < targetSteps - 1 ? 1 : 0.2;
+        },
+        onStepComplete() {
+          steps++;
+          const states = simulation.getRenderStates(0).marbles;
+          trace.push({
+            step: trace.length,
+            active: states.map(({ id, position }) => ({ id, ...position })),
+            finished: finished.slice(),
+          });
+        },
+      });
+      if (frame === 0) firstFrameSteps = steps - stepsBeforeFrame;
+      frame++;
+    }
+
+    return {
+      trace: trace.slice(0, targetSteps),
+      finished,
+      debt: simulation.physicsDebt,
+      firstFrameSteps,
+    };
+  };
+
+  const runs = [run(), run(), run()];
+  assertExactTraceEqual(runs[1].trace, runs[0].trace, 'replay run 2');
+  assertExactTraceEqual(runs[2].trace, runs[0].trace, 'replay run 3');
+  assert.deepEqual(runs[1].finished, runs[0].finished);
+  assert.deepEqual(runs[2].finished, runs[0].finished);
+  assert.equal(runs[0].finished.length, 3);
+  assert.equal(runs[0].firstFrameSteps, 1);
+  assert.equal(runs[1].firstFrameSteps, 1);
+  assert.equal(runs[2].firstFrameSteps, 1);
+  assert.equal(runs[0].debt, 0);
+  assert.equal(runs[1].debt, 0);
+  assert.equal(runs[2].debt, 0);
+});
