@@ -9,7 +9,6 @@ import type { RandomSource } from './utils/random';
 export class Box2dPhysics implements IPhysics {
   private readonly randomSource: RandomSource;
   private Box2D!: typeof Box2D & EmscriptenModule;
-  private gravity!: Box2D.b2Vec2;
   private world!: Box2D.b2World;
 
   private marbleMap: { [id: number]: Box2D.b2Body } = {};
@@ -43,11 +42,12 @@ export class Box2dPhysics implements IPhysics {
     this.deleteCandidates = [];
 
     if (this.world) {
-      this.world.__destroy__();
+      this.Box2D.destroy(this.world);
     }
 
-    this.gravity = new this.Box2D.b2Vec2(0, 10);
-    this.world = new this.Box2D.b2World(this.gravity);
+    const gravity = new this.Box2D.b2Vec2(0, 10);
+    this.world = new this.Box2D.b2World(gravity);
+    this.Box2D.destroy(gravity);
   }
 
   loadStage(stage: StageDef): void {
