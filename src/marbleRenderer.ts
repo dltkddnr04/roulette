@@ -89,12 +89,15 @@ export function renderMarble(
   const viewPortHh = viewPort.h / viewPort.zoom / 2;
   const viewPortLeft = viewPort.x - viewPortHw;
   const viewPortRight = viewPort.x + viewPortHw;
-  const viewPortTop = viewPort.y - viewPortHh - state.size / 2;
+  const viewPortTop = viewPort.y - viewPortHh;
   const viewPortBottom = viewPort.y + viewPortHh;
-  if (
-    !isMinimap &&
-    (position.x < viewPortLeft || position.x > viewPortRight || position.y < viewPortTop || position.y > viewPortBottom)
-  ) {
+  const halfSize = state.size / 2;
+  const isOutsideView =
+    position.x + halfSize < viewPortLeft ||
+    position.x - halfSize > viewPortRight ||
+    position.y + halfSize < viewPortTop ||
+    position.y - halfSize > viewPortBottom;
+  if (!isMinimap && isOutsideView) {
     return;
   }
 
@@ -105,7 +108,6 @@ export function renderMarble(
   }
 
   const transform = ctx.getTransform();
-  const halfSize = state.size / 2;
   try {
     ctx.fillStyle = `hsl(${state.hue} 100% ${theme.marbleLightness + 25 * Math.min(1, state.impact / 500)}%)`;
 
