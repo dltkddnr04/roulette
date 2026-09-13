@@ -610,6 +610,8 @@ div.copyright a {
     .settings-collapsible {
       flex: 1 1 auto;
       min-height: 0;
+      display: flex;
+      flex-direction: column;
 
       &.collapsed {
         display: none;
