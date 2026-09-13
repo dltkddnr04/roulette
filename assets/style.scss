@@ -104,6 +104,7 @@ div.copyright a {
   max-width: calc(100vw - 2rem);
 
   display: flex;
+  column-gap: 10px;
   visibility: visible;
   opacity: 1;
   transition: visibility 0s, opacity 1s linear;
@@ -161,6 +162,7 @@ div.copyright a {
     flex-grow: 1;
     flex-shrink: 1;
     order: 1;
+    align-self: flex-end;
 
     .actions {
       display: flex;
@@ -645,6 +647,7 @@ div.copyright a {
     .left {
       order: 2;
       flex: 0 0 auto;
+      align-self: stretch;
     }
 
     textarea {
