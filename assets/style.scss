@@ -101,6 +101,7 @@ div.copyright a {
   padding: 10px;
   z-index: 999;
   min-width: 50%;
+  max-width: calc(100vw - 2rem);
 
   display: flex;
   visibility: visible;
@@ -121,8 +122,6 @@ div.copyright a {
 
   textarea {
     width: 100%;
-    // 오른쪽 칼럼이 패널 높이를 결정하면 '여러명'을 열 때 범위 행(div.row, 35px)만큼
-    // 패널이 세로로 튄다. 왼쪽이 항상 더 크도록 그만큼 미리 확보해 높이를 고정한다
     min-height: calc(5rem + 35px);
     border: none;
     background: #999;
@@ -150,7 +149,7 @@ div.copyright a {
 
   }
 
-  div.theme {
+  .theme {
     flex-grow: 1;
     display: flex;
     align-items: center;
@@ -158,7 +157,7 @@ div.copyright a {
     justify-content: flex-end;
   }
 
-  div.left {
+  .left {
     flex-grow: 1;
     flex-shrink: 1;
     order: 1;
@@ -169,7 +168,7 @@ div.copyright a {
       justify-content: stretch;
       gap: 2px;
 
-      div.sep {
+      .sep {
         flex-grow: 1;
       }
     }
@@ -179,35 +178,105 @@ div.copyright a {
     display: none;
   }
 
-  div.right {
+  .settings-panel {
     order: 2;
-    flex-grow: 0;
-    flex-shrink: 0;
+    flex: 0 1 50%;
+    min-width: 0;
 
-    div.row {
+    .settings-collapsible {
+      min-width: 0;
+    }
+
+    .settings-tabs {
+      min-width: 0;
+    }
+
+    .settings-tab-list {
+      display: flex;
+      min-width: 0;
+      overflow-x: auto;
+      scrollbar-width: thin;
+    }
+
+    .settings-tab {
+      flex: 1 0 auto;
+      min-width: 84px;
+      height: 25px;
+      white-space: nowrap;
+      border-radius: 0;
+      background: #999;
+      color: #fefefe;
+
+      &:first-child {
+        border-radius: 10px 0 0 10px;
+      }
+
+      &:last-child {
+        border-radius: 0 10px 10px 0;
+      }
+
+      &.active {
+        background: #333;
+      }
+    }
+
+    .settings-tab-panel {
+      min-width: 0;
+    }
+
+    .settings-row {
       display: flex;
       align-items: center;
       height: 35px;
 
-      label {
-        width: 150px;
-        flex-grow: 0;
-        flex-shrink: 0;
-        padding-left: 1rem;
-        color: white;
+      .settings-row-control {
+        flex: 1 1 auto;
+        min-width: 0;
       }
 
-      .toggle-item {
+      &.settings-row-theme {
+        .settings-row-label {
+          width: 0;
+          flex-basis: 0;
+          padding: 0;
+          overflow: hidden;
+        }
+
+        .settings-row-control {
+          display: flex;
+          justify-content: flex-end;
+        }
+      }
+
+      .settings-row-label {
+        width: 150px;
+        flex: 0 0 150px;
+        padding-left: 1rem;
+        color: white;
+        display: flex;
+        align-items: center;
+        gap: 4px;
+      }
+
+      .settings-toggle {
         width: 50%;
         display: flex;
         align-items: center;
       }
 
-      // div.right div.row 와 같은 자리에 두어야 display:flex 를 이긴다
-      &.row-range {
+      .settings-toggle-label {
+        flex: 1 1 auto;
+        min-width: 0;
+        display: flex;
+        align-items: center;
+        gap: 4px;
+        color: white;
+      }
+
+      &.settings-row-range {
         display: none;
 
-        label {
+        .settings-row-label {
           display: none;
         }
 
@@ -216,10 +285,7 @@ div.copyright a {
           padding-left: 150px;
         }
 
-        // div.right는 콘텐츠 폭으로 잡힌다. number input의 기본 폭(~169px)이 그대로
-        // 남으면 이 행을 열 때마다 오른쪽 칼럼 전체가 넓어진다. width를 0으로 눌러
-        // intrinsic 계산에서 빼고, flex-grow로 위 행이 정한 폭만 채우게 한다
-        .range-group {
+        .settings-range-control {
           flex: 1 1 0;
           min-width: 0;
 
@@ -235,13 +301,13 @@ div.copyright a {
         }
       }
 
-      &.row-sponsors {
+      &.settings-row-sponsors {
         height: auto;
         align-items: flex-start;
         padding-top: 5px;
         padding-bottom: 5px;
 
-        .sponsor-controls {
+        .settings-sponsor-controls {
           flex: 1 1 auto;
           min-width: 0;
           display: flex;
@@ -253,12 +319,12 @@ div.copyright a {
             color: white;
           }
 
-          .sponsor-actions {
+          .settings-sponsor-actions {
             display: flex;
             align-items: center;
             gap: 6px;
 
-            .sponsor-enabled {
+            .settings-sponsor-enabled {
               width: auto;
               flex: 1 1 auto;
               display: flex;
@@ -279,19 +345,19 @@ div.copyright a {
         }
       }
 
-      &.row-fairness {
+      &.settings-row-fairness {
         height: auto;
         align-items: flex-start;
         padding-top: 5px;
         padding-bottom: 5px;
 
-        .fairness-controls {
+        .settings-fairness-controls {
           flex: 1 1 auto;
           min-width: 0;
         }
 
-        .fairness-toolbar,
-        .fairness-actions,
+        .settings-fairness-toolbar,
+        .settings-fairness-actions,
         .fairness-participant,
         .fairness-draw {
           display: flex;
@@ -299,19 +365,19 @@ div.copyright a {
           gap: 6px;
         }
 
-        .fairness-toolbar,
-        .fairness-actions {
+        .settings-fairness-toolbar,
+        .settings-fairness-actions {
           margin-bottom: 4px;
         }
 
-        .fairness-toolbar select {
+        .settings-fairness-toolbar select {
           flex: 1 1 auto;
           min-width: 0;
         }
 
-        .fairness-enabled,
-        .fairness-excluded,
-        .fairness-import {
+        .settings-fairness-enabled,
+        .settings-fairness-excluded,
+        .settings-fairness-import {
           width: auto;
           display: flex;
           align-items: center;
@@ -320,7 +386,7 @@ div.copyright a {
           margin: 0;
         }
 
-        .fairness-import input[type=file] {
+        .settings-fairness-import input[type=file] {
           display: none;
         }
 
@@ -370,6 +436,28 @@ div.copyright a {
         }
       }
     }
+  }
+
+  .settings-toggle-grid {
+    display: flex;
+    align-items: center;
+    min-height: 35px;
+  }
+
+  .settings-toggle {
+    width: 50%;
+    min-width: 0;
+    display: flex;
+    align-items: center;
+  }
+
+  .settings-toggle-label {
+    flex: 1 1 auto;
+    min-width: 0;
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    color: white;
   }
 
   select {
@@ -422,7 +510,7 @@ div.copyright a {
     }
   }
 
-  .btn-group {
+  .settings-segmented-control {
     display: flex;
     justify-content: stretch;
 
@@ -476,10 +564,13 @@ div.copyright a {
 @media screen and (max-width: 750px) {
   #settings {
     bottom: 60px;
-    display: block;
+    display: flex;
+    flex-direction: column;
     min-width: 0;
-    max-width: 100%;
+    max-width: calc(100% - 2rem);
     width: calc(100% - 2rem);
+    max-height: calc(100vh - 76px);
+    max-height: calc(100dvh - 76px);
     overflow: hidden;
     opacity: 1;
     visibility: visible;
@@ -492,6 +583,7 @@ div.copyright a {
 
     .btn-toggle-settings {
       display: flex;
+      flex: 0 0 auto;
       align-items: center;
       justify-content: center;
       gap: 6px;
@@ -505,8 +597,54 @@ div.copyright a {
       }
     }
 
-    .collapsible-rows.collapsed {
-      display: none;
+    .settings-panel {
+      order: 1;
+      flex: 1 1 auto;
+      min-height: 0;
+      display: flex;
+      flex-direction: column;
+    }
+
+    .settings-collapsible {
+      flex: 1 1 auto;
+      min-height: 0;
+
+      &.collapsed {
+        display: none;
+      }
+    }
+
+    .settings-tabs {
+      display: flex;
+      flex-direction: column;
+      min-height: 0;
+    }
+
+    .settings-tab-list {
+      flex: 0 0 auto;
+      overflow-x: auto;
+      white-space: nowrap;
+    }
+
+    .settings-tab {
+      flex: 0 0 auto;
+      min-width: 84px;
+      min-height: 30px;
+    }
+
+    .settings-tab-panel {
+      flex: 1 1 auto;
+      min-height: 0;
+      max-height: calc(100vh - 180px);
+      max-height: calc(100dvh - 180px);
+      overflow-x: hidden;
+      overflow-y: auto;
+      overscroll-behavior: contain;
+    }
+
+    .left {
+      order: 2;
+      flex: 0 0 auto;
     }
 
     textarea {
@@ -514,42 +652,40 @@ div.copyright a {
       font-size: 11pt;
     }
 
-    div.right div.row {
+    .settings-toggle-grid {
+      display: flex;
+      flex-wrap: wrap;
+      border-bottom: 1px solid #555;
+      padding: .5rem 0;
+    }
+
+    .settings-toggle {
+      width: 50%;
+      display: flex;
+      flex-direction: column;
+      align-items: flex-start;
+      gap: .3rem;
+    }
+
+    .settings-toggle-label {
+      width: 100%;
+    }
+
+    .settings-panel .settings-row {
       height: auto;
       display: block;
       border-bottom: 1px solid #555;
       padding: .5rem 0;
 
-      label {
+      .settings-row-label {
         width: 100%;
         margin-bottom: .5rem;
         padding-left: 0;
-        display: block;
-      }
-
-      &.row-toggles {
         display: flex;
-        flex-wrap: wrap;
-
-        .toggle-item {
-          width: 50%;
-          display: flex;
-          flex-direction: column;
-          align-items: start;
-        }
-
-        label {
-          order: 0;
-          margin-bottom: .3rem;
-        }
-
-        input[type=checkbox] {
-          order: 1;
-        }
       }
 
-      &.row-sponsors {
-        .sponsor-controls .sponsor-actions .sponsor-enabled {
+      &.settings-row-sponsors {
+        .settings-sponsor-controls .settings-sponsor-actions .settings-sponsor-enabled {
           width: auto;
           display: flex;
           margin-bottom: 0;
@@ -557,9 +693,9 @@ div.copyright a {
         }
       }
 
-      &.row-fairness {
-        .fairness-toolbar,
-        .fairness-actions,
+      &.settings-row-fairness {
+        .settings-fairness-toolbar,
+        .settings-fairness-actions,
         .fairness-participant,
         .fairness-draw {
           flex-wrap: wrap;
@@ -571,12 +707,12 @@ div.copyright a {
         }
       }
 
-      &.row-range.active {
+      &.settings-row-range.active {
         display: flex;
         padding-left: 0;
       }
 
-      &.row-theme {
+      &.settings-row-theme {
         display: none;
       }
 

@@ -1,8 +1,11 @@
 import type { ChangeEvent } from 'react';
 import { useCallback, useEffect, useRef, useState } from 'react';
+import { ParticipantInput } from './components/settings/ParticipantInput';
+import { SettingsPanel } from './components/settings/SettingsPanel';
+import type { EditedRange, WinnerType } from './components/settings/WinnerSettings';
 import type { FairnessState } from './fairness';
 import { translateElement, translateTree } from './localization';
-import { isRenderScale, type RenderScale, type WinnerRange } from './options';
+import type { WinnerRange } from './options';
 import type { Roulette } from './roulette';
 import type { SponsorState } from './sponsorStore';
 import { getParticipantNames, normalizeParticipantNames } from './utils/participants';
@@ -11,9 +14,6 @@ import { readLocalStorage, writeLocalStorage } from './utils/storage';
 const NAMES_STORAGE_KEY = 'mbr_names';
 const RENDER_SCALE_STORAGE_KEY = 'mbr_render_scale';
 const DEFAULT_NAMES = '수박*2,키위*2,귤*2';
-
-type WinnerType = 'first' | 'last' | 'multi' | 'custom';
-type EditedRange = 'start' | 'end';
 
 function useRouletteReady(roulette: Roulette): boolean {
   const [ready, setReady] = useState(roulette.isReady);
@@ -47,467 +47,6 @@ function initialNames(): string {
   const savedNames = readLocalStorage(NAMES_STORAGE_KEY);
   if (namesFromUrl) return namesFromUrl.replace(/,/g, '\n');
   return savedNames ?? DEFAULT_NAMES;
-}
-
-type ParticipantInputProps = {
-  value: string;
-  onChange: (value: string) => void;
-  onBlur: () => void;
-  onShuffle: () => void;
-  onStart: () => void;
-};
-
-function ParticipantInput({ value, onChange, onBlur, onShuffle, onStart }: ParticipantInputProps) {
-  return (
-    <div className="left">
-      <h3 data-trans>Enter names below</h3>
-      <textarea
-        id="in_names"
-        placeholder="Input names separated by commas or line feed here"
-        data-trans="placeholder"
-        value={value}
-        onChange={(event) => onChange(event.currentTarget.value)}
-        onBlur={onBlur}
-      />
-      <div className="actions">
-        <div className="sep"></div>
-        <button id="btnShuffle" type="button" onClick={onShuffle}>
-          <i className="icon shuffle"></i>
-          <span data-trans>Shuffle</span>
-        </button>
-        <button id="btnStart" type="button" onClick={onStart}>
-          <i className="icon play"></i>
-          <span data-trans>Start</span>
-        </button>
-      </div>
-    </div>
-  );
-}
-
-type WinnerSettingsProps = {
-  winnerType: WinnerType;
-  rank: string;
-  rangeStart: string;
-  rangeEnd: string;
-  onSelect: (type: WinnerType) => void;
-  onRankChange: (value: string) => void;
-  onRangeChange: (field: EditedRange, value: string) => void;
-  onRangeBlur: (field: EditedRange) => void;
-};
-
-function WinnerSettings({
-  winnerType,
-  rank,
-  rangeStart,
-  rangeEnd,
-  onSelect,
-  onRankChange,
-  onRangeChange,
-  onRangeBlur,
-}: WinnerSettingsProps) {
-  return (
-    <>
-      <div className="row">
-        <label htmlFor="in_winningRank">
-          <i className="icon trophy"></i>
-          <span data-trans>The winner is</span>
-        </label>
-        <div className="btn-group">
-          <button
-            type="button"
-            className={`btn-winner btn-first-winner${winnerType === 'first' ? ' active' : ''}`}
-            data-trans
-            onClick={() => onSelect('first')}
-          >
-            First
-          </button>
-          <button
-            type="button"
-            className={`btn-winner btn-last-winner${winnerType === 'last' ? ' active' : ''}`}
-            data-trans
-            onClick={() => onSelect('last')}
-          >
-            Last
-          </button>
-          <input
-            type="number"
-            id="in_winningRank"
-            className={winnerType === 'custom' ? 'active' : ''}
-            value={rank}
-            min="1"
-            onChange={(event) => onRankChange(event.currentTarget.value)}
-            onBlur={() => onSelect('custom')}
-          />
-          <button
-            type="button"
-            className={`btn-winner btn-multi-winner${winnerType === 'multi' ? ' active' : ''}`}
-            data-trans
-            onClick={() => onSelect('multi')}
-          >
-            Multiple
-          </button>
-        </div>
-      </div>
-      <div className={`row row-range${winnerType === 'multi' ? ' active' : ''}`}>
-        <label htmlFor="in_rangeStart">
-          <span className="sr-only">Range start</span>
-        </label>
-        <div className="btn-group range-group">
-          <input
-            type="number"
-            id="in_rangeStart"
-            value={rangeStart}
-            min="1"
-            onChange={(event) => onRangeChange('start', event.currentTarget.value)}
-            onBlur={() => onRangeBlur('start')}
-          />
-          <span className="range-sep">~</span>
-          <input
-            type="number"
-            id="in_rangeEnd"
-            value={rangeEnd}
-            min="1"
-            onChange={(event) => onRangeChange('end', event.currentTarget.value)}
-            onBlur={() => onRangeBlur('end')}
-          />
-        </div>
-      </div>
-    </>
-  );
-}
-
-type SponsorSettingsProps = {
-  state: SponsorState | null;
-  onUpload: (event: ChangeEvent<HTMLInputElement>) => void;
-  onSelect: (assetId: string | null) => void;
-  onEnabled: (enabled: boolean) => void;
-  onDelete: () => void;
-};
-
-function SponsorSettings({ state, onUpload, onSelect, onEnabled, onDelete }: SponsorSettingsProps) {
-  return (
-    <div className="row row-sponsors">
-      <label htmlFor="inSponsorFiles">
-        <span>Branding &amp; Sponsors</span>
-      </label>
-      <div className="sponsor-controls">
-        <input type="file" id="inSponsorFiles" accept="image/*" multiple onChange={onUpload} />
-        <select
-          id="sltSponsor"
-          value={state?.selectedAssetId ?? ''}
-          onChange={(event) => onSelect(event.currentTarget.value || null)}
-        >
-          <option value="">No sponsor selected</option>
-          {state?.assets.map((asset) => (
-            <option key={asset.id} value={asset.id}>
-              {asset.name}
-            </option>
-          ))}
-        </select>
-        <div className="sponsor-actions">
-          <label className="sponsor-enabled" htmlFor="chkSponsorsEnabled">
-            <span>Enabled</span>
-            <input
-              type="checkbox"
-              id="chkSponsorsEnabled"
-              checked={state?.enabled ?? false}
-              onChange={(event) => onEnabled(event.currentTarget.checked)}
-            />
-          </label>
-          <button type="button" id="btnDeleteSponsor" disabled={!state?.selectedAssetId} onClick={onDelete}>
-            Delete selected
-          </button>
-        </div>
-      </div>
-    </div>
-  );
-}
-
-type FairnessSettingsProps = {
-  state: FairnessState | null;
-  onEnabled: (enabled: boolean) => void;
-  onModeChange: (mode: FairnessState['mode']) => void;
-  onRename: (participantId: string, currentName: string) => void;
-  onExcluded: (participantId: string, excluded: boolean) => void;
-  onNewEpoch: () => void;
-  onVoid: (drawId: string) => void;
-  onExport: () => void;
-  onImport: (value: string) => void;
-  onDelete: () => void;
-};
-
-function FairnessSettings({
-  state,
-  onEnabled,
-  onModeChange,
-  onRename,
-  onExcluded,
-  onNewEpoch,
-  onVoid,
-  onExport,
-  onImport,
-  onDelete,
-}: FairnessSettingsProps) {
-  const complete = state?.mode === 'complete';
-  return (
-    <div className="row row-fairness">
-      <label htmlFor="chkFairness">
-        <span data-trans>Cumulative fairness</span>
-      </label>
-      <div className="fairness-controls">
-        <div className="fairness-toolbar">
-          <label className="fairness-enabled" htmlFor="chkFairness">
-            <span data-trans>Enabled</span>
-            <input
-              type="checkbox"
-              id="chkFairness"
-              checked={state?.enabled ?? false}
-              disabled={state !== null && !state.available}
-              onChange={(event) => onEnabled(event.currentTarget.checked)}
-            />
-          </label>
-          <select
-            id="sltFairnessMode"
-            value={state?.mode ?? 'simple'}
-            onChange={(event) => {
-              if (event.currentTarget.value === 'simple' || event.currentTarget.value === 'complete') {
-                onModeChange(event.currentTarget.value);
-              }
-            }}
-          >
-            <option value="simple" data-trans>
-              Simple
-            </option>
-            <option value="complete" data-trans>
-              Complete
-            </option>
-          </select>
-        </div>
-        {state?.error ? <div className="fairness-error">{state.error}</div> : null}
-        {state?.enabled ? (
-          <>
-            <div className="fairness-actions">
-              <button type="button" onClick={onNewEpoch} data-trans>
-                Start a new fairness period
-              </button>
-              {complete ? (
-                <>
-                  <button type="button" onClick={onExport} data-trans>
-                    Export
-                  </button>
-                  <label className="fairness-import" htmlFor="inFairnessImport">
-                    <span data-trans>Import</span>
-                    <input
-                      type="file"
-                      id="inFairnessImport"
-                      accept="application/json,.json"
-                      onChange={(event) => {
-                        const file = event.currentTarget.files?.[0];
-                        event.currentTarget.value = '';
-                        if (!file) return;
-                        void file
-                          .text()
-                          .then(onImport)
-                          .catch(() => undefined);
-                      }}
-                    />
-                  </label>
-                  <button type="button" onClick={onDelete} data-trans>
-                    Delete history
-                  </button>
-                </>
-              ) : null}
-            </div>
-            <div className="fairness-participants">
-              {state.participants.map((participant) => (
-                <div className={`fairness-participant${participant.active ? '' : ' inactive'}`} key={participant.id}>
-                  <span className="fairness-participant-name">{participant.displayName}</span>
-                  {complete ? <code>{participant.id}</code> : null}
-                  <span className="fairness-stats">
-                    {complete
-                      ? `actual ${participant.actualWins} · fairness ${participant.fairnessCountedWins} · credit ${participant.balanceCredit} · effective ${participant.effectiveBalance}`
-                      : `wins ${participant.currentEpochWins}`}
-                  </span>
-                  {complete ? (
-                    <span className="fairness-status">
-                      {participant.active ? 'active' : 'inactive'} · {participant.participationHistory.length} status
-                      changes
-                    </span>
-                  ) : null}
-                  <label className="fairness-excluded" htmlFor={`exclude-${participant.id}`}>
-                    <span data-trans>Excluded</span>
-                    <input
-                      type="checkbox"
-                      id={`exclude-${participant.id}`}
-                      checked={participant.excluded}
-                      onChange={(event) => onExcluded(participant.id, event.currentTarget.checked)}
-                    />
-                  </label>
-                  <button type="button" onClick={() => onRename(participant.id, participant.displayName)} data-trans>
-                    Rename
-                  </button>
-                </div>
-              ))}
-            </div>
-            {state.recentDraws.length > 0 ? (
-              <div className="fairness-history">
-                {state.recentDraws.map((draw) => (
-                  <div className="fairness-draw" key={draw.id}>
-                    <span>
-                      {new Date(draw.confirmedAt ?? draw.preparedAt).toLocaleString()} · {draw.status} ·{' '}
-                      {draw.winners.map((winner) => winner.entryDisplayName).join(', ') || '—'}
-                    </span>
-                    {complete ? (
-                      <span className="fairness-draw-details">
-                        {draw.mapTitle} · {String(draw.seed)} · {draw.rawParticipantInputs.join(', ')} ·{' '}
-                        {draw.policy.id} ·{' '}
-                        {draw.entries
-                          .map(
-                            (entry) =>
-                              `${entry.displayName} (${entry.memberIds
-                                .map(
-                                  (memberId) =>
-                                    draw.members.find((member) => member.participantId === memberId)?.displayName
-                                )
-                                .filter((name): name is string => name !== undefined)
-                                .join(' + ')})`
-                          )
-                          .join(', ')}
-                      </span>
-                    ) : null}
-                    {complete && draw.status === 'confirmed' ? (
-                      <button type="button" onClick={() => onVoid(draw.id)} data-trans>
-                        Void
-                      </button>
-                    ) : null}
-                  </div>
-                ))}
-              </div>
-            ) : null}
-          </>
-        ) : null}
-      </div>
-    </div>
-  );
-}
-
-type SettingsPanelProps = {
-  collapsed: boolean;
-  onToggle: () => void;
-  maps: ReturnType<Roulette['getMaps']>;
-  mapIndex: number;
-  onMapChange: (index: number) => void;
-  renderScale: RenderScale;
-  onRenderScaleChange: (value: RenderScale) => void;
-  autoRecording: boolean;
-  onAutoRecordingChange: (value: boolean) => void;
-  useSkills: boolean;
-  onSkillsChange: (value: boolean) => void;
-  darkMode: boolean;
-  onDarkModeChange: (value: boolean) => void;
-  winnerSettings: WinnerSettingsProps;
-  sponsorSettings: SponsorSettingsProps;
-  fairnessSettings: FairnessSettingsProps;
-};
-
-function SettingsPanel({
-  collapsed,
-  onToggle,
-  maps,
-  mapIndex,
-  onMapChange,
-  renderScale,
-  onRenderScaleChange,
-  autoRecording,
-  onAutoRecordingChange,
-  useSkills,
-  onSkillsChange,
-  darkMode,
-  onDarkModeChange,
-  winnerSettings,
-  sponsorSettings,
-  fairnessSettings,
-}: SettingsPanelProps) {
-  return (
-    <div className="right">
-      <button type="button" className="btn-toggle-settings" onClick={onToggle}>
-        <span data-trans>Settings</span>
-        <i className="toggle-arrow">{collapsed ? '▲' : '▼'}</i>
-      </button>
-      <div className={`collapsible-rows${collapsed ? ' collapsed' : ''}`}>
-        <div className="row">
-          <label htmlFor="sltMap">
-            <i className="icon map"></i>
-            <span data-trans>Map</span>
-          </label>
-          <select id="sltMap" value={mapIndex} onChange={(event) => onMapChange(Number(event.currentTarget.value))}>
-            {maps.map((map) => (
-              <option key={map.index} value={map.index} data-trans>
-                {map.title}
-              </option>
-            ))}
-          </select>
-        </div>
-        <div className="row">
-          <label htmlFor="sltRenderScale">
-            <span data-trans>Render quality</span>
-          </label>
-          <select
-            id="sltRenderScale"
-            value={renderScale}
-            onChange={(event) => {
-              const value = Number(event.currentTarget.value);
-              if (isRenderScale(value)) onRenderScaleChange(value);
-            }}
-          >
-            <option value="0.5">Performance</option>
-            <option value="1">Native</option>
-          </select>
-        </div>
-        <SponsorSettings {...sponsorSettings} />
-        <FairnessSettings {...fairnessSettings} />
-        <div className="row row-toggles">
-          <div className="toggle-item">
-            <label htmlFor="chkAutoRecording">
-              <i className="icon record"></i>
-              <span data-trans>Recording</span>
-            </label>
-            <input
-              type="checkbox"
-              id="chkAutoRecording"
-              checked={autoRecording}
-              onChange={(event) => onAutoRecordingChange(event.currentTarget.checked)}
-            />
-          </div>
-          <div className="toggle-item">
-            <label htmlFor="chkSkill">
-              <i className="icon bomb"></i>
-              <span data-trans>Using skills</span>
-            </label>
-            <input
-              type="checkbox"
-              id="chkSkill"
-              checked={useSkills}
-              onChange={(event) => onSkillsChange(event.currentTarget.checked)}
-            />
-          </div>
-        </div>
-        <WinnerSettings {...winnerSettings} />
-        <div className="row row-theme">
-          <div className="theme">
-            <i className="icon sun"></i>
-            <input
-              type="checkbox"
-              id="chkDarkMode"
-              checked={darkMode}
-              onChange={(event) => onDarkModeChange(event.currentTarget.checked)}
-            />
-            <i className="icon moon"></i>
-          </div>
-        </div>
-      </div>
-    </div>
-  );
 }
 
 function Toast({ message }: { message: string }) {
@@ -844,49 +383,51 @@ export function App({ roulette }: { roulette: Roulette }) {
         <SettingsPanel
           collapsed={collapsed}
           onToggle={() => setCollapsed((value) => !value)}
-          maps={maps}
-          mapIndex={mapIndex}
-          onMapChange={(index) => {
-            if (!ready || !Number.isSafeInteger(index)) return;
-            roulette.setMap(index);
-            setMapIndex(index);
-          }}
-          renderScale={renderScale}
-          onRenderScaleChange={(value) => {
-            writeLocalStorage(RENDER_SCALE_STORAGE_KEY, String(value));
-            roulette.setRenderScale(value);
-            setRenderScale(value);
-          }}
-          autoRecording={autoRecording}
-          onAutoRecordingChange={(value) => {
-            roulette.setAutoRecording(value);
-            setAutoRecording(value);
-          }}
-          useSkills={useSkills}
-          onSkillsChange={(value) => {
-            roulette.setSkillsEnabled(value);
-            setUseSkills(value);
-          }}
-          darkMode={darkMode}
-          onDarkModeChange={(value) => {
-            roulette.setTheme(value ? 'dark' : 'light');
-            document.documentElement.classList.toggle('light', !value);
-            setDarkMode(value);
-          }}
-          winnerSettings={{
-            winnerType,
-            rank,
-            rangeStart,
-            rangeEnd,
-            onSelect: handleWinnerType,
-            onRankChange: (value) => {
-              setRank(value);
-              setWinnerType('custom');
+          generalSettings={{
+            maps,
+            mapIndex,
+            onMapChange: (index) => {
+              if (!ready || !Number.isSafeInteger(index)) return;
+              roulette.setMap(index);
+              setMapIndex(index);
             },
-            onRangeChange: handleRangeChange,
-            onRangeBlur: handleRangeBlur,
+            renderScale,
+            onRenderScaleChange: (value) => {
+              writeLocalStorage(RENDER_SCALE_STORAGE_KEY, String(value));
+              roulette.setRenderScale(value);
+              setRenderScale(value);
+            },
+            autoRecording,
+            onAutoRecordingChange: (value) => {
+              roulette.setAutoRecording(value);
+              setAutoRecording(value);
+            },
+            useSkills,
+            onSkillsChange: (value) => {
+              roulette.setSkillsEnabled(value);
+              setUseSkills(value);
+            },
+            darkMode,
+            onDarkModeChange: (value) => {
+              roulette.setTheme(value ? 'dark' : 'light');
+              document.documentElement.classList.toggle('light', !value);
+              setDarkMode(value);
+            },
+            winnerSettings: {
+              winnerType,
+              rank,
+              rangeStart,
+              rangeEnd,
+              onSelect: handleWinnerType,
+              onRankChange: (value) => {
+                setRank(value);
+                setWinnerType('custom');
+              },
+              onRangeChange: handleRangeChange,
+              onRangeBlur: handleRangeBlur,
+            },
           }}
-          sponsorSettings={{
+          brandingSettings={{
             state: sponsorState,
             onUpload: handleSponsorUpload,
             onSelect: handleSponsorSelect,

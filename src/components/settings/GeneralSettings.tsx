@@ -1,0 +1,97 @@
+import { isRenderScale, type RenderScale } from '../../options';
+import type { Roulette } from '../../roulette';
+import { SettingsRow } from './SettingsRow';
+import { SettingsToggle } from './SettingsToggle';
+import type { WinnerSettingsProps } from './WinnerSettings';
+import { WinnerSettings } from './WinnerSettings';
+
+export type GeneralSettingsProps = {
+  maps: ReturnType<Roulette['getMaps']>;
+  mapIndex: number;
+  onMapChange: (index: number) => void;
+  renderScale: RenderScale;
+  onRenderScaleChange: (value: RenderScale) => void;
+  autoRecording: boolean;
+  onAutoRecordingChange: (value: boolean) => void;
+  useSkills: boolean;
+  onSkillsChange: (value: boolean) => void;
+  darkMode: boolean;
+  onDarkModeChange: (value: boolean) => void;
+  winnerSettings: WinnerSettingsProps;
+};
+
+export function GeneralSettings({
+  maps,
+  mapIndex,
+  onMapChange,
+  renderScale,
+  onRenderScaleChange,
+  autoRecording,
+  onAutoRecordingChange,
+  useSkills,
+  onSkillsChange,
+  darkMode,
+  onDarkModeChange,
+  winnerSettings,
+}: GeneralSettingsProps) {
+  return (
+    <div className="settings-general">
+      <SettingsRow label={<span data-trans>Map</span>} htmlFor="sltMap" icon="map">
+        <select id="sltMap" value={mapIndex} onChange={(event) => onMapChange(Number(event.currentTarget.value))}>
+          {maps.map((map) => (
+            <option key={map.index} value={map.index} data-trans>
+              {map.title}
+            </option>
+          ))}
+        </select>
+      </SettingsRow>
+      <SettingsRow label={<span data-trans>Render quality</span>} htmlFor="sltRenderScale">
+        <select
+          id="sltRenderScale"
+          value={renderScale}
+          onChange={(event) => {
+            const value = Number(event.currentTarget.value);
+            if (isRenderScale(value)) onRenderScaleChange(value);
+          }}
+        >
+          <option value="0.5" data-trans>
+            Performance
+          </option>
+          <option value="1" data-trans>
+            Native
+          </option>
+        </select>
+      </SettingsRow>
+      <div className="settings-toggle-grid">
+        <SettingsToggle
+          id="chkAutoRecording"
+          label={<span data-trans>Recording</span>}
+          icon="record"
+          checked={autoRecording}
+          onChange={onAutoRecordingChange}
+        />
+        <SettingsToggle
+          id="chkSkill"
+          label={<span data-trans>Using skills</span>}
+          icon="bomb"
+          checked={useSkills}
+          onChange={onSkillsChange}
+        />
+      </div>
+      <WinnerSettings {...winnerSettings} />
+      <SettingsRow className="settings-row-theme" label={<span data-trans>Theme</span>} htmlFor="chkDarkMode">
+        <div className="theme">
+          <i className="icon sun" aria-hidden="true"></i>
+          <input
+            type="checkbox"
+            id="chkDarkMode"
+            checked={darkMode}
+            aria-label="Dark mode"
+            onChange={(event) => onDarkModeChange(event.currentTarget.checked)}
+          />
+          <i className="icon moon" aria-hidden="true"></i>
+        </div>
+      </SettingsRow>
+    </div>
+  );
+}
