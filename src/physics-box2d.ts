@@ -6,10 +6,25 @@ import type { MapEntity, MapEntityRenderState } from './types/MapEntity.type';
 import type { Transform } from './utils/interpolation';
 import type { RandomSource } from './utils/random';
 
+type Box2DModule = typeof Box2D & EmscriptenModule;
+
+let box2dModulePromise: Promise<Box2DModule> | null = null;
+
+function loadBox2D(): Promise<Box2DModule> {
+  if (!box2dModulePromise) {
+    box2dModulePromise = Box2DFactory().catch((error) => {
+      box2dModulePromise = null;
+      throw error;
+    });
+  }
+  return box2dModulePromise;
+}
+
 export class Box2dPhysics implements IPhysics {
   private readonly randomSource: RandomSource;
-  private Box2D!: typeof Box2D & EmscriptenModule;
+  private Box2D!: Box2DModule;
   private world!: Box2D.b2World;
+  private worldDestroyed = false;
 
   private marbleMap: { [id: number]: Box2D.b2Body } = {};
   private entities: {
@@ -25,7 +40,7 @@ export class Box2dPhysics implements IPhysics {
   }
 
   async init(): Promise<void> {
-    this.Box2D = await Box2DFactory();
+    this.Box2D = await loadBox2D();
     this.resetWorld();
   }
 
@@ -41,13 +56,24 @@ export class Box2dPhysics implements IPhysics {
     this.entities = [];
     this.deleteCandidates = [];
 
-    if (this.world) {
+    if (this.world && !this.worldDestroyed) {
       this.Box2D.destroy(this.world);
     }
 
     const gravity = new this.Box2D.b2Vec2(0, 10);
     this.world = new this.Box2D.b2World(gravity);
     this.Box2D.destroy(gravity);
+    this.worldDestroyed = false;
+  }
+
+  dispose(): void {
+    this.marbleMap = {};
+    this.entities = [];
+    this.deleteCandidates = [];
+    if (this.world && !this.worldDestroyed) {
+      this.Box2D.destroy(this.world);
+      this.worldDestroyed = true;
+    }
   }
 
   loadStage(stage: StageDef): void {

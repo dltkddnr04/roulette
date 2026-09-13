@@ -278,6 +278,97 @@ div.copyright a {
           }
         }
       }
+
+      &.row-fairness {
+        height: auto;
+        align-items: flex-start;
+        padding-top: 5px;
+        padding-bottom: 5px;
+
+        .fairness-controls {
+          flex: 1 1 auto;
+          min-width: 0;
+        }
+
+        .fairness-toolbar,
+        .fairness-actions,
+        .fairness-participant,
+        .fairness-draw {
+          display: flex;
+          align-items: center;
+          gap: 6px;
+        }
+
+        .fairness-toolbar,
+        .fairness-actions {
+          margin-bottom: 4px;
+        }
+
+        .fairness-toolbar select {
+          flex: 1 1 auto;
+          min-width: 0;
+        }
+
+        .fairness-enabled,
+        .fairness-excluded,
+        .fairness-import {
+          width: auto;
+          display: flex;
+          align-items: center;
+          gap: 4px;
+          padding-left: 0;
+          margin: 0;
+        }
+
+        .fairness-import input[type=file] {
+          display: none;
+        }
+
+        .fairness-participants,
+        .fairness-history {
+          display: flex;
+          flex-direction: column;
+          gap: 3px;
+        }
+
+        .fairness-participant,
+        .fairness-draw {
+          min-width: 0;
+          font-size: 11px;
+        }
+
+        .fairness-participant.inactive {
+          opacity: .55;
+        }
+
+        .fairness-participant-name {
+          flex: 1 1 auto;
+          min-width: 0;
+          overflow: hidden;
+          text-overflow: ellipsis;
+          white-space: nowrap;
+        }
+
+        .fairness-participant code,
+        .fairness-stats {
+          color: #ddd;
+          white-space: nowrap;
+        }
+
+        .fairness-draw span {
+          flex: 1 1 auto;
+          min-width: 0;
+          overflow: hidden;
+          text-overflow: ellipsis;
+          white-space: nowrap;
+        }
+
+        .fairness-error {
+          color: #ffd080;
+          font-size: 11px;
+          margin-bottom: 4px;
+        }
+      }
     }
   }
 
@@ -463,6 +554,20 @@ div.copyright a {
           display: flex;
           margin-bottom: 0;
           padding-left: 0;
+        }
+      }
+
+      &.row-fairness {
+        .fairness-toolbar,
+        .fairness-actions,
+        .fairness-participant,
+        .fairness-draw {
+          flex-wrap: wrap;
+        }
+
+        .fairness-stats,
+        .fairness-participant code {
+          width: 100%;
         }
       }
 

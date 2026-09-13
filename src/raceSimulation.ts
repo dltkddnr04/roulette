@@ -94,8 +94,12 @@ export class RaceSimulation {
     return this.hasExplicitSeed ? 'explicit' : 'random';
   }
 
-  useRandomSeed(): void {
+  setRandomSeedMode(): void {
     this.hasExplicitSeed = false;
+  }
+
+  useRandomSeed(): void {
+    this.setRandomSeedMode();
   }
 
   setSkillsEnabled(enabled: boolean): void {
@@ -174,6 +178,15 @@ export class RaceSimulation {
   start(): void {
     this.physics.start();
     this.marbles.forEach((marble) => (marble.isActive = true));
+  }
+
+  dispose(): void {
+    this.physics.dispose?.();
+    this.marbles = [];
+    this.previousEntities = [];
+    this.currentEntities = [];
+    this.previousMarbleTransforms.clear();
+    this.currentMarbleTransforms.clear();
   }
 
   getCount(): number {

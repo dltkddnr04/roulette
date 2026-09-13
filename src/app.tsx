@@ -1,5 +1,6 @@
 import type { ChangeEvent } from 'react';
 import { useCallback, useEffect, useRef, useState } from 'react';
+import type { FairnessState } from './fairness';
 import { translateElement, translateTree } from './localization';
 import { isRenderScale, type RenderScale, type WinnerRange } from './options';
 import type { Roulette } from './roulette';
@@ -222,6 +223,162 @@ function SponsorSettings({ state, onUpload, onSelect, onEnabled, onDelete }: Spo
   );
 }
 
+type FairnessSettingsProps = {
+  state: FairnessState | null;
+  onEnabled: (enabled: boolean) => void;
+  onModeChange: (mode: FairnessState['mode']) => void;
+  onRename: (participantId: string, currentName: string) => void;
+  onExcluded: (participantId: string, excluded: boolean) => void;
+  onNewEpoch: () => void;
+  onVoid: (drawId: string) => void;
+  onExport: () => void;
+  onImport: (value: string) => void;
+  onDelete: () => void;
+};
+
+function FairnessSettings({
+  state,
+  onEnabled,
+  onModeChange,
+  onRename,
+  onExcluded,
+  onNewEpoch,
+  onVoid,
+  onExport,
+  onImport,
+  onDelete,
+}: FairnessSettingsProps) {
+  const complete = state?.mode === 'complete';
+  return (
+    <div className="row row-fairness">
+      <label htmlFor="chkFairness">
+        <span data-trans>Cumulative fairness</span>
+      </label>
+      <div className="fairness-controls">
+        <div className="fairness-toolbar">
+          <label className="fairness-enabled" htmlFor="chkFairness">
+            <span data-trans>Enabled</span>
+            <input
+              type="checkbox"
+              id="chkFairness"
+              checked={state?.enabled ?? false}
+              disabled={state !== null && !state.available}
+              onChange={(event) => onEnabled(event.currentTarget.checked)}
+            />
+          </label>
+          <select
+            id="sltFairnessMode"
+            value={state?.mode ?? 'simple'}
+            onChange={(event) => {
+              if (event.currentTarget.value === 'simple' || event.currentTarget.value === 'complete') {
+                onModeChange(event.currentTarget.value);
+              }
+            }}
+          >
+            <option value="simple" data-trans>
+              Simple
+            </option>
+            <option value="complete" data-trans>
+              Complete
+            </option>
+          </select>
+        </div>
+        {state?.error ? <div className="fairness-error">{state.error}</div> : null}
+        {state?.enabled ? (
+          <>
+            <div className="fairness-actions">
+              <button type="button" onClick={onNewEpoch} data-trans>
+                Start a new fairness period
+              </button>
+              {complete ? (
+                <>
+                  <button type="button" onClick={onExport} data-trans>
+                    Export
+                  </button>
+                  <label className="fairness-import" htmlFor="inFairnessImport">
+                    <span data-trans>Import</span>
+                    <input
+                      type="file"
+                      id="inFairnessImport"
+                      accept="application/json,.json"
+                      onChange={(event) => {
+                        const file = event.currentTarget.files?.[0];
+                        event.currentTarget.value = '';
+                        if (!file) return;
+                        void file
+                          .text()
+                          .then(onImport)
+                          .catch(() => undefined);
+                      }}
+                    />
+                  </label>
+                  <button type="button" onClick={onDelete} data-trans>
+                    Delete history
+                  </button>
+                </>
+              ) : null}
+            </div>
+            <div className="fairness-participants">
+              {state.participants.map((participant) => (
+                <div className={`fairness-participant${participant.active ? '' : ' inactive'}`} key={participant.id}>
+                  <span className="fairness-participant-name">{participant.displayName}</span>
+                  {complete ? <code>{participant.id}</code> : null}
+                  <span className="fairness-stats">
+                    {complete
+                      ? `actual ${participant.actualWins} · fairness ${participant.fairnessCountedWins} · credit ${participant.balanceCredit} · effective ${participant.effectiveBalance}`
+                      : `wins ${participant.currentEpochWins}`}
+                  </span>
+                  {complete ? (
+                    <span className="fairness-status">
+                      {participant.active ? 'active' : 'inactive'} · {participant.participationHistory.length} status
+                      changes
+                    </span>
+                  ) : null}
+                  <label className="fairness-excluded" htmlFor={`exclude-${participant.id}`}>
+                    <span data-trans>Excluded</span>
+                    <input
+                      type="checkbox"
+                      id={`exclude-${participant.id}`}
+                      checked={participant.excluded}
+                      onChange={(event) => onExcluded(participant.id, event.currentTarget.checked)}
+                    />
+                  </label>
+                  <button type="button" onClick={() => onRename(participant.id, participant.displayName)} data-trans>
+                    Rename
+                  </button>
+                </div>
+              ))}
+            </div>
+            {state.recentDraws.length > 0 ? (
+              <div className="fairness-history">
+                {state.recentDraws.map((draw) => (
+                  <div className="fairness-draw" key={draw.id}>
+                    <span>
+                      {new Date(draw.confirmedAt ?? draw.preparedAt).toLocaleString()} · {draw.status} ·{' '}
+                      {draw.winners.map((winner) => winner.displayName).join(', ') || '—'}
+                    </span>
+                    {complete ? (
+                      <span className="fairness-draw-details">
+                        {draw.mapTitle} · {String(draw.seed)} · {draw.rawParticipantInputs.join(', ')} ·{' '}
+                        {draw.policy.id}
+                      </span>
+                    ) : null}
+                    {complete && draw.status === 'confirmed' ? (
+                      <button type="button" onClick={() => onVoid(draw.id)} data-trans>
+                        Void
+                      </button>
+                    ) : null}
+                  </div>
+                ))}
+              </div>
+            ) : null}
+          </>
+        ) : null}
+      </div>
+    </div>
+  );
+}
+
 type SettingsPanelProps = {
   collapsed: boolean;
   onToggle: () => void;
@@ -238,6 +395,7 @@ type SettingsPanelProps = {
   onDarkModeChange: (value: boolean) => void;
   winnerSettings: WinnerSettingsProps;
   sponsorSettings: SponsorSettingsProps;
+  fairnessSettings: FairnessSettingsProps;
 };
 
 function SettingsPanel({
@@ -256,6 +414,7 @@ function SettingsPanel({
   onDarkModeChange,
   winnerSettings,
   sponsorSettings,
+  fairnessSettings,
 }: SettingsPanelProps) {
   return (
     <div className="right">
@@ -294,6 +453,7 @@ function SettingsPanel({
           </select>
         </div>
         <SponsorSettings {...sponsorSettings} />
+        <FairnessSettings {...fairnessSettings} />
         <div className="row row-toggles">
           <div className="toggle-item">
             <label htmlFor="chkAutoRecording">
@@ -367,6 +527,7 @@ export function App({ roulette }: { roulette: Roulette }) {
   const [useSkills, setUseSkills] = useState(roulette.getSkillsEnabled());
   const [darkMode, setDarkMode] = useState(roulette.getTheme() === 'dark');
   const [sponsorState, setSponsorState] = useState<SponsorState | null>(null);
+  const [fairnessState, setFairnessState] = useState<FairnessState | null>(null);
   const [toast, setToast] = useState<string | null>(null);
   const [toastId, setToastId] = useState(0);
   const toastTimer = useRef<number | null>(null);
@@ -400,6 +561,14 @@ export function App({ roulette }: { roulette: Roulette }) {
     }
   }, [roulette]);
 
+  const refreshFairness = useCallback(async () => {
+    try {
+      setFairnessState(await roulette.getFairnessState());
+    } catch (error) {
+      console.warn('Fairness controls unavailable', error);
+    }
+  }, [roulette]);
+
   const applyWinnerSetting = useCallback(
     (nextType: WinnerType = winnerType, edited?: EditedRange) => {
       let start: number;
@@ -424,7 +593,12 @@ export function App({ roulette }: { roulette: Roulette }) {
           break;
       }
 
-      roulette.setWinnerRange(start - 1, end - 1);
+      if (!roulette.setWinnerRange(start - 1, end - 1)) {
+        const currentRange = roulette.getWinnerRange();
+        setWinnerType('custom');
+        setRank(String(currentRange.start + 1));
+        return;
+      }
       const clipped: WinnerRange = roulette.getWinnerRange();
       if (nextType === 'multi') {
         setRangeStart(String(clipped.start + 1));
@@ -442,8 +616,9 @@ export function App({ roulette }: { roulette: Roulette }) {
       roulette.setMarbles(participantNames);
       writeLocalStorage(NAMES_STORAGE_KEY, participantNames.join(','));
       applyWinnerSetting();
+      void refreshFairness();
     },
-    [applyWinnerSetting, roulette]
+    [applyWinnerSetting, refreshFairness, roulette]
   );
 
   useEffect(() => {
@@ -459,7 +634,8 @@ export function App({ roulette }: { roulette: Roulette }) {
     writeLocalStorage(NAMES_STORAGE_KEY, participantNames.join(','));
     roulette.setWinnerRange(0, 0);
     void refreshSponsors();
-  }, [ready, refreshSponsors, roulette]);
+    void refreshFairness();
+  }, [ready, refreshFairness, refreshSponsors, roulette]);
 
   useEffect(() => {
     const onGoal = () => {
@@ -468,22 +644,26 @@ export function App({ roulette }: { roulette: Roulette }) {
         settingsTimer.current = null;
         setSettingsHidden(false);
       }, 3000);
+      void refreshFairness();
     };
     const onMessage = (event: Event) => {
       const message = (event as CustomEvent<string>).detail;
       if (typeof message === 'string') showToast(message);
+      if (roulette.roundState === 'ready') setSettingsHidden(false);
     };
     roulette.addEventListener('goal', onGoal);
     roulette.addEventListener('message', onMessage);
+    roulette.addEventListener('fairness', refreshFairness);
     return () => {
       roulette.removeEventListener('goal', onGoal);
       roulette.removeEventListener('message', onMessage);
+      roulette.removeEventListener('fairness', refreshFairness);
       if (settingsTimer.current !== null) {
         window.clearTimeout(settingsTimer.current);
         settingsTimer.current = null;
       }
     };
-  }, [roulette, showToast]);
+  }, [refreshFairness, roulette, showToast]);
 
   const handleWinnerType = (type: WinnerType) => {
     setWinnerType(type);
@@ -543,11 +723,106 @@ export function App({ roulette }: { roulette: Roulette }) {
     }
   };
 
+  const handleFairnessEnabled = async (enabled: boolean) => {
+    try {
+      await roulette.setFairnessEnabled(enabled);
+      await refreshFairness();
+    } catch (error) {
+      showToast(error instanceof Error ? error.message : 'Fairness is unavailable');
+      await refreshFairness();
+    }
+  };
+
+  const handleFairnessMode = async (mode: FairnessState['mode']) => {
+    try {
+      await roulette.setFairnessMode(mode);
+      await refreshFairness();
+    } catch (error) {
+      showToast(error instanceof Error ? error.message : 'Fairness mode could not be changed');
+    }
+  };
+
+  const handleFairnessRename = async (participantId: string, currentName: string) => {
+    const nextName = window.prompt('Rename fairness participant', currentName);
+    if (nextName === null) return;
+    try {
+      await roulette.renameFairParticipant(participantId, nextName);
+      await refreshFairness();
+    } catch (error) {
+      showToast(error instanceof Error ? error.message : 'Participant could not be renamed');
+    }
+  };
+
+  const handleFairnessExcluded = async (participantId: string, excluded: boolean) => {
+    try {
+      await roulette.setFairnessParticipantExcluded(participantId, excluded);
+      await refreshFairness();
+    } catch (error) {
+      showToast(error instanceof Error ? error.message : 'Participant exclusion could not be changed');
+      await refreshFairness();
+    }
+  };
+
+  const handleFairnessNewEpoch = async () => {
+    try {
+      await roulette.startNewFairnessEpoch();
+      await refreshFairness();
+    } catch (error) {
+      showToast(error instanceof Error ? error.message : 'Fairness epoch could not be started');
+    }
+  };
+
+  const handleFairnessVoid = async (drawId: string) => {
+    if (!window.confirm('Void this fairness draw?')) return;
+    try {
+      await roulette.voidFairnessDraw(drawId);
+      await refreshFairness();
+    } catch (error) {
+      showToast(error instanceof Error ? error.message : 'Fairness draw could not be voided');
+    }
+  };
+
+  const handleFairnessExport = async () => {
+    try {
+      const data = await roulette.exportFairnessData();
+      const objectUrl = URL.createObjectURL(new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' }));
+      const anchor = document.createElement('a');
+      anchor.href = objectUrl;
+      anchor.download = 'marble-roulette-fairness.json';
+      anchor.click();
+      URL.revokeObjectURL(objectUrl);
+    } catch (error) {
+      showToast(error instanceof Error ? error.message : 'Fairness data could not be exported');
+    }
+  };
+
+  const handleFairnessImport = async (value: string) => {
+    if (!window.confirm('Replace fairness history with this import?')) return;
+    try {
+      await roulette.importFairnessData(value);
+      await refreshFairness();
+    } catch (error) {
+      showToast(error instanceof Error ? error.message : 'Fairness data could not be imported');
+    }
+  };
+
+  const handleFairnessDelete = async () => {
+    if (!window.confirm('Delete all fairness history?')) return;
+    try {
+      await roulette.deleteFairnessData();
+      await refreshFairness();
+    } catch (error) {
+      showToast(error instanceof Error ? error.message : 'Fairness history could not be deleted');
+    }
+  };
+
   const maps = roulette.getMaps();
   const onStart = () => {
     if (!ready || roulette.roundState !== 'ready' || roulette.getCount() === 0) return;
     setSettingsHidden(true);
-    roulette.start();
+    void Promise.resolve(roulette.start()).catch((error) => {
+      showToast(error instanceof Error ? error.message : 'The roulette could not start');
+    });
   };
 
   return (
@@ -606,18 +881,32 @@ export function App({ roulette }: { roulette: Roulette }) {
             onEnabled: handleSponsorEnabled,
             onDelete: handleSponsorDelete,
           }}
+          fairnessSettings={{
+            state: fairnessState,
+            onEnabled: (value) => void handleFairnessEnabled(value),
+            onModeChange: (value) => void handleFairnessMode(value),
+            onRename: (participantId, currentName) => void handleFairnessRename(participantId, currentName),
+            onExcluded: (participantId, excluded) => void handleFairnessExcluded(participantId, excluded),
+            onNewEpoch: () => void handleFairnessNewEpoch(),
+            onVoid: (drawId) => void handleFairnessVoid(drawId),
+            onExport: () => void handleFairnessExport(),
+            onImport: (value) => void handleFairnessImport(value),
+            onDelete: () => void handleFairnessDelete(),
+          }}
         />
         <ParticipantInput
           value={names}
           onChange={(value) => {
             setNames(value);
-            if (ready) getReady(value);
+            if (ready && !roulette.getFairnessEnabled()) getReady(value);
           }}
           onBlur={() => {
             const normalized = normalizeParticipantNames(getParticipantNames(names));
             if (names !== normalized.join(',')) {
               setNames(normalized.join(','));
               if (ready) getReady(normalized.join(','));
+            } else if (ready && roulette.getFairnessEnabled()) {
+              getReady(names);
             }
           }}
           onShuffle={() => {

@@ -39,6 +39,18 @@ const { getStepBudget, preservePhysicsDebt, RaceSimulation } = loadTypeScriptMod
 const { RoundSession } = loadTypeScriptModule('src/roundSession.ts');
 const { validateReplayDescriptor } = loadTypeScriptModule('src/replay.ts');
 const { createSeededRandom } = loadTypeScriptModule('src/utils/random.ts');
+const {
+  canUseStrictBalanceFastPath,
+  createFairnessCandidateSeed,
+  createFairnessExport,
+  evaluateStrictBalance,
+  projectFairnessEvents,
+  searchBudget,
+  validateFairnessExport,
+} = loadTypeScriptModule('src/fairness.ts');
+const { FairnessCoordinator, mapMarbleIdsToParticipants, runHeadlessRace } =
+  loadTypeScriptModule('src/fairnessCoordinator.ts');
+const { InMemoryFairnessStore } = loadTypeScriptModule('src/fairnessStore.ts');
 
 test('parseName preserves supported participant syntax and rejects malformed modifiers', () => {
   assert.deepEqual(parseName('Alice'), { name: 'Alice', weight: 1, count: 1 });
@@ -624,4 +636,523 @@ test('repeated replay rebuilds on one real Box2D simulation are bit-identical', 
   assert.equal(runs[0].debt, 0);
   assert.equal(runs[1].debt, 0);
   assert.equal(runs[2].debt, 0);
+});
+
+function fairnessEvent(type, timestamp, details) {
+  return { version: 1, eventId: `event-${timestamp}-${type}`, timestamp, type, ...details };
+}
+
+function fairnessParticipant(participantId, displayName, marbleId, effectiveBalance, included = true, active = true) {
+  return {
+    participantId,
+    displayName,
+    rawInput: displayName,
+    weight: 1,
+    count: 1,
+    marbleIds: [marbleId],
+    active,
+    excluded: !included,
+    included,
+    effectiveBalance,
+  };
+}
+
+test('strict balance selects only the current minimum included participants', () => {
+  const evaluation = evaluateStrictBalance([
+    { id: 'A', active: true, excluded: false, effectiveBalance: 4 },
+    { id: 'B', active: true, excluded: false, effectiveBalance: 3 },
+    { id: 'C', active: true, excluded: false, effectiveBalance: 3 },
+    { id: 'D', active: true, excluded: false, effectiveBalance: 4 },
+    { id: 'E', active: true, excluded: true, effectiveBalance: 0 },
+    { id: 'F', active: false, excluded: false, effectiveBalance: 0 },
+  ]);
+
+  assert.deepEqual(evaluation.eligibleIds, ['B', 'C']);
+  assert.deepEqual(evaluation.activeExcludedIds, ['E']);
+  assert.equal(canUseStrictBalanceFastPath(evaluation), false);
+  assert.equal(
+    canUseStrictBalanceFastPath(
+      evaluateStrictBalance([
+        { id: 'A', active: true, excluded: false, effectiveBalance: 2 },
+        { id: 'B', active: true, excluded: false, effectiveBalance: 2 },
+      ])
+    ),
+    true
+  );
+  assert.equal(searchBudget(3, 4, 2), 32);
+  assert.equal(searchBudget(1000, 10, 1), 2995);
+  assert.equal(searchBudget(500, 500, 1), 1497);
+  assert.equal(searchBudget(0, 1, 1), 0);
+});
+
+test('fairness projection separates confirmed, voided, excluded, and rejoined history', () => {
+  const events = [
+    fairnessEvent('epochStarted', 1, { epochId: 'epoch-1' }),
+    fairnessEvent('participantDiscovered', 2, { participantId: 'A', displayName: 'A', active: true, excluded: false }),
+    fairnessEvent('participantDiscovered', 3, { participantId: 'B', displayName: 'B', active: true, excluded: false }),
+    fairnessEvent('drawPrepared', 4, {
+      drawId: 'draw-1',
+      epochId: 'epoch-1',
+      seed: 'one',
+      mapIndex: 0,
+      mapTitle: 'test',
+      rawParticipantInputs: ['A', 'B'],
+      winnerRange: { start: 0, end: 0 },
+      skillsEnabled: true,
+      fairnessEnabledAtDraw: false,
+      policy: { id: 'strict-balance-v1', version: 1 },
+      participants: [fairnessParticipant('A', 'A', 0, 0), fairnessParticipant('B', 'B', 1, 0)],
+    }),
+    fairnessEvent('drawConfirmed', 5, {
+      drawId: 'draw-1',
+      winners: [{ participantId: 'A', displayName: 'A', marbleId: 0 }],
+    }),
+    fairnessEvent('participantParticipationChanged', 6, { participantId: 'A', active: false }),
+    fairnessEvent('drawPrepared', 7, {
+      drawId: 'draw-2',
+      epochId: 'epoch-1',
+      seed: 'two',
+      mapIndex: 0,
+      mapTitle: 'test',
+      rawParticipantInputs: ['B'],
+      winnerRange: { start: 0, end: 0 },
+      skillsEnabled: true,
+      fairnessEnabledAtDraw: false,
+      policy: { id: 'strict-balance-v1', version: 1 },
+      participants: [fairnessParticipant('B', 'B', 0, 0)],
+    }),
+    fairnessEvent('drawConfirmed', 8, {
+      drawId: 'draw-2',
+      winners: [{ participantId: 'B', displayName: 'B', marbleId: 0 }],
+    }),
+    fairnessEvent('participantParticipationChanged', 9, { participantId: 'A', active: true }),
+    fairnessEvent('participantDiscovered', 10, { participantId: 'C', displayName: 'C', active: true, excluded: false }),
+    fairnessEvent('participantExclusionChanged', 11, { participantId: 'B', excluded: true }),
+    fairnessEvent('drawPrepared', 12, {
+      drawId: 'draw-3',
+      epochId: 'epoch-1',
+      seed: 'three',
+      mapIndex: 0,
+      mapTitle: 'test',
+      rawParticipantInputs: ['A', 'B', 'C'],
+      winnerRange: { start: 0, end: 0 },
+      skillsEnabled: true,
+      fairnessEnabledAtDraw: true,
+      policy: { id: 'strict-balance-v1', version: 1 },
+      participants: [
+        fairnessParticipant('A', 'A', 0, 1),
+        fairnessParticipant('B', 'B', 1, 1, false),
+        fairnessParticipant('C', 'C', 2, 1),
+      ],
+    }),
+    fairnessEvent('drawConfirmed', 13, {
+      drawId: 'draw-3',
+      winners: [{ participantId: 'B', displayName: 'B', marbleId: 1 }],
+    }),
+    fairnessEvent('drawVoided', 14, { drawId: 'draw-1', reason: 'test' }),
+  ];
+
+  const projection = projectFairnessEvents(events);
+  const participantA = projection.participants.find(({ id }) => id === 'A');
+  const participantB = projection.participants.find(({ id }) => id === 'B');
+  const participantC = projection.participants.find(({ id }) => id === 'C');
+  assert.deepEqual(participantA, {
+    id: 'A',
+    displayName: 'A',
+    createdAt: 2,
+    active: true,
+    excluded: false,
+    actualWins: 0,
+    fairnessCountedWins: 0,
+    currentEpochWins: 0,
+    effectiveBalance: 0,
+    previousEffectiveBalance: 1,
+    participationHistory: [
+      { timestamp: 2, active: true },
+      { timestamp: 6, active: false },
+      { timestamp: 9, active: true },
+    ],
+  });
+  assert.equal(participantB.actualWins, 2);
+  assert.equal(participantB.currentEpochWins, 1);
+  assert.equal(participantB.effectiveBalance, 1);
+  assert.equal(participantC.effectiveBalance, 1);
+  assert.equal(projection.draws.find(({ id }) => id === 'draw-1').status, 'voided');
+  assert.equal(projection.draws.find(({ id }) => id === 'draw-3').status, 'confirmed');
+});
+
+test('fairness export validates and round-trips draw metadata without mutating the source', () => {
+  const event = fairnessEvent('epochStarted', 1, { epochId: 'epoch-1' });
+  const exported = createFairnessExport([event], 'complete');
+  const roundTrip = validateFairnessExport(JSON.parse(JSON.stringify(exported)));
+  assert.deepEqual(roundTrip, exported);
+  assert.notEqual(roundTrip.events, exported.events);
+  assert.throws(() => validateFairnessExport({ ...exported, version: 2 }), /unsupported export version/);
+});
+
+test('fairness export rejects inconsistent draw snapshots', () => {
+  const baseEvents = [
+    fairnessEvent('epochStarted', 1, { epochId: 'epoch-1' }),
+    fairnessEvent('participantDiscovered', 2, { participantId: 'A', displayName: 'A', active: true, excluded: false }),
+  ];
+  const draw = {
+    drawId: 'draw-1',
+    epochId: 'epoch-1',
+    seed: 'seed',
+    mapIndex: 0,
+    mapTitle: 'test',
+    rawParticipantInputs: ['A'],
+    winnerRange: { start: 0, end: 0 },
+    skillsEnabled: false,
+    fairnessEnabledAtDraw: true,
+    policy: { id: 'strict-balance-v1', version: 1 },
+    participants: [fairnessParticipant('A', 'A', 0, 0)],
+  };
+  const prepared = fairnessEvent('drawPrepared', 3, draw);
+  const valid = (events) => validateFairnessExport({ version: 1, mode: 'complete', events });
+
+  assert.throws(
+    () => valid([...baseEvents, fairnessEvent('drawPrepared', 3, { ...draw, participants: [] })]),
+    /participant snapshot is empty/
+  );
+  assert.throws(
+    () =>
+      valid([
+        ...baseEvents,
+        fairnessEvent('drawPrepared', 3, {
+          ...draw,
+          participants: [{ ...draw.participants[0], count: 2 }],
+        }),
+      ]),
+    /participant snapshot is invalid/
+  );
+  assert.throws(
+    () =>
+      valid([
+        ...baseEvents,
+        prepared,
+        fairnessEvent('drawConfirmed', 4, {
+          drawId: 'draw-1',
+          winners: [{ participantId: 'A', displayName: 'A', marbleId: 1 }],
+        }),
+      ]),
+    /winner marble is not in the prepared participant snapshot/
+  );
+});
+
+test('fairness history deduplicates one participant with multiple winning marbles', () => {
+  const events = [
+    fairnessEvent('epochStarted', 1, { epochId: 'epoch-1' }),
+    fairnessEvent('participantDiscovered', 2, { participantId: 'A', displayName: 'A', active: true, excluded: false }),
+    fairnessEvent('drawPrepared', 3, {
+      drawId: 'draw-1',
+      epochId: 'epoch-1',
+      seed: 'seed',
+      mapIndex: 0,
+      mapTitle: 'test',
+      rawParticipantInputs: ['A*2'],
+      winnerRange: { start: 0, end: 1 },
+      skillsEnabled: true,
+      fairnessEnabledAtDraw: false,
+      policy: { id: 'strict-balance-v1', version: 1 },
+      participants: [
+        {
+          ...fairnessParticipant('A', 'A', 0, 0),
+          count: 2,
+          marbleIds: [0, 1],
+        },
+      ],
+    }),
+    fairnessEvent('drawConfirmed', 4, {
+      drawId: 'draw-1',
+      winners: [
+        { participantId: 'A', displayName: 'A', marbleId: 0 },
+        { participantId: 'A', displayName: 'A', marbleId: 1 },
+      ],
+    }),
+  ];
+  const participant = projectFairnessEvents(events).participants[0];
+  assert.equal(participant.actualWins, 1);
+  assert.equal(participant.fairnessCountedWins, 1);
+});
+
+test('fairness starts a new epoch without deleting lifetime history', () => {
+  const events = [
+    fairnessEvent('epochStarted', 1, { epochId: 'epoch-1' }),
+    fairnessEvent('participantDiscovered', 2, { participantId: 'A', displayName: 'A', active: true, excluded: false }),
+    fairnessEvent('drawPrepared', 3, {
+      drawId: 'draw-1',
+      epochId: 'epoch-1',
+      seed: 'seed',
+      mapIndex: 0,
+      mapTitle: 'test',
+      rawParticipantInputs: ['A'],
+      winnerRange: { start: 0, end: 0 },
+      skillsEnabled: true,
+      fairnessEnabledAtDraw: false,
+      policy: { id: 'strict-balance-v1', version: 1 },
+      participants: [fairnessParticipant('A', 'A', 0, 0)],
+    }),
+    fairnessEvent('drawConfirmed', 4, {
+      drawId: 'draw-1',
+      winners: [{ participantId: 'A', displayName: 'A', marbleId: 0 }],
+    }),
+    fairnessEvent('epochStarted', 5, { epochId: 'epoch-2' }),
+  ];
+  const participant = projectFairnessEvents(events).participants[0];
+  assert.equal(participant.actualWins, 1);
+  assert.equal(participant.fairnessCountedWins, 1);
+  assert.equal(participant.currentEpochWins, 0);
+  assert.equal(participant.effectiveBalance, 0);
+});
+
+test('new fairness epochs do not carry an inactive participant balance into rejoin', () => {
+  const events = [
+    fairnessEvent('epochStarted', 1, { epochId: 'epoch-1' }),
+    fairnessEvent('participantDiscovered', 2, { participantId: 'A', displayName: 'A', active: true, excluded: false }),
+    fairnessEvent('participantDiscovered', 3, { participantId: 'B', displayName: 'B', active: true, excluded: false }),
+    fairnessEvent('drawPrepared', 4, {
+      drawId: 'draw-1',
+      epochId: 'epoch-1',
+      seed: 'seed',
+      mapIndex: 0,
+      mapTitle: 'test',
+      rawParticipantInputs: ['A', 'B'],
+      winnerRange: { start: 0, end: 0 },
+      skillsEnabled: true,
+      fairnessEnabledAtDraw: false,
+      policy: { id: 'strict-balance-v1', version: 1 },
+      participants: [fairnessParticipant('A', 'A', 0, 0), fairnessParticipant('B', 'B', 1, 0)],
+    }),
+    fairnessEvent('drawConfirmed', 5, {
+      drawId: 'draw-1',
+      winners: [{ participantId: 'B', displayName: 'B', marbleId: 1 }],
+    }),
+    fairnessEvent('participantParticipationChanged', 6, { participantId: 'B', active: false }),
+    fairnessEvent('epochStarted', 7, { epochId: 'epoch-2' }),
+    fairnessEvent('participantParticipationChanged', 8, { participantId: 'B', active: true }),
+  ];
+
+  const projection = projectFairnessEvents(events);
+  const participantB = projection.participants.find(({ id }) => id === 'B');
+  assert.equal(participantB.effectiveBalance, 0);
+  assert.equal(participantB.previousEffectiveBalance, 0);
+  assert.equal(participantB.actualWins, 1);
+});
+
+test('fairness participant rename keeps identity across a fresh coordinator', async () => {
+  let id = 0;
+  const store = new InMemoryFairnessStore();
+  const makeCoordinator = () =>
+    new FairnessCoordinator({
+      store,
+      createId: (prefix) => `${prefix}-${++id}`,
+      now: () => id,
+    });
+
+  const first = makeCoordinator();
+  first.setCurrentParticipantInputs(['A', 'B']);
+  await first.setEnabled(true);
+  const firstState = await first.getState();
+  const participantA = firstState.participants.find(({ displayName }) => displayName === 'A');
+  await first.renameParticipant(participantA.id, 'Alice');
+
+  const second = makeCoordinator();
+  second.setCurrentParticipantInputs(['B', 'A']);
+  await second.setEnabled(true);
+  const secondState = await second.getState();
+  const renamed = secondState.participants.find(({ displayName }) => displayName === 'Alice');
+  assert.equal(renamed.id, participantA.id);
+  assert.equal(secondState.participants.length, 2);
+});
+
+test('fairness participant identity survives temporary absence and rejoin', async () => {
+  let id = 0;
+  const coordinator = new FairnessCoordinator({
+    store: new InMemoryFairnessStore(),
+    createId: (prefix) => `${prefix}-${++id}`,
+    now: () => id,
+  });
+
+  coordinator.setCurrentParticipantInputs(['A', 'B', 'C']);
+  await coordinator.setEnabled(true);
+  const initial = await coordinator.getState();
+  const initialC = initial.participants.find(({ displayName }) => displayName === 'C');
+
+  coordinator.setCurrentParticipantInputs(['A', 'B']);
+  await coordinator.getState();
+  coordinator.setCurrentParticipantInputs(['A', 'B', 'C']);
+  const rejoined = await coordinator.getState();
+  const rejoinedC = rejoined.participants.find(({ displayName }) => displayName === 'C');
+
+  assert.equal(rejoinedC.id, initialC.id);
+  assert.equal(rejoinedC.active, true);
+  assert.equal(rejoinedC.actualWins, 0);
+  assert.equal(rejoinedC.participationHistory.filter(({ active }) => active === false).length, 1);
+});
+
+test('renamed participant identity survives temporary absence and rejoin', async () => {
+  let id = 0;
+  const coordinator = new FairnessCoordinator({
+    store: new InMemoryFairnessStore(),
+    createId: (prefix) => `${prefix}-${++id}`,
+    now: () => id,
+  });
+
+  coordinator.setCurrentParticipantInputs(['A', 'B']);
+  await coordinator.setEnabled(true);
+  const initial = await coordinator.getState();
+  const initialA = initial.participants.find(({ displayName }) => displayName === 'A');
+  await coordinator.renameParticipant(initialA.id, 'Alice');
+
+  coordinator.setCurrentParticipantInputs(['B']);
+  await coordinator.getState();
+  coordinator.setCurrentParticipantInputs(['B', 'A']);
+  const rejoined = await coordinator.getState();
+  const rejoinedA = rejoined.participants.find(({ displayName }) => displayName === 'Alice');
+
+  assert.equal(rejoinedA.id, initialA.id);
+  assert.equal(rejoinedA.active, true);
+});
+
+test('fairness coordinator records ordinary draws while disabled and searches only when enabled', async () => {
+  const stage = {
+    title: 'fairness test',
+    finish: { y: 20 },
+    camera: { zoomTriggerY: 10 },
+    spawn: {
+      origin: { x: 10.25, y: 1 },
+      maxColumns: 10,
+      columnSpacing: 0.6,
+      rowSpacing: 1,
+      maxUnshiftedRows: 5,
+    },
+    entities: [],
+  };
+  const request = (seed) => ({
+    stage,
+    mapIndex: 0,
+    participantInputs: ['A', 'B'],
+    winnerRange: { start: 0, end: 0 },
+    skillsEnabled: true,
+    currentSeed: seed,
+  });
+  let id = 0;
+  const ordinary = new FairnessCoordinator({
+    store: new InMemoryFairnessStore(),
+    createId: (prefix) => `${prefix}-${++id}`,
+    now: () => id,
+  });
+  ordinary.setCurrentParticipantInputs(['A', 'B']);
+  const ordinaryToken = ordinary.beginStart();
+  const ordinaryDraw = await ordinary.prepareUnconstrainedDraw(request('ordinary'), ordinaryToken);
+  assert.ok(ordinaryDraw);
+  const ordinaryWinner = ordinaryDraw.event.participants.find(({ displayName }) => displayName === 'A').marbleIds[0];
+  assert.equal((await ordinary.confirmDraw(ordinaryDraw.drawId, [ordinaryWinner], ordinaryToken)).confirmed, true);
+  const ordinaryState = await ordinary.getState();
+  assert.equal(ordinaryState.enabled, false);
+  assert.equal(ordinaryState.recentDraws[0].fairnessEnabledAtDraw, false);
+  assert.equal(ordinaryState.participants.find(({ displayName }) => displayName === 'A').actualWins, 1);
+
+  const candidateSeeds = ['bad', 'good'];
+  const fairness = new FairnessCoordinator({
+    store: new InMemoryFairnessStore(),
+    createId: (prefix) => `${prefix}-${++id}`,
+    now: () => id,
+    createCandidateSeed: () => candidateSeeds.shift(),
+    headlessRunner: async ({ seed }) => {
+      const mapping = mapMarbleIdsToParticipants(seed, [
+        { participantId: participantIds.A, count: 1 },
+        { participantId: participantIds.B, count: 1 },
+      ]);
+      const wanted = seed === 'bad' ? participantIds.A : participantIds.B;
+      return [Array.from(mapping.entries()).find(([, participantId]) => participantId === wanted)[0]];
+    },
+  });
+  fairness.setCurrentParticipantInputs(['A', 'B']);
+  await fairness.setEnabled(true);
+  const fairnessParticipants = await fairness.getState();
+  const participantIds = Object.fromEntries(
+    fairnessParticipants.participants.map(({ displayName, id }) => [displayName, id])
+  );
+  const seedToken = fairness.beginStart();
+  const firstDraw = await fairness.prepareUnconstrainedDraw(request('baseline'), seedToken);
+  const firstWinner = firstDraw.event.participants.find(({ displayName }) => displayName === 'A').marbleIds[0];
+  await fairness.confirmDraw(firstDraw.drawId, [firstWinner], seedToken);
+
+  const searchToken = fairness.beginStart();
+  const searched = await fairness.prepareDraw(request('unused-seed'), searchToken);
+  assert.equal(searched.seed, 'good');
+  assert.deepEqual(searched.expectedWinnerParticipantIds, [participantIds.B]);
+  assert.equal(
+    (
+      await fairness.confirmDraw(
+        searched.drawId,
+        searched.expectedWinnerMarbleIds,
+        searchToken,
+        [participantIds.B],
+        searched.expectedWinnerMarbleIds
+      )
+    ).confirmed,
+    true
+  );
+  const state = await fairness.getState();
+  assert.equal(state.participants.find(({ displayName }) => displayName === 'A').currentEpochWins, 1);
+  assert.equal(state.participants.find(({ displayName }) => displayName === 'B').currentEpochWins, 1);
+  assert.equal(createFairnessCandidateSeed().startsWith('seed-'), true);
+});
+
+test('fairness write failures disable the control plane without hiding the error', async () => {
+  const store = new InMemoryFairnessStore();
+  store.append = async () => {
+    throw new Error('quota exceeded');
+  };
+  const coordinator = new FairnessCoordinator({ store });
+  coordinator.setCurrentParticipantInputs(['A']);
+
+  await assert.rejects(() => coordinator.setEnabled(true), /quota exceeded/);
+  const state = await coordinator.getState();
+  assert.equal(state.available, false);
+  assert.equal(state.enabled, false);
+  assert.match(state.error, /quota exceeded/);
+});
+
+test('fairness headless runner uses the real Box2D simulation', async () => {
+  const request = {
+    seed: 'headless-box2d',
+    stage: {
+      title: 'headless test',
+      finish: { y: 2.5 },
+      camera: { zoomTriggerY: 2 },
+      spawn: {
+        origin: { x: 10.25, y: 1 },
+        maxColumns: 10,
+        columnSpacing: 0.6,
+        rowSpacing: 1,
+        maxUnshiftedRows: 5,
+      },
+      entities: [],
+    },
+    participants: [
+      { name: 'A', weight: 0.1, count: 1 },
+      { name: 'B', weight: 1, count: 1 },
+    ],
+    totalCount: 2,
+    spawnPositions: [
+      { x: 10.25, y: 1 },
+      { x: 10.85, y: 1 },
+    ],
+    skillsEnabled: true,
+    targetRank: 0,
+  };
+  const originalFetch = globalThis.fetch;
+  const originalLog = console.log;
+  globalThis.fetch = undefined;
+  console.log = () => {};
+  try {
+    assert.deepEqual(await runHeadlessRace(request), await runHeadlessRace(request));
+  } finally {
+    globalThis.fetch = originalFetch;
+    console.log = originalLog;
+  }
 });

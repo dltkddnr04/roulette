@@ -1,6 +1,8 @@
 import { Camera } from './camera';
 import { canvasHeight, canvasWidth, initialZoom, Themes, zoomThreshold } from './data/constants';
 import { stages } from './data/maps';
+import type { FairnessExport, FairnessMode, FairnessState } from './fairness';
+import { FairnessCancelledError, FairnessCoordinator, type FairnessPreparedDraw } from './fairnessCoordinator';
 import { FastForwader } from './fastForwader';
 import { Minimap } from './minimap';
 import { isRenderScale, type RenderScale, type WinnerRange } from './options';
@@ -18,11 +20,37 @@ import { bound } from './utils/bound.decorator';
 import type { Seed } from './utils/random';
 import { VideoRecorder } from './utils/videoRecorder';
 
+export type {
+  FairnessCurrentEpoch,
+  FairnessDrawStatus,
+  FairnessDrawSummary,
+  FairnessEvent,
+  FairnessExport,
+  FairnessMode,
+  FairnessParticipantSnapshot,
+  FairnessPublicParticipant,
+  FairnessState,
+} from './fairness';
 export type { ReplayDescriptor, ReplayDescriptorV1, RouletteState, ThemeName } from './replay';
 export type { RoundState } from './roundSession';
 
 export class Roulette extends EventTarget {
   private _roundSession = new RoundSession();
+  private readonly _fairnessCoordinator: FairnessCoordinator;
+  private _fairnessRound: {
+    drawId: string;
+    operationToken: number;
+    generation: number;
+    expectedWinnerParticipantIds: readonly string[] | null;
+    expectedWinnerMarbleIds: readonly number[] | null;
+  } | null = null;
+  private _normalDraw: {
+    generation: number;
+    prepared: Promise<FairnessPreparedDraw | null>;
+  } | null = null;
+  private _fairnessStartPromise: Promise<void> | null = null;
+  private _replayPending = false;
+  private _applyingReplay = false;
 
   private _lastTime: number = 0;
 
@@ -66,8 +94,9 @@ export class Roulette extends EventTarget {
     return new FastForwader();
   }
 
-  constructor(renderScale: RenderScale = 0.5) {
+  constructor(renderScale: RenderScale = 0.5, fairnessCoordinator = new FairnessCoordinator()) {
     super();
+    this._fairnessCoordinator = fairnessCoordinator;
     this._renderScale = renderScale;
     document.addEventListener('visibilitychange', this._handleVisibilityChange);
     this._renderer = this.createRenderer();
@@ -176,6 +205,41 @@ export class Roulette extends EventTarget {
     }
   }
 
+  private _emitMessage(message: string) {
+    this.dispatchEvent(new CustomEvent('message', { detail: message }));
+  }
+
+  private _emitFairnessStateChange() {
+    this.dispatchEvent(new Event('fairness'));
+  }
+
+  private _cancelActiveFairnessDraw(reason: string, cancelNormalDraw = true): void {
+    const activeDraw = this._fairnessRound;
+    this._fairnessRound = null;
+    if (activeDraw) {
+      void this._fairnessCoordinator.cancelDraw(activeDraw.drawId, reason).catch((error) => {
+        console.warn('Fairness draw cancellation failed', error);
+      });
+    }
+    if (cancelNormalDraw) {
+      const normalDraw = this._normalDraw;
+      this._normalDraw = null;
+      if (normalDraw) {
+        void normalDraw.prepared
+          .then((prepared) => {
+            if (prepared) {
+              return this._fairnessCoordinator.cancelDraw(prepared.drawId, reason);
+            }
+            return undefined;
+          })
+          .catch((error) => {
+            console.warn('Fairness draw cancellation failed', error);
+          });
+      }
+    }
+    this._fairnessCoordinator.invalidateStart();
+  }
+
   private _checkFinish() {
     const finish = this._roundSession.checkFinish();
     if (!finish) return;
@@ -195,6 +259,64 @@ export class Roulette extends EventTarget {
         detail: { winner: finish.result[0].name, winners: finish.result.map((m) => m.name) },
       })
     );
+
+    const fairnessRound = this._fairnessRound;
+    if (fairnessRound && fairnessRound.generation === this._roundSession.generation) {
+      void this._fairnessCoordinator
+        .confirmDraw(
+          fairnessRound.drawId,
+          finish.result.map((marble) => marble.id),
+          fairnessRound.operationToken,
+          fairnessRound.expectedWinnerParticipantIds,
+          fairnessRound.expectedWinnerMarbleIds
+        )
+        .then((confirmation) => {
+          if (!confirmation.confirmed && confirmation.reason) this._emitMessage(confirmation.reason);
+          this._emitFairnessStateChange();
+        })
+        .catch((error) => {
+          this._emitMessage(error instanceof Error ? error.message : 'Fairness could not record this draw');
+          this._emitFairnessStateChange();
+        })
+        .then(
+          () => {
+            if (this._fairnessRound === fairnessRound) this._fairnessRound = null;
+          },
+          () => {
+            if (this._fairnessRound === fairnessRound) this._fairnessRound = null;
+          }
+        );
+    } else {
+      const normalDraw = this._normalDraw;
+      this._normalDraw = null;
+      if (normalDraw && normalDraw.generation === this._roundSession.generation) {
+        void normalDraw.prepared
+          .then(async (prepared) => {
+            if (!prepared) return undefined;
+            if (normalDraw.generation !== this._roundSession.generation) {
+              await this._fairnessCoordinator.cancelDraw(
+                prepared.drawId,
+                'Fairness draw was cancelled after the round ended'
+              );
+              return undefined;
+            }
+            const confirmation = await this._fairnessCoordinator.confirmDraw(
+              prepared.drawId,
+              finish.result.map((marble) => marble.id),
+              null
+            );
+            if (!confirmation.confirmed && confirmation.reason) {
+              this._emitMessage(confirmation.reason);
+            }
+            this._emitFairnessStateChange();
+            return undefined;
+          })
+          .catch((error) => {
+            this._emitMessage(error instanceof Error ? error.message : 'Fairness could not record this draw');
+            this._emitFairnessStateChange();
+          });
+      }
+    }
   }
 
   private _calcTimeScale(): number {
@@ -324,6 +446,8 @@ export class Roulette extends EventTarget {
   public clearMarbles() {
     if (!this._roundSession.isInitialized) return;
 
+    this._replayPending = false;
+    this._cancelActiveFairnessDraw('Fairness draw was cancelled because the participants changed');
     this._invalidateRecording();
     this._presentationEffects.clear();
     this._roundSession.clearMarbles();
@@ -339,9 +463,52 @@ export class Roulette extends EventTarget {
     }
   }
 
-  public start() {
+  public start(): void | Promise<void> {
+    if (this._replayPending) {
+      this._replayPending = false;
+      return this._startWithoutFairness(false);
+    }
+
+    if (this._fairnessCoordinator.getFairnessEnabled()) {
+      if (this._fairnessStartPromise) return this._fairnessStartPromise;
+
+      let trackedPromise!: Promise<void>;
+      trackedPromise = this._startWithFairness().then(
+        () => {
+          if (this._fairnessStartPromise === trackedPromise) this._fairnessStartPromise = null;
+        },
+        (error) => {
+          if (this._fairnessStartPromise === trackedPromise) this._fairnessStartPromise = null;
+          throw error;
+        }
+      );
+      this._fairnessStartPromise = trackedPromise;
+      return trackedPromise;
+    }
+
+    return this._startWithoutFairness();
+  }
+
+  private _startWithoutFairness(recordHistory = true) {
     const roundGeneration = this._roundSession.prepareStart();
     if (roundGeneration === null) return;
+
+    if (recordHistory) {
+      const stage = this._roundSession.currentStage;
+      if (stage) {
+        const prepared = this._fairnessCoordinator
+          .prepareUnconstrainedDraw({
+            stage,
+            mapIndex: stages.indexOf(stage),
+            participantInputs: this._roundSession.getParticipantInputs(),
+            winnerRange: this._roundSession.getWinnerRange(),
+            skillsEnabled: this._roundSession.getSkillsEnabled(),
+            currentSeed: this._roundSession.getSeed(),
+          })
+          .catch(() => null);
+        this._normalDraw = { generation: roundGeneration, prepared };
+      }
+    }
 
     this._clearRecordingStopTimer();
     this._camera.startFollowingMarbles();
@@ -388,6 +555,136 @@ export class Roulette extends EventTarget {
     }
   }
 
+  private _restoreRandomSeedMode(): void {
+    this._roundSession.setRandomSeedMode();
+  }
+
+  private async _startWithFairness(): Promise<void> {
+    if (!this._roundSession.isInitialized || this._roundSession.roundState !== 'ready') return;
+    if (this._roundSession.getCount() === 0) return;
+
+    const winnerRange = this._roundSession.getWinnerRange();
+    if (winnerRange.start !== winnerRange.end) {
+      this._emitMessage('Cumulative fairness supports one winning rank at a time');
+      return;
+    }
+
+    const stage = this._roundSession.currentStage;
+    if (!stage) return;
+
+    const operationToken = this._fairnessCoordinator.beginStart();
+    const request = {
+      stage,
+      mapIndex: stages.indexOf(stage),
+      participantInputs: this._roundSession.getParticipantInputs(),
+      winnerRange,
+      skillsEnabled: this._roundSession.getSkillsEnabled(),
+      currentSeed: this._roundSession.getSeed(),
+    } as const;
+    const restoreRandomSeedMode = this._roundSession.getSeedMode() === 'random';
+
+    let prepared;
+    try {
+      prepared = await this._fairnessCoordinator.prepareDraw(request, operationToken);
+    } catch (error) {
+      if (error instanceof FairnessCancelledError) return;
+      const state = await this._fairnessCoordinator.getState();
+      this._emitMessage(error instanceof Error ? error.message : 'Fairness could not start this draw');
+      // A storage failure disables fairness and leaves the old roulette path
+      // usable. Search/policy failures deliberately do not fall back to a draw.
+      if (!state.available) this._startWithoutFairness();
+      return;
+    }
+
+    if (!this._fairnessCoordinator.isStartCurrent(operationToken)) {
+      void this._fairnessCoordinator.cancelDraw(prepared.drawId, 'Fairness draw was cancelled before start');
+      return;
+    }
+
+    this._invalidateRecording();
+    this._presentationEffects.clear();
+    this._roundSession.setSeed(prepared.seed);
+    const spawnLayout = this._roundSession.setParticipants(request.participantInputs.slice());
+    if (!spawnLayout) {
+      await this._fairnessCoordinator.cancelDraw(prepared.drawId, 'Fairness could not rebuild the round');
+      this._emitMessage('Fairness could not rebuild the round');
+      return;
+    }
+    if (restoreRandomSeedMode) this._restoreRandomSeedMode();
+
+    const margin = 3;
+    const viewW = canvasWidth / initialZoom;
+    const viewH = canvasHeight / initialZoom;
+    const zoom = Math.max(
+      1.5,
+      Math.min(Math.min(viewW / (spawnLayout.width + margin * 2), viewH / (spawnLayout.height + margin * 2)), 3)
+    );
+    this._camera.initializePosition(spawnLayout.center, zoom);
+
+    const roundGeneration = this._roundSession.prepareStart();
+    if (roundGeneration === null) {
+      await this._fairnessCoordinator.cancelDraw(prepared.drawId, 'Fairness could not start the round');
+      this._emitMessage('Fairness could not start the round');
+      return;
+    }
+    this._fairnessRound = {
+      drawId: prepared.drawId,
+      operationToken,
+      generation: roundGeneration,
+      expectedWinnerParticipantIds: prepared.expectedWinnerParticipantIds
+        ? [prepared.expectedWinnerParticipantIds[prepared.expectedWinnerParticipantIds.length - 1]]
+        : null,
+      expectedWinnerMarbleIds: prepared.expectedWinnerMarbleIds
+        ? [prepared.expectedWinnerMarbleIds[prepared.expectedWinnerMarbleIds.length - 1]]
+        : null,
+    };
+
+    this._clearRecordingStopTimer();
+    this._camera.startFollowingMarbles();
+
+    const startPhysics = () => {
+      if (!this._roundSession.isRunning(roundGeneration)) return;
+      this._roundSession.activate(roundGeneration);
+    };
+
+    if (this._autoRecording) {
+      this._recordingStartGeneration = roundGeneration;
+      this._recorder
+        .start()
+        .then(() => {
+          if (this._recordingStartGeneration !== roundGeneration) {
+            if (
+              this._recordingStartGeneration === null &&
+              this._activeRecordingGeneration === null &&
+              this._recorder.isRecording
+            ) {
+              this._recorder.stop();
+            }
+            return;
+          }
+          this._recordingStartGeneration = null;
+          if (!this._roundSession.isRunning(roundGeneration)) {
+            if (this._recorder.isRecording) this._recorder.stop();
+            return;
+          }
+          this._activeRecordingGeneration = roundGeneration;
+          startPhysics();
+        })
+        .catch((error) => {
+          if (this._recordingStartGeneration !== roundGeneration) return;
+          this._recordingStartGeneration = null;
+          if (!this._roundSession.isRunning(roundGeneration)) {
+            if (this._recorder.isRecording) this._recorder.stop();
+            return;
+          }
+          console.error('recording failed to start', error);
+          startPhysics();
+        });
+    } else {
+      startPhysics();
+    }
+  }
+
   public setSpeed(value: number) {
     if (value <= 0) {
       throw new Error('Speed multiplier must larger than 0');
@@ -414,6 +711,7 @@ export class Roulette extends EventTarget {
   }
 
   public setSeed(seed: Seed) {
+    if (!this._applyingReplay) this._cancelActiveFairnessDraw('Fairness draw was cancelled because the seed changed');
     this._roundSession.setSeed(seed);
   }
 
@@ -422,7 +720,8 @@ export class Roulette extends EventTarget {
   }
 
   public useRandomSeed(): void {
-    this._roundSession.useRandomSeed();
+    if (!this._applyingReplay) this._cancelActiveFairnessDraw('Fairness draw was cancelled because the seed changed');
+    this._roundSession.setRandomSeedMode();
   }
 
   public getSeedMode(): 'random' | 'explicit' {
@@ -434,7 +733,9 @@ export class Roulette extends EventTarget {
   }
 
   public setWinnerRange(start: number, end: number) {
+    if (!this._applyingReplay) this._cancelActiveFairnessDraw('Fairness draw was cancelled because the winner changed');
     this._roundSession.setWinnerRange(start, end);
+    return true;
   }
 
   /** 실제 구슬 수에 맞춰 잘린 범위 (0-based, 양끝 포함) */
@@ -451,11 +752,63 @@ export class Roulette extends EventTarget {
   }
 
   public setSkillsEnabled(enabled: boolean): void {
+    if (!this._applyingReplay) this._cancelActiveFairnessDraw('Fairness draw was cancelled because skills changed');
     this._roundSession.setSkillsEnabled(enabled);
   }
 
   public getSkillsEnabled(): boolean {
     return this._roundSession.getSkillsEnabled();
+  }
+
+  public getFairnessState(): Promise<FairnessState> {
+    return this._fairnessCoordinator.getState();
+  }
+
+  public setFairnessEnabled(enabled: boolean): Promise<void> {
+    if (!enabled && this._roundSession.roundState !== 'running') {
+      this._cancelActiveFairnessDraw('Fairness was disabled', false);
+    }
+    return this._fairnessCoordinator.setEnabled(enabled);
+  }
+
+  public getFairnessEnabled(): boolean {
+    return this._fairnessCoordinator.getFairnessEnabled();
+  }
+
+  public setFairnessMode(mode: FairnessMode): Promise<void> {
+    return this._fairnessCoordinator.setMode(mode);
+  }
+
+  public getFairnessMode(): FairnessMode {
+    return this._fairnessCoordinator.getMode();
+  }
+
+  public setFairnessParticipantExcluded(participantId: string, excluded: boolean): Promise<void> {
+    return this._fairnessCoordinator.setParticipantExcluded(participantId, excluded);
+  }
+
+  public renameFairParticipant(participantId: string, name: string): Promise<void> {
+    return this._fairnessCoordinator.renameParticipant(participantId, name);
+  }
+
+  public startNewFairnessEpoch(): Promise<void> {
+    return this._fairnessCoordinator.startNewEpoch();
+  }
+
+  public voidFairnessDraw(drawId: string): Promise<void> {
+    return this._fairnessCoordinator.voidDraw(drawId);
+  }
+
+  public exportFairnessData(): Promise<FairnessExport> {
+    return this._fairnessCoordinator.exportData();
+  }
+
+  public importFairnessData(value: unknown): Promise<void> {
+    return this._fairnessCoordinator.importData(value);
+  }
+
+  public deleteFairnessData(): Promise<void> {
+    return this._fairnessCoordinator.clearData();
   }
 
   public setFastForward(enabled: boolean): void {
@@ -500,9 +853,14 @@ export class Roulette extends EventTarget {
   public setMarbles(names: string[]) {
     if (!this._roundSession.isInitialized) return;
 
+    if (!this._applyingReplay) {
+      this._replayPending = false;
+      this._cancelActiveFairnessDraw('Fairness draw was cancelled because the participants changed');
+    }
     this._invalidateRecording();
     this._presentationEffects.clear();
     const spawnLayout = this._roundSession.setParticipants(names);
+    this._fairnessCoordinator.setCurrentParticipantInputs(names, this._applyingReplay);
     if (!spawnLayout) return;
 
     // 카메라를 구슬 생성 위치 중앙으로 이동 + 줌인
@@ -520,6 +878,8 @@ export class Roulette extends EventTarget {
   public reset() {
     if (!this._roundSession.isInitialized) return;
 
+    this._replayPending = false;
+    this._cancelActiveFairnessDraw('Fairness draw was cancelled because the round reset');
     this._invalidateRecording();
     this._presentationEffects.clear();
     this._roundSession.reset();
@@ -574,13 +934,23 @@ export class Roulette extends EventTarget {
     if (!this._roundSession.isInitialized) throw new Error('Cannot load replay before initialization');
     const replay = validateReplayDescriptor(value, stages.length);
 
-    // Apply the explicit seed before any rebuild so map/participant changes do
-    // not consume an auto-generated seed or alter the replay stream.
-    this.setSeed(replay.seed);
-    this.setSkillsEnabled(replay.skillsEnabled);
-    this.setMap(replay.mapIndex);
-    this.setMarbles(replay.participants.slice());
-    this.setWinnerRange(replay.winnerRange.start, replay.winnerRange.end);
+    this._cancelActiveFairnessDraw('Fairness draw was cancelled because a replay was loaded');
+    this._applyingReplay = true;
+    this._replayPending = true;
+    try {
+      // Apply the explicit seed before any rebuild so map/participant changes
+      // do not consume an auto-generated seed or alter the replay stream.
+      this.setSeed(replay.seed);
+      this.setSkillsEnabled(replay.skillsEnabled);
+      this.setMap(replay.mapIndex);
+      this.setMarbles(replay.participants.slice());
+      this.setWinnerRange(replay.winnerRange.start, replay.winnerRange.end);
+    } catch (error) {
+      this._replayPending = false;
+      throw error;
+    } finally {
+      this._applyingReplay = false;
+    }
   }
 
   public getMaps() {
@@ -606,6 +976,10 @@ export class Roulette extends EventTarget {
 
     if (index < 0 || index > stages.length - 1) {
       throw new Error('Incorrect map number');
+    }
+    if (!this._applyingReplay) {
+      this._replayPending = false;
+      this._cancelActiveFairnessDraw('Fairness draw was cancelled because the map changed');
     }
     this._invalidateRecording();
     this._presentationEffects.clear();

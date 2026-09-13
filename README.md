@@ -21,6 +21,7 @@
 - 시뮬레이션에 영향을 주는 난수를 seeded PRNG로 분리하고, 동일한 빌드/런타임에서 같은 시드의 경기를 재현 가능하게 구성
 - `Roulette` / `RoundSession` / `RaceSimulation`으로 라운드 상태와 시뮬레이션 책임을 분리
 - 로컬 이미지 기반 **Branding & Sponsors** 기능
+- 선택형 누적 공정성과 기록/리플레이 제어 플레인
 - Cloudflare Workers Static Assets 기반 자체 호스팅
 - 입력, 녹화, 에셋 로딩 및 여러 렌더링 예외 처리 강화
 

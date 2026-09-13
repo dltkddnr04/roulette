@@ -2,8 +2,8 @@ import type { StageDef } from './data/maps';
 import { type RaceRenderState, RaceSimulation, type SimulationStepCallbacks } from './raceSimulation';
 import type { MarblePresentationState } from './types/MarbleRenderState.type';
 import { getMarbleSpawnLayout, type MarbleSpawnLayout } from './utils/marbleSpawn';
+import { getSimulationParticipantSetup } from './utils/participants';
 import type { Seed } from './utils/random';
-import { parseName } from './utils/utils';
 
 export type RoundState = 'initializing' | 'ready' | 'running' | 'finished';
 
@@ -24,12 +24,6 @@ function clipWinnerRange(start: number, end: number, marbleCount: number): { sta
   const clippedStart = Math.min(Math.max(0, start), last);
   return { start: clippedStart, end: Math.min(Math.max(clippedStart, end), last) };
 }
-
-type ParsedParticipant = {
-  name: string;
-  weight: number;
-  count: number;
-};
 
 export class RoundSession {
   private readonly simulation: RaceSimulation;
@@ -89,8 +83,8 @@ export class RoundSession {
     this.simulation.setSeed(seed);
   }
 
-  useRandomSeed(): void {
-    this.simulation.useRandomSeed();
+  setRandomSeedMode(): void {
+    this.simulation.setRandomSeedMode();
   }
 
   getParticipantInputs(): readonly string[] {
@@ -250,30 +244,11 @@ export class RoundSession {
     this.reset();
     if (!this.stage) return null;
 
-    let maxWeight = -Infinity;
-    let minWeight = Infinity;
-    const participants: ParsedParticipant[] = this.participantInputs
-      .map((nameString) => {
-        const result = parseName(nameString);
-        if (!result) return null;
-        const { name, weight, count } = result;
-        maxWeight = Math.max(maxWeight, weight);
-        minWeight = Math.min(minWeight, weight);
-        return { name, weight, count };
-      })
-      .filter((participant): participant is ParsedParticipant => participant !== null);
+    const setup = getSimulationParticipantSetup(this.participantInputs);
+    if (!setup || setup.totalCount > MAX_MARBLES) return null;
 
-    const gap = maxWeight - minWeight;
-    let totalCount = 0;
-    participants.forEach((participant) => {
-      participant.weight = 0.1 + (gap ? (participant.weight - minWeight) / gap : 0);
-      totalCount += participant.count;
-    });
-
-    if (!Number.isSafeInteger(totalCount) || totalCount <= 0 || totalCount > MAX_MARBLES) return null;
-
-    const spawnLayout = getMarbleSpawnLayout(totalCount, this.stage.spawn);
-    this.simulation.replaceMarbles(participants, totalCount, spawnLayout.positions);
+    const spawnLayout = getMarbleSpawnLayout(setup.totalCount, this.stage.spawn);
+    this.simulation.replaceMarbles(setup.participants, setup.totalCount, spawnLayout.positions);
     this.seed = this.simulation.getSeed();
     return spawnLayout;
   }
