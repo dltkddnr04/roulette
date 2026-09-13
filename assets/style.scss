@@ -658,9 +658,24 @@ div.copyright a {
 
     .settings-toggle-grid {
       display: flex;
-      flex-wrap: wrap;
+      flex-direction: column;
+      align-items: stretch;
+      flex-wrap: nowrap;
       border-bottom: 1px solid #555;
       padding: .5rem 0;
+    }
+
+    .settings-toggle-grid > .settings-toggle {
+      width: 100%;
+      min-height: 35px;
+      flex-direction: row;
+      align-items: center;
+      gap: 0;
+    }
+
+    .settings-toggle-grid > .settings-toggle .settings-toggle-label {
+      width: auto;
+      flex: 1 1 auto;
     }
 
     .settings-toggle {
