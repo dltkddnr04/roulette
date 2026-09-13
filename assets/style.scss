@@ -617,6 +617,7 @@ div.copyright a {
     }
 
     .settings-tabs {
+      flex: 1 1 auto;
       display: flex;
       flex-direction: column;
       min-height: 0;
@@ -637,8 +638,6 @@ div.copyright a {
     .settings-tab-panel {
       flex: 1 1 auto;
       min-height: 0;
-      max-height: calc(100vh - 180px);
-      max-height: calc(100dvh - 180px);
       overflow-x: hidden;
       overflow-y: auto;
       overscroll-behavior: contain;
