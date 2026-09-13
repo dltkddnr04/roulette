@@ -1,16 +1,18 @@
 import type { StageDef } from './data/maps';
 import {
-  canUseStrictBalanceFastPath,
+  canUseStrictBalanceEntryFastPath,
   createFairnessCandidateSeed,
   createFairnessExport,
   createFairnessId,
   createFairnessState,
-  evaluateStrictBalance,
+  evaluateStrictBalanceEntries,
+  FAIRNESS_DATA_VERSION,
+  type FairnessDrawEntrySnapshot,
   type FairnessDrawPreparedEvent,
   type FairnessEvent,
   type FairnessExport,
+  type FairnessMemberSnapshot,
   type FairnessMode,
-  type FairnessParticipantSnapshot,
   type FairnessProjection,
   type FairnessState,
   type FairnessWinnerSnapshot,
@@ -21,8 +23,7 @@ import {
   validateFairnessExport,
 } from './fairness';
 import { type FairnessEventStore, IndexedDbFairnessStore } from './fairnessStore';
-import type { MarbleParticipant } from './raceSimulation';
-import { RaceSimulation } from './raceSimulation';
+import { type MarbleParticipant, RaceSimulation } from './raceSimulation';
 import { MAX_MARBLES } from './roundSession';
 import { getMarbleSpawnLayout } from './utils/marbleSpawn';
 import { getSimulationParticipantSetup } from './utils/participants';
@@ -61,6 +62,8 @@ export type FairnessPreparedDraw = Readonly<{
   drawId: string;
   seed: Seed;
   event: FairnessDrawPreparedEvent;
+  expectedWinnerEntryIds: readonly string[] | null;
+  /** Kept for singleton-entry callers; grouped draws use entry IDs. */
   expectedWinnerParticipantIds: readonly string[] | null;
   expectedWinnerMarbleIds: readonly number[] | null;
   operationToken: number;
@@ -80,8 +83,9 @@ export type FairnessCoordinatorOptions = Readonly<{
   headlessStepLimit?: number;
 }>;
 
-type SyncedInput = Readonly<{
-  participantId: string;
+type SyncedEntry = Readonly<{
+  entryId: string;
+  memberIds: readonly string[];
   rawInput: string;
   displayName: string;
   weight: number;
@@ -91,7 +95,7 @@ type SyncedInput = Readonly<{
 type SearchResult = Readonly<{
   seed: Seed;
   winnerMarbleIds: readonly number[];
-  winnerParticipantIds: readonly string[];
+  winnerEntryIds: readonly string[];
 }>;
 
 export class FairnessCancelledError extends Error {
@@ -107,6 +111,11 @@ function clone<T>(value: T): T {
 
 function getErrorMessage(error: unknown, fallback = DEFAULT_RECENT_ERROR): string {
   return error instanceof Error && error.message ? error.message : fallback;
+}
+
+function isFairnessInputError(error: unknown): boolean {
+  if (!(error instanceof Error)) return false;
+  return error.message.startsWith('Fairness group') || error.message.startsWith('Fairness member');
 }
 
 function isFairnessMode(value: unknown): value is FairnessMode {
@@ -129,25 +138,86 @@ function createBaseEvent<T extends FairnessEvent['type']>(
   createId: (prefix: string) => string
 ): Pick<FairnessEvent, 'version' | 'eventId' | 'timestamp' | 'type'> & { type: T } {
   return {
-    version: 1,
+    version: FAIRNESS_DATA_VERSION,
     eventId: createId('event'),
     timestamp: now(),
     type,
   } as Pick<FairnessEvent, 'version' | 'eventId' | 'timestamp' | 'type'> & { type: T };
 }
 
+export function parseFairnessEntryName(name: string): string[] | null {
+  const members: string[] = [];
+  let current = '';
+  for (let index = 0; index < name.length; index++) {
+    const character = name[index];
+    if (character === '\\' && name[index + 1] === '+') {
+      current += '+';
+      index++;
+    } else if (character === '+') {
+      const member = current.trim();
+      if (!member) return null;
+      members.push(member);
+      current = '';
+    } else {
+      current += character;
+    }
+  }
+  const member = current.trim();
+  if (!member) return null;
+  members.push(member);
+  return members;
+}
+
+type ParsedFairnessEntry = Readonly<{
+  rawInput: string;
+  displayName: string;
+  memberNames: string[];
+  weight: number;
+  count: number;
+}>;
+
+function parseFairnessEntries(inputs: readonly string[], parseGroups: boolean): ParsedFairnessEntry[] {
+  const rows: ParsedFairnessEntry[] = [];
+  const memberNames = new Set<string>();
+  inputs.forEach((rawInput) => {
+    const parsed = parseName(rawInput);
+    if (!parsed) return;
+    const names = parseGroups ? parseFairnessEntryName(parsed.name) : [parsed.name];
+    if (!names) throw new Error('Fairness group contains an empty member');
+    names.forEach((name) => {
+      if (memberNames.has(name)) throw new Error('Fairness member cannot appear in multiple draw entries');
+      memberNames.add(name);
+    });
+    rows.push({ rawInput, displayName: parsed.name, memberNames: names, weight: parsed.weight, count: parsed.count });
+  });
+  return rows;
+}
+
 function mapWinnerMarbles(
   winnerMarbleIds: readonly number[],
-  participants: readonly FairnessParticipantSnapshot[]
+  entries: readonly FairnessDrawEntrySnapshot[],
+  members: readonly FairnessMemberSnapshot[]
 ): FairnessWinnerSnapshot[] | null {
   const winners: FairnessWinnerSnapshot[] = [];
   const seen = new Set<string>();
   for (const marbleId of winnerMarbleIds) {
-    const participant = participants.find((candidate) => candidate.marbleIds.includes(marbleId));
-    if (!participant) return null;
-    if (seen.has(participant.participantId)) continue;
-    seen.add(participant.participantId);
-    winners.push({ participantId: participant.participantId, displayName: participant.displayName, marbleId });
+    const entry = entries.find((candidate) => candidate.marbleIds.includes(marbleId));
+    if (!entry) return null;
+    if (seen.has(entry.entryId)) continue;
+    seen.add(entry.entryId);
+    const winnerMembers = entry.memberIds.map((memberId) => {
+      const member = members.find((candidate) => candidate.participantId === memberId);
+      return member ? { participantId: member.participantId, displayName: member.displayName } : null;
+    });
+    if (winnerMembers.some((member) => member === null)) return null;
+    winners.push({
+      entryId: entry.entryId,
+      entryDisplayName: entry.displayName,
+      marbleId,
+      members: winnerMembers.filter(
+        (member): member is { participantId: string; displayName: string } => member !== null
+      ),
+    });
   }
   return winners;
 }
@@ -171,11 +241,14 @@ export function mapMarbleIdsToParticipants(
   return mapping;
 }
 
-async function yieldToHost(): Promise<void> {
-  await new Promise<void>((resolve) => {
-    if (typeof setTimeout === 'function') setTimeout(resolve, 0);
-    else resolve();
-  });
+export function mapMarbleIdsToEntries(
+  seed: Seed,
+  entries: readonly Readonly<{ entryId: string; count: number }>[]
+): Map<number, string> {
+  return mapMarbleIdsToParticipants(
+    seed,
+    entries.map((entry) => ({ participantId: entry.entryId, count: entry.count }))
+  );
 }
 
 export async function runHeadlessRace(request: FairnessHeadlessSearchRequest, stepLimit = DEFAULT_HEADLESS_STEP_LIMIT) {
@@ -213,6 +286,13 @@ export async function runHeadlessRace(request: FairnessHeadlessSearchRequest, st
   }
 }
 
+async function yieldToHost(): Promise<void> {
+  await new Promise<void>((resolve) => {
+    if (typeof setTimeout === 'function') setTimeout(resolve, 0);
+    else resolve();
+  });
+}
+
 export class FairnessCoordinator {
   private readonly store: FairnessEventStore;
   private readonly headlessRunner: FairnessHeadlessRunner;
@@ -224,7 +304,8 @@ export class FairnessCoordinator {
   private events: FairnessEvent[] = [];
   private projection: FairnessProjection = projectFairnessEvents([]);
   private currentInputs: string[] = [];
-  private inputBindings: Array<string | null> = [];
+  private boundInputs: string[] = [];
+  private inputBindings: Array<readonly string[] | null> = [];
   private manualRenames = new Map<string, string>();
   private mutationQueue: Promise<void> = Promise.resolve();
   private loadingPromise: Promise<void> | null = null;
@@ -274,7 +355,8 @@ export class FairnessCoordinator {
     if (!this.enabled || suppressSync) return;
 
     void this.syncCurrentParticipants().catch((error) => {
-      this.markUnavailable(error);
+      if (isFairnessInputError(error)) this.error = getErrorMessage(error);
+      else this.markUnavailable(error);
     });
   }
 
@@ -293,7 +375,13 @@ export class FairnessCoordinator {
       await this.syncCurrentParticipants();
       writeLocalStorage(FAIRNESS_ENABLED_STORAGE_KEY, 'true');
     } catch (error) {
-      this.markUnavailable(error);
+      if (isFairnessInputError(error)) {
+        this.enabled = false;
+        this.error = getErrorMessage(error);
+        writeLocalStorage(FAIRNESS_ENABLED_STORAGE_KEY, 'false');
+      } else {
+        this.markUnavailable(error);
+      }
       throw new Error(getErrorMessage(error));
     }
   }
@@ -342,8 +430,11 @@ export class FairnessCoordinator {
       const participant = this.projection.participants.find((candidate) => candidate.id === participantId);
       if (!participant) throw new Error('Fairness participant was not found');
       if (participant.displayName === trimmedName) return;
-      const boundIndex = this.inputBindings.indexOf(participantId);
-      const rawInput = boundIndex >= 0 ? this.currentInputs[boundIndex] : undefined;
+      const boundIndex = this.inputBindings.findIndex((binding) => binding?.includes(participantId));
+      const memberIndex = boundIndex >= 0 ? (this.inputBindings[boundIndex]?.indexOf(participantId) ?? -1) : -1;
+      const parsed = boundIndex >= 0 ? parseName(this.boundInputs[boundIndex]) : null;
+      const memberNames = parsed ? parseFairnessEntryName(parsed.name) : null;
+      const rawInput = memberIndex >= 0 && memberNames ? memberNames[memberIndex] : undefined;
       if (rawInput !== undefined) this.manualRenames.set(participantId, rawInput);
       const base = createBaseEvent('participantRenamed', this.now, this.createId);
       await this.appendEvent({ ...base, participantId, displayName: trimmedName, ...(rawInput ? { rawInput } : {}) });
@@ -395,6 +486,7 @@ export class FairnessCoordinator {
       this.events = data.events.map((event) => clone(event));
       this.projection = projectFairnessEvents(this.events);
       this.inputBindings = [];
+      this.boundInputs = [];
       this.manualRenames = collectManualRenameBindings(this.events);
       this.mode = data.mode;
       writeLocalStorage(FAIRNESS_MODE_STORAGE_KEY, this.mode);
@@ -415,6 +507,7 @@ export class FairnessCoordinator {
       this.events = [];
       this.projection = projectFairnessEvents([]);
       this.inputBindings = [];
+      this.boundInputs = [];
       this.manualRenames.clear();
     });
   }
@@ -432,19 +525,29 @@ export class FairnessCoordinator {
       throw new Error('Cumulative fairness supports one winning rank at a time');
     }
 
-    const policyInputs = this.projection.participants.map((participant) => ({
-      id: participant.id,
-      active: participant.active,
-      excluded: participant.excluded,
-      effectiveBalance: participant.effectiveBalance,
+    const policyInputs = new Map(
+      this.projection.participants.map((participant) => [
+        participant.id,
+        {
+          id: participant.id,
+          active: participant.active,
+          excluded: participant.excluded,
+          effectiveBalance: participant.effectiveBalance,
+        },
+      ])
+    );
+    const entryPolicyInputs = syncedInputs.map((entry) => ({
+      id: entry.entryId,
+      members: entry.memberIds.map((memberId) => policyInputs.get(memberId)).filter((member) => member !== undefined),
     }));
-    const evaluation = evaluateStrictBalance(policyInputs);
-    if (evaluation.eligibleIds.length === 0) throw new Error('Fairness has no eligible participants');
+    const evaluation = evaluateStrictBalanceEntries(entryPolicyInputs);
+    if (evaluation.eligibleEntryIds.length === 0) throw new Error('Fairness has no eligible draw entries');
 
-    const mappingRows = syncedInputs.map((input) => ({ participantId: input.participantId, count: input.count }));
+    const mappingRows = syncedInputs.map((input) => ({ entryId: input.entryId, count: input.count }));
     const spawnLayout = getMarbleSpawnLayout(setup.totalCount, request.stage.spawn);
-    const mustSearch = !canUseStrictBalanceFastPath(evaluation);
+    const mustSearch = !canUseStrictBalanceEntryFastPath(evaluation);
     let seed = request.currentSeed;
+    let expectedWinnerEntryIds: readonly string[] | null = null;
     let expectedWinnerParticipantIds: readonly string[] | null = null;
     let expectedWinnerMarbleIds: readonly number[] | null = null;
     const drawId = this.createId('draw');
@@ -458,11 +561,13 @@ export class FairnessCoordinator {
           setup.totalCount,
           spawnLayout.positions,
           mappingRows,
-          evaluation.eligibleIds,
+          evaluation.eligibleEntryIds,
           token
         );
         seed = searchResult.seed;
-        expectedWinnerParticipantIds = [searchResult.winnerParticipantIds[request.winnerRange.end]];
+        expectedWinnerEntryIds = [searchResult.winnerEntryIds[request.winnerRange.end]];
+        const winningEntry = syncedInputs.find((entry) => entry.entryId === expectedWinnerEntryIds?.[0]);
+        expectedWinnerParticipantIds = winningEntry?.memberIds.length === 1 ? [winningEntry.memberIds[0]] : null;
         expectedWinnerMarbleIds = [searchResult.winnerMarbleIds[request.winnerRange.end]];
       }
 
@@ -477,6 +582,7 @@ export class FairnessCoordinator {
         drawId: event.drawId,
         seed,
         event: clone(event),
+        expectedWinnerEntryIds,
         expectedWinnerParticipantIds,
         expectedWinnerMarbleIds,
         operationToken: token,
@@ -509,7 +615,8 @@ export class FairnessCoordinator {
     winnerMarbleIds: readonly number[],
     token: number | null,
     expectedWinnerParticipantIds: readonly string[] | null = null,
-    expectedWinnerMarbleIds: readonly number[] | null = null
+    expectedWinnerMarbleIds: readonly number[] | null = null,
+    expectedWinnerEntryIds: readonly string[] | null = null
   ): Promise<FairnessConfirmationResult> {
     await this.ensureLoaded();
     if (!this.available) return { confirmed: false, reason: this.error ?? DEFAULT_RECENT_ERROR };
@@ -530,7 +637,7 @@ export class FairnessCoordinator {
         return { confirmed: false, reason: 'Fairness draw was cancelled' };
       }
 
-      const winners = mapWinnerMarbles(winnerMarbleIds, draw.participants);
+      const winners = mapWinnerMarbles(winnerMarbleIds, draw.entries, draw.members);
       if (!winners || winners.length === 0) {
         const reason = 'Fairness could not map the actual winner to a participant';
         await this.appendEvent({ ...createBaseEvent('drawFailed', this.now, this.createId), drawId, reason });
@@ -538,9 +645,22 @@ export class FairnessCoordinator {
       }
 
       if (
+        expectedWinnerEntryIds &&
+        (expectedWinnerEntryIds.length !== winners.length ||
+          expectedWinnerEntryIds.some((entryId, index) => entryId !== winners[index].entryId))
+      ) {
+        const reason = 'Fairness search verification did not match the actual draw entry';
+        await this.appendEvent({ ...createBaseEvent('drawFailed', this.now, this.createId), drawId, reason });
+        return { confirmed: false, reason };
+      }
+
+      if (
         expectedWinnerParticipantIds &&
         (expectedWinnerParticipantIds.length !== winners.length ||
-          expectedWinnerParticipantIds.some((participantId, index) => participantId !== winners[index].participantId))
+          expectedWinnerParticipantIds.some(
+            (participantId, index) =>
+              winners[index].members.length !== 1 || participantId !== winners[index].members[0].participantId
+          ))
       ) {
         const reason = 'Fairness search verification did not match the actual run';
         await this.appendEvent({ ...createBaseEvent('drawFailed', this.now, this.createId), drawId, reason });
@@ -584,11 +704,16 @@ export class FairnessCoordinator {
   async prepareUnconstrainedDraw(request: FairnessStartRequest): Promise<FairnessPreparedDraw | null> {
     await this.ensureLoaded();
     if (!this.available) return null;
-    const syncedInputs = await this.syncCurrentParticipants(true, request.participantInputs);
+    const syncedInputs = await this.syncCurrentParticipants(
+      true,
+      request.participantInputs,
+      undefined,
+      this.enabled || this.events.length > 0
+    );
 
     const setup = getSimulationParticipantSetup(request.participantInputs);
     if (!setup || setup.totalCount <= 0 || setup.totalCount > MAX_MARBLES) return null;
-    const mappingRows = syncedInputs.map((input) => ({ participantId: input.participantId, count: input.count }));
+    const mappingRows = syncedInputs.map((input) => ({ entryId: input.entryId, count: input.count }));
     const preparedEvent = this.createPreparedEvent(
       request,
       request.currentSeed,
@@ -605,6 +730,7 @@ export class FairnessCoordinator {
       drawId: preparedEvent.drawId,
       seed: preparedEvent.seed,
       event: clone(preparedEvent),
+      expectedWinnerEntryIds: null,
       expectedWinnerParticipantIds: null,
       expectedWinnerMarbleIds: null,
       operationToken: 0,
@@ -656,96 +782,139 @@ export class FairnessCoordinator {
   private async syncCurrentParticipants(
     force = false,
     inputs: readonly string[] = this.currentInputs,
-    token?: number
-  ): Promise<SyncedInput[]> {
+    token?: number,
+    parseGroups = this.enabled || this.events.length > 0
+  ): Promise<SyncedEntry[]> {
     if (!force && !this.enabled) return [];
     await this.ensureLoaded();
     if (!this.available) throw new Error(this.error ?? DEFAULT_RECENT_ERROR);
+    const rows = parseFairnessEntries(inputs, parseGroups);
 
     return this.enqueueMutation(async () => {
       if (token !== undefined) this.assertCurrent(token);
       if (!force && !this.enabled) return [];
       await this.ensureEpoch();
-      const syncedInputs = await this.syncCurrentParticipantsNow(inputs, token);
+      const syncedInputs = await this.syncCurrentParticipantsNow(rows, token);
+      this.error = null;
       if (token !== undefined) this.assertCurrent(token);
       return syncedInputs;
     });
   }
 
   private async syncCurrentParticipantsNow(
-    inputs: readonly string[] = this.currentInputs,
+    rows: readonly ParsedFairnessEntry[],
     token?: number
-  ): Promise<SyncedInput[]> {
-    const rows: Array<{ rawInput: string; displayName: string; weight: number; count: number }> = [];
-    inputs.forEach((rawInput) => {
+  ): Promise<SyncedEntry[]> {
+    const previousMemberNames: string[][] = [];
+    let previousRowIndex = 0;
+    for (const rawInput of this.boundInputs) {
       const parsed = parseName(rawInput);
-      if (parsed) rows.push({ rawInput, displayName: parsed.name, weight: parsed.weight, count: parsed.count });
+      if (!parsed) continue;
+      const binding = this.inputBindings[previousRowIndex] ?? [];
+      const names = binding.length > 1 ? parseFairnessEntryName(parsed.name) : [parsed.name];
+      previousMemberNames.push(names && names.length === binding.length ? names : []);
+      previousRowIndex++;
+    }
+    const previousMemberBindings = new Map<string, string>();
+    previousMemberNames.forEach((names, rowIndex) => {
+      names.forEach((name, memberIndex) => {
+        const participantId = this.inputBindings[rowIndex]?.[memberIndex];
+        if (participantId && !previousMemberBindings.has(name)) previousMemberBindings.set(name, participantId);
+      });
     });
-
+    const currentMemberNames = new Set<string>();
+    rows.forEach((row) => row.memberNames.forEach((name) => currentMemberNames.add(name)));
     const usedIds = new Set<string>();
-    const nextBindings: Array<string | null> = [];
+    const nextBindings: Array<readonly string[] | null> = [];
     const currentIds = new Set<string>();
-    const syncedInputs: SyncedInput[] = [];
+    const syncedInputs: SyncedEntry[] = [];
 
     for (let rowIndex = 0; rowIndex < rows.length; rowIndex++) {
       if (token !== undefined) this.assertCurrent(token);
       const row = rows[rowIndex];
       const priorBinding = this.inputBindings[rowIndex];
-      const boundParticipant = priorBinding
-        ? this.projection.participants.find((candidate) => candidate.id === priorBinding && !usedIds.has(candidate.id))
-        : undefined;
-      const namedParticipant = this.projection.participants.find(
-        (candidate) => candidate.displayName === row.displayName && !usedIds.has(candidate.id)
-      );
-      const pinnedParticipant = this.projection.participants.find(
-        (candidate) => this.manualRenames.get(candidate.id) === row.rawInput && !usedIds.has(candidate.id)
-      );
-      // Preserve a row's identity across a rename, but do not let reordering
-      // two existing names silently swap their participant IDs.
-      const isPinnedRename = boundParticipant && this.manualRenames.get(boundParticipant.id) === row.rawInput;
-      let participant =
-        boundParticipant &&
-        (isPinnedRename ||
-          (!namedParticipant && !pinnedParticipant) ||
-          boundParticipant.displayName === row.displayName)
-          ? boundParticipant
-          : (namedParticipant ?? pinnedParticipant);
+      const boundMembers = priorBinding ?? [];
+      const memberIds: string[] = [];
+      for (let memberIndex = 0; memberIndex < row.memberNames.length; memberIndex++) {
+        const memberName = row.memberNames[memberIndex];
+        const priorId = boundMembers[memberIndex];
+        const priorMemberName = previousMemberNames[rowIndex]?.[memberIndex];
+        const priorMemberCount = previousMemberNames[rowIndex]?.length ?? 0;
+        const boundParticipant = priorId
+          ? this.projection.participants.find((candidate) => candidate.id === priorId && !usedIds.has(candidate.id))
+          : undefined;
+        const previousTokenId = previousMemberBindings.get(memberName);
+        const previousTokenParticipant = previousTokenId
+          ? this.projection.participants.find((candidate) => candidate.id === previousTokenId)
+          : undefined;
+        const namedParticipant = this.projection.participants.find((candidate) => candidate.displayName === memberName);
+        const pinnedParticipant = this.projection.participants.find(
+          (candidate) => this.manualRenames.get(candidate.id) === memberName
+        );
+        if (
+          [namedParticipant, pinnedParticipant].some(
+            (candidate) => candidate !== undefined && usedIds.has(candidate.id)
+          )
+        ) {
+          throw new Error('Fairness member cannot appear in multiple draw entries');
+        }
+        const isPinnedRename = boundParticipant && this.manualRenames.get(boundParticipant.id) === memberName;
+        let participant =
+          namedParticipant ??
+          pinnedParticipant ??
+          previousTokenParticipant ??
+          (boundParticipant &&
+          priorMemberCount === row.memberNames.length &&
+          (!priorMemberName || !currentMemberNames.has(priorMemberName))
+            ? boundParticipant
+            : undefined);
 
-      if (!participant) {
-        const participantId = this.createId('participant');
-        const base = createBaseEvent('participantDiscovered', this.now, this.createId);
-        await this.appendEvent({
-          ...base,
-          participantId,
-          displayName: row.displayName,
-          active: true,
-          excluded: false,
-        });
-        participant = this.projection.participants.find((candidate) => candidate.id === participantId);
-      }
-      if (!participant) throw new Error('Fairness participant discovery failed');
+        if (isPinnedRename && boundParticipant) participant = boundParticipant;
 
-      usedIds.add(participant.id);
-      currentIds.add(participant.id);
-      nextBindings[rowIndex] = participant.id;
+        if (!participant) {
+          const participantId = this.createId('participant');
+          const base = createBaseEvent('participantDiscovered', this.now, this.createId);
+          await this.appendEvent({
+            ...base,
+            participantId,
+            displayName: memberName,
+            active: true,
+            excluded: false,
+          });
+          participant = this.projection.participants.find((candidate) => candidate.id === participantId);
+        }
+        if (!participant) throw new Error('Fairness participant discovery failed');
+        if (usedIds.has(participant.id)) throw new Error('Fairness member cannot appear in multiple draw entries');
 
-      if (!participant.active) {
-        const base = createBaseEvent('participantParticipationChanged', this.now, this.createId);
-        await this.appendEvent({ ...base, participantId: participant.id, active: true });
+        usedIds.add(participant.id);
+        currentIds.add(participant.id);
+        memberIds.push(participant.id);
+        if (!participant.active) {
+          const base = createBaseEvent('participantParticipationChanged', this.now, this.createId);
+          await this.appendEvent({ ...base, participantId: participant.id, active: true });
+        }
+        const latestParticipant = this.projection.participants.find((candidate) => candidate.id === participant.id);
+        const manualRename = this.manualRenames.get(participant.id);
+        if (latestParticipant && latestParticipant.displayName !== memberName && manualRename !== memberName) {
+          this.manualRenames.set(latestParticipant.id, memberName);
+          const base = createBaseEvent('participantRenamed', this.now, this.createId);
+          await this.appendEvent({
+            ...base,
+            participantId: latestParticipant.id,
+            displayName: memberName,
+            rawInput: memberName,
+          });
+        }
       }
-      const latestParticipant = this.projection.participants.find((candidate) => candidate.id === participant.id);
-      const manualRename = this.manualRenames.get(participant.id);
-      if (latestParticipant && latestParticipant.displayName !== row.displayName && manualRename !== row.rawInput) {
-        this.manualRenames.set(latestParticipant.id, row.rawInput);
-        const base = createBaseEvent('participantRenamed', this.now, this.createId);
-        await this.appendEvent({
-          ...base,
-          participantId: latestParticipant.id,
-          displayName: row.displayName,
-          rawInput: row.rawInput,
-        });
-      }
-      syncedInputs.push({ participantId: participant.id, ...row });
+      nextBindings[rowIndex] = memberIds;
+      syncedInputs.push({
+        entryId: `entry-${rowIndex}`,
+        memberIds,
+        rawInput: row.rawInput,
+        displayName: row.displayName,
+        weight: row.weight,
+        count: row.count,
+      });
     }
 
     // Keep absence events sequential so each event is persisted and projected
@@ -757,40 +926,45 @@ export class FairnessCoordinator {
       await this.appendEvent({ ...base, participantId: participant.id, active: false });
     }
     this.inputBindings = nextBindings;
+    this.boundInputs = rows.map((row) => row.rawInput);
     return syncedInputs;
   }
 
   private createPreparedEvent(
     request: FairnessStartRequest,
     seed: Seed,
-    syncedInputs: readonly SyncedInput[],
-    mappingRows: readonly Readonly<{ participantId: string; count: number }>[],
+    syncedInputs: readonly SyncedEntry[],
+    mappingRows: readonly Readonly<{ entryId: string; count: number }>[],
     totalCount: number,
     drawId: string,
     fairnessEnabledAtDraw: boolean
   ): FairnessDrawPreparedEvent {
-    const mapping = mapMarbleIdsToParticipants(seed, mappingRows);
+    const mapping = mapMarbleIdsToEntries(seed, mappingRows);
     const base = createBaseEvent('drawPrepared', this.now, this.createId);
-    const participants: FairnessParticipantSnapshot[] = syncedInputs.map((input) => {
-      const participant = this.projection.participants.find((candidate) => candidate.id === input.participantId);
+    const memberIds = [...new Set(syncedInputs.reduce<string[]>((ids, input) => ids.concat(input.memberIds), []))];
+    const members: FairnessMemberSnapshot[] = memberIds.map((memberId) => {
+      const participant = this.projection.participants.find((candidate) => candidate.id === memberId);
       if (!participant) throw new Error('Fairness participant mapping is unavailable');
       return {
-        participantId: input.participantId,
+        participantId: memberId,
         displayName: participant.displayName,
-        rawInput: input.rawInput,
-        weight: input.weight,
-        count: input.count,
-        marbleIds: [...mapping]
-          .filter(([, participantId]) => participantId === input.participantId)
-          .map(([marbleId]) => marbleId),
         active: participant.active,
         excluded: participant.excluded,
         included: participant.active && !participant.excluded,
         effectiveBalance: participant.effectiveBalance,
       };
     });
+    const entries: FairnessDrawEntrySnapshot[] = syncedInputs.map((input) => ({
+      entryId: input.entryId,
+      displayName: input.displayName,
+      rawInput: input.rawInput,
+      memberIds: [...input.memberIds],
+      weight: input.weight,
+      count: input.count,
+      marbleIds: [...mapping].filter(([, entryId]) => entryId === input.entryId).map(([marbleId]) => marbleId),
+    }));
 
-    if (participants.reduce((total, participant) => total + participant.count, 0) !== totalCount) {
+    if (entries.reduce((total, entry) => total + entry.count, 0) !== totalCount) {
       throw new Error('Fairness participant snapshot count does not match the simulation');
     }
 
@@ -809,7 +983,8 @@ export class FairnessCoordinator {
         id: STRICT_BALANCE_POLICY_ID,
         version: STRICT_BALANCE_POLICY_VERSION,
       },
-      participants,
+      members,
+      entries,
     };
   }
 
@@ -818,16 +993,15 @@ export class FairnessCoordinator {
     participants: readonly MarbleParticipant[],
     totalCount: number,
     spawnPositions: readonly { x: number; y: number }[],
-    mappingRows: readonly Readonly<{ participantId: string; count: number }>[],
-    eligibleIds: readonly string[],
+    mappingRows: readonly Readonly<{ entryId: string; count: number }>[],
+    eligibleEntryIds: readonly string[],
     token: number
   ): Promise<SearchResult> {
-    const activeParticipantCount = this.projection.participants.filter((participant) => participant.active).length;
-    const budget = searchBudget(totalCount, Math.max(1, activeParticipantCount), eligibleIds.length);
+    const budget = searchBudget(totalCount, Math.max(1, mappingRows.length), eligibleEntryIds.length);
     if (budget <= 0) throw new Error('Fairness search has no valid budget');
 
-    const mappingByMarble = (seed: Seed) => mapMarbleIdsToParticipants(seed, mappingRows);
-    const eligible = new Set(eligibleIds);
+    const mappingByMarble = (seed: Seed) => mapMarbleIdsToEntries(seed, mappingRows);
+    const eligible = new Set(eligibleEntryIds);
     let lastError: unknown;
     for (let attempt = 0; attempt < budget; attempt++) {
       this.assertCurrent(token);
@@ -843,13 +1017,13 @@ export class FairnessCoordinator {
           targetRank: request.winnerRange.end,
         });
         const mapping = mappingByMarble(seed);
-        const winnerParticipantIds = winnerMarbleIds.map((marbleId) => mapping.get(marbleId));
-        const winnerId = winnerParticipantIds[request.winnerRange.end];
+        const winnerEntryIds = winnerMarbleIds.map((marbleId) => mapping.get(marbleId));
+        const winnerId = winnerEntryIds[request.winnerRange.end];
         if (winnerId && eligible.has(winnerId)) {
           return {
             seed,
             winnerMarbleIds: winnerMarbleIds.slice(),
-            winnerParticipantIds: winnerParticipantIds.filter((id): id is string => id !== undefined),
+            winnerEntryIds: winnerEntryIds.filter((id): id is string => id !== undefined),
           };
         }
       } catch (error) {

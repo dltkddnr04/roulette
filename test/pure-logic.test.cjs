@@ -40,15 +40,18 @@ const { RoundSession } = loadTypeScriptModule('src/roundSession.ts');
 const { validateReplayDescriptor } = loadTypeScriptModule('src/replay.ts');
 const { createSeededRandom } = loadTypeScriptModule('src/utils/random.ts');
 const {
+  canUseStrictBalanceEntryFastPath,
   canUseStrictBalanceFastPath,
   createFairnessCandidateSeed,
   createFairnessExport,
   evaluateStrictBalance,
+  evaluateStrictBalanceEntries,
+  LEGACY_FAIRNESS_DATA_VERSION,
   projectFairnessEvents,
   searchBudget,
   validateFairnessExport,
 } = loadTypeScriptModule('src/fairness.ts');
-const { FairnessCoordinator, mapMarbleIdsToParticipants, runHeadlessRace } =
+const { FairnessCoordinator, mapMarbleIdsToParticipants, parseFairnessEntryName, runHeadlessRace } =
   loadTypeScriptModule('src/fairnessCoordinator.ts');
 const { InMemoryFairnessStore } = loadTypeScriptModule('src/fairnessStore.ts');
 
@@ -685,6 +688,329 @@ test('strict balance selects only the current minimum included participants', ()
   assert.equal(searchBudget(0, 1, 1), 0);
 });
 
+test('fairness entry parser keeps physical entries separate from group members', () => {
+  assert.deepEqual(parseFairnessEntryName('A'), ['A']);
+  assert.deepEqual(parseFairnessEntryName('B+C'), ['B', 'C']);
+  assert.deepEqual(parseFairnessEntryName('B + C'), ['B', 'C']);
+  const weightedGroup = parseName('B+C/2*3');
+  assert.deepEqual(parseFairnessEntryName(weightedGroup.name), ['B', 'C']);
+  assert.equal(weightedGroup.weight, 2);
+  assert.equal(weightedGroup.count, 3);
+  assert.deepEqual(parseFairnessEntryName('B+C'), ['B', 'C']);
+  assert.deepEqual(parseFairnessEntryName('C\\+\\+'), ['C++']);
+  assert.deepEqual(parseFairnessEntryName('A\\B'), ['A\\B']);
+  assert.equal(parseFairnessEntryName('A+'), null);
+  assert.equal(parseFairnessEntryName('+B'), null);
+  assert.equal(parseFairnessEntryName('A++B'), null);
+});
+
+test('strict balance evaluates grouped entries by exact member average', () => {
+  const input = (id, effectiveBalance, excluded = false) => ({
+    id,
+    active: true,
+    excluded,
+    effectiveBalance,
+  });
+  const evaluation = evaluateStrictBalanceEntries([
+    { id: 'A', members: [input('A', 0)] },
+    { id: 'BC', members: [input('B', 0), input('C', 0)] },
+    { id: 'D', members: [input('D', 0)] },
+  ]);
+  assert.deepEqual(evaluation.eligibleEntryIds, ['A', 'BC', 'D']);
+  assert.equal(canUseStrictBalanceEntryFastPath(evaluation), true);
+
+  assert.deepEqual(
+    evaluateStrictBalanceEntries([
+      { id: 'A', members: [input('A', 0)] },
+      { id: 'BC', members: [input('B', 1), input('C', 1)] },
+      { id: 'D', members: [input('D', 0)] },
+    ]).eligibleEntryIds,
+    ['A', 'D']
+  );
+  assert.deepEqual(
+    evaluateStrictBalanceEntries([
+      { id: 'BC', members: [input('B', 2), input('C', 4)] },
+      { id: 'D', members: [input('D', 3)] },
+    ]).eligibleEntryIds,
+    ['BC', 'D']
+  );
+  assert.deepEqual(
+    evaluateStrictBalanceEntries([
+      { id: 'AB', members: [input('A', 0), input('B', 1)] },
+      { id: 'CDE', members: [input('C', 0), input('D', 0), input('E', 2)] },
+    ]).eligibleEntryIds,
+    ['AB']
+  );
+  const partial = evaluateStrictBalanceEntries([
+    { id: 'BC', members: [input('B', 0), input('C', 99, true)] },
+    { id: 'D', members: [input('D', 0)] },
+    { id: 'E', members: [input('E', 0, true)] },
+  ]);
+  assert.deepEqual(partial.eligibleEntryIds, ['BC', 'D']);
+  assert.deepEqual(partial.ineligibleEntryIds, ['E']);
+  assert.equal(canUseStrictBalanceEntryFastPath(partial), false);
+});
+
+test('group winner accounting credits every member once and void reverses it', () => {
+  const event = (type, timestamp, details) => ({ ...fairnessEvent(type, timestamp, details), version: 2 });
+  const members = ['A', 'B', 'C', 'D'].map((participantId) => ({
+    participantId,
+    displayName: participantId,
+    active: true,
+    excluded: false,
+    included: true,
+    effectiveBalance: 0,
+  }));
+  const entries = [
+    { entryId: 'entry-a', displayName: 'A', rawInput: 'A', memberIds: ['A'], weight: 1, count: 1, marbleIds: [0] },
+    {
+      entryId: 'entry-bc',
+      displayName: 'B+C',
+      rawInput: 'B+C',
+      memberIds: ['B', 'C'],
+      weight: 1,
+      count: 1,
+      marbleIds: [1],
+    },
+    { entryId: 'entry-d', displayName: 'D', rawInput: 'D', memberIds: ['D'], weight: 1, count: 1, marbleIds: [2] },
+  ];
+  const prepared = {
+    drawId: 'draw-group',
+    epochId: 'epoch-1',
+    seed: 'group',
+    mapIndex: 0,
+    mapTitle: 'group',
+    rawParticipantInputs: ['A', 'B+C', 'D'],
+    winnerRange: { start: 0, end: 0 },
+    skillsEnabled: false,
+    fairnessEnabledAtDraw: true,
+    policy: { id: 'strict-balance-v1', version: 1 },
+    members,
+    entries,
+  };
+  const events = [
+    event('epochStarted', 1, { epochId: 'epoch-1' }),
+    ...members.map((member, index) =>
+      event('participantDiscovered', index + 2, {
+        participantId: member.participantId,
+        displayName: member.displayName,
+        active: true,
+        excluded: false,
+      })
+    ),
+    event('drawPrepared', 6, prepared),
+    event('drawConfirmed', 7, {
+      drawId: 'draw-group',
+      winners: [
+        {
+          entryId: 'entry-bc',
+          entryDisplayName: 'B+C',
+          marbleId: 1,
+          members: [
+            { participantId: 'B', displayName: 'B' },
+            { participantId: 'C', displayName: 'C' },
+          ],
+        },
+      ],
+    }),
+  ];
+  const projection = projectFairnessEvents(events);
+  assert.equal(projection.draws[0].entries[1].memberIds.length, 2);
+  assert.equal(projection.participants.find(({ id }) => id === 'B').actualWins, 1);
+  assert.equal(projection.participants.find(({ id }) => id === 'C').currentEpochWins, 1);
+  const voided = projectFairnessEvents([...events, event('drawVoided', 8, { drawId: 'draw-group' })]);
+  assert.equal(voided.participants.find(({ id }) => id === 'B').actualWins, 0);
+  assert.equal(voided.participants.find(({ id }) => id === 'C').currentEpochWins, 0);
+});
+
+test('group identity survives regrouping and duplicate member entries are rejected', async () => {
+  let id = 0;
+  const stage = {
+    title: 'group test',
+    finish: { y: 20 },
+    camera: { zoomTriggerY: 10 },
+    spawn: { origin: { x: 10.25, y: 1 }, maxColumns: 10, columnSpacing: 0.6, rowSpacing: 1, maxUnshiftedRows: 5 },
+    entities: [],
+  };
+  const request = (participantInputs) => ({
+    stage,
+    mapIndex: 0,
+    participantInputs,
+    winnerRange: { start: 0, end: 0 },
+    skillsEnabled: false,
+    currentSeed: 'group-test',
+  });
+  const coordinator = new FairnessCoordinator({
+    store: new InMemoryFairnessStore(),
+    createId: (prefix) => `${prefix}-${++id}`,
+    now: () => id,
+  });
+  coordinator.setCurrentParticipantInputs(['A', 'B', 'C']);
+  await coordinator.setEnabled(true);
+  const initial = await coordinator.getState();
+  const ids = Object.fromEntries(
+    initial.participants.map(({ displayName, id: participantId }) => [displayName, participantId])
+  );
+  coordinator.setCurrentParticipantInputs(['A', 'B+C', 'D']);
+  const grouped = await coordinator.getState();
+  assert.equal(grouped.participants.find(({ displayName }) => displayName === 'A').id, ids.A);
+  assert.equal(grouped.participants.find(({ displayName }) => displayName === 'B').id, ids.B);
+  assert.equal(grouped.participants.find(({ displayName }) => displayName === 'C').id, ids.C);
+  ids.D = grouped.participants.find(({ displayName }) => displayName === 'D').id;
+  const prepared = await coordinator.prepareDraw(request(['A', 'B+C', 'D']), coordinator.beginStart());
+  assert.deepEqual(
+    prepared.event.entries.map((entry) => entry.displayName),
+    ['A', 'B+C', 'D']
+  );
+  assert.deepEqual(
+    prepared.event.entries[1].memberIds.map(
+      (memberId) => prepared.event.members.find((member) => member.participantId === memberId).displayName
+    ),
+    ['B', 'C']
+  );
+
+  coordinator.setCurrentParticipantInputs(['A+B', 'C', 'D']);
+  const regrouped = await coordinator.getState();
+  assert.equal(regrouped.participants.find(({ displayName }) => displayName === 'A').id, ids.A);
+  assert.equal(regrouped.participants.find(({ displayName }) => displayName === 'B').id, ids.B);
+  assert.equal(regrouped.participants.find(({ displayName }) => displayName === 'C').id, ids.C);
+  await assert.rejects(
+    () => coordinator.prepareDraw(request(['A', 'A+B']), coordinator.beginStart()),
+    /multiple draw entries/
+  );
+
+  await coordinator.renameParticipant(ids.B, 'Bravo');
+  coordinator.setCurrentParticipantInputs(['Bravo+C', 'D']);
+  const renamed = await coordinator.getState();
+  assert.equal(renamed.participants.find(({ displayName }) => displayName === 'Bravo').id, ids.B);
+  await assert.rejects(
+    () => coordinator.prepareDraw(request(['Bravo', 'B+C']), coordinator.beginStart()),
+    /multiple draw entries/
+  );
+});
+
+test('group search accepts an eligible draw entry and keeps plus literal when fairness is off', async () => {
+  const stage = {
+    title: 'group search test',
+    finish: { y: 20 },
+    camera: { zoomTriggerY: 10 },
+    spawn: { origin: { x: 10.25, y: 1 }, maxColumns: 10, columnSpacing: 0.6, rowSpacing: 1, maxUnshiftedRows: 5 },
+    entities: [],
+  };
+  const request = (participantInputs, currentSeed) => ({
+    stage,
+    mapIndex: 0,
+    participantInputs,
+    winnerRange: { start: 0, end: 0 },
+    skillsEnabled: false,
+    currentSeed,
+  });
+  let id = 0;
+  const candidateSeeds = ['reject-group', 'accept-singleton'];
+  const coordinator = new FairnessCoordinator({
+    store: new InMemoryFairnessStore(),
+    createId: (prefix) => `${prefix}-${++id}`,
+    now: () => id,
+    createCandidateSeed: () => candidateSeeds.shift(),
+    headlessRunner: async ({ seed }) => {
+      const mapping = mapMarbleIdsToParticipants(seed, [
+        { participantId: 'entry-0', count: 1 },
+        { participantId: 'entry-1', count: 1 },
+        { participantId: 'entry-2', count: 1 },
+      ]);
+      const wanted = seed === 'reject-group' ? 'entry-1' : 'entry-0';
+      return [Array.from(mapping.entries()).find(([, entryId]) => entryId === wanted)[0]];
+    },
+  });
+  coordinator.setCurrentParticipantInputs(['A', 'B+C', 'D']);
+  await coordinator.setEnabled(true);
+
+  const baseline = await coordinator.prepareUnconstrainedDraw(request(['A', 'B+C', 'D'], 'baseline'));
+  const groupWinnerMarble = baseline.event.entries.find(({ entryId }) => entryId === 'entry-1').marbleIds[0];
+  await coordinator.confirmDraw(baseline.drawId, [groupWinnerMarble], null);
+
+  const searched = await coordinator.prepareDraw(request(['A', 'B+C', 'D'], 'unused-seed'), coordinator.beginStart());
+  assert.equal(searched.seed, 'accept-singleton');
+  assert.deepEqual(searched.expectedWinnerEntryIds, ['entry-0']);
+  assert.equal(searched.event.entries.length, 3);
+  assert.deepEqual(
+    searched.event.entries[1].memberIds.map(
+      (memberId) => searched.event.members.find((member) => member.participantId === memberId).displayName
+    ),
+    ['B', 'C']
+  );
+  assert.equal(
+    (
+      await coordinator.confirmDraw(
+        searched.drawId,
+        searched.expectedWinnerMarbleIds,
+        searched.operationToken,
+        null,
+        searched.expectedWinnerMarbleIds,
+        searched.expectedWinnerEntryIds
+      )
+    ).confirmed,
+    true
+  );
+  const state = await coordinator.getState();
+  assert.equal(state.participants.find(({ displayName }) => displayName === 'B').currentEpochWins, 1);
+  assert.equal(state.participants.find(({ displayName }) => displayName === 'C').currentEpochWins, 1);
+
+  const ordinary = new FairnessCoordinator({ store: new InMemoryFairnessStore() });
+  ordinary.setCurrentParticipantInputs(['B+C']);
+  const ordinaryDraw = await ordinary.prepareUnconstrainedDraw(request(['B+C'], 'literal-plus'));
+  assert.deepEqual(
+    ordinaryDraw.event.entries.map(({ displayName }) => displayName),
+    ['B+C']
+  );
+  assert.deepEqual(
+    ordinaryDraw.event.members.map(({ displayName }) => displayName),
+    ['B+C']
+  );
+  await ordinary.setEnabled(true);
+  const migratedState = await ordinary.getState();
+  assert.equal(migratedState.participants.find(({ displayName }) => displayName === 'B+C').active, false);
+  assert.equal(migratedState.participants.find(({ displayName }) => displayName === 'B').active, true);
+  assert.equal(migratedState.participants.find(({ displayName }) => displayName === 'C').active, true);
+});
+
+test('legacy v1 B+C data remains a singleton during v2 migration', () => {
+  const legacy = fairnessEvent('drawPrepared', 3, {
+    drawId: 'legacy-draw',
+    epochId: 'epoch-1',
+    seed: 'legacy',
+    mapIndex: 0,
+    mapTitle: 'legacy',
+    rawParticipantInputs: ['B+C'],
+    winnerRange: { start: 0, end: 0 },
+    skillsEnabled: false,
+    fairnessEnabledAtDraw: false,
+    policy: { id: 'strict-balance-v1', version: 1 },
+    participants: [fairnessParticipant('legacy-member', 'B+C', 0, 0)],
+  });
+  const migrated = validateFairnessExport({
+    version: LEGACY_FAIRNESS_DATA_VERSION,
+    mode: 'complete',
+    events: [
+      fairnessEvent('epochStarted', 1, { epochId: 'epoch-1' }),
+      fairnessEvent('participantDiscovered', 2, {
+        participantId: 'legacy-member',
+        displayName: 'B+C',
+        active: true,
+        excluded: false,
+      }),
+      legacy,
+    ],
+  });
+  const migratedDraw = migrated.events.find(({ type }) => type === 'drawPrepared');
+  assert.equal(migrated.version, 2);
+  assert.deepEqual(
+    migratedDraw.members.map(({ displayName }) => displayName),
+    ['B+C']
+  );
+  assert.deepEqual(migratedDraw.entries[0].memberIds, ['legacy-member']);
+});
+
 test('fairness projection separates confirmed, voided, excluded, and rejoined history', () => {
   const events = [
     fairnessEvent('epochStarted', 1, { epochId: 'epoch-1' }),
@@ -787,7 +1113,7 @@ test('fairness export validates and round-trips draw metadata without mutating t
   const roundTrip = validateFairnessExport(JSON.parse(JSON.stringify(exported)));
   assert.deepEqual(roundTrip, exported);
   assert.notEqual(roundTrip.events, exported.events);
-  assert.throws(() => validateFairnessExport({ ...exported, version: 2 }), /unsupported export version/);
+  assert.throws(() => validateFairnessExport({ ...exported, version: 3 }), /unsupported export version/);
 });
 
 test('fairness export rejects inconsistent draw snapshots', () => {
@@ -1047,7 +1373,7 @@ test('fairness coordinator records ordinary draws while disabled and searches on
   const ordinaryToken = ordinary.beginStart();
   const ordinaryDraw = await ordinary.prepareUnconstrainedDraw(request('ordinary'), ordinaryToken);
   assert.ok(ordinaryDraw);
-  const ordinaryWinner = ordinaryDraw.event.participants.find(({ displayName }) => displayName === 'A').marbleIds[0];
+  const ordinaryWinner = ordinaryDraw.event.entries.find(({ displayName }) => displayName === 'A').marbleIds[0];
   assert.equal((await ordinary.confirmDraw(ordinaryDraw.drawId, [ordinaryWinner], ordinaryToken)).confirmed, true);
   const ordinaryState = await ordinary.getState();
   assert.equal(ordinaryState.enabled, false);
@@ -1077,7 +1403,7 @@ test('fairness coordinator records ordinary draws while disabled and searches on
   );
   const seedToken = fairness.beginStart();
   const firstDraw = await fairness.prepareUnconstrainedDraw(request('baseline'), seedToken);
-  const firstWinner = firstDraw.event.participants.find(({ displayName }) => displayName === 'A').marbleIds[0];
+  const firstWinner = firstDraw.event.entries.find(({ displayName }) => displayName === 'A').marbleIds[0];
   await fairness.confirmDraw(firstDraw.drawId, [firstWinner], seedToken);
 
   const searchToken = fairness.beginStart();
@@ -1151,6 +1477,61 @@ test('fairness headless runner uses the real Box2D simulation', async () => {
   console.log = () => {};
   try {
     assert.deepEqual(await runHeadlessRace(request), await runHeadlessRace(request));
+  } finally {
+    globalThis.fetch = originalFetch;
+    console.log = originalLog;
+  }
+});
+
+test('real Box2D winner mapping keeps a grouped entry together', async () => {
+  const stage = {
+    title: 'group headless test',
+    finish: { y: 2.5 },
+    camera: { zoomTriggerY: 2 },
+    spawn: {
+      origin: { x: 10.25, y: 1 },
+      maxColumns: 10,
+      columnSpacing: 0.6,
+      rowSpacing: 1,
+      maxUnshiftedRows: 5,
+    },
+    entities: [],
+  };
+  const entries = [
+    { participantId: 'entry-a', count: 1 },
+    { participantId: 'entry-bc', count: 1 },
+    { participantId: 'entry-d', count: 1 },
+  ];
+  const originalFetch = globalThis.fetch;
+  const originalLog = console.log;
+  globalThis.fetch = undefined;
+  console.log = () => {};
+  try {
+    let groupedWinner = false;
+    for (let index = 0; index < 12 && !groupedWinner; index++) {
+      const seed = `group-headless-${index}`;
+      const winnerMarbleIds = await runHeadlessRace({
+        seed,
+        stage,
+        participants: [
+          { name: 'A', weight: 1, count: 1 },
+          { name: 'B+C', weight: 1, count: 1 },
+          { name: 'D', weight: 1, count: 1 },
+        ],
+        totalCount: 3,
+        spawnPositions: [
+          { x: 10.25, y: 1 },
+          { x: 10.85, y: 1 },
+          { x: 11.45, y: 1 },
+        ],
+        skillsEnabled: false,
+        targetRank: 0,
+      });
+      const mapping = mapMarbleIdsToParticipants(seed, entries);
+      const winnerEntryId = mapping.get(winnerMarbleIds[0]);
+      if (winnerEntryId === 'entry-bc') groupedWinner = true;
+    }
+    assert.equal(groupedWinner, true);
   } finally {
     globalThis.fetch = originalFetch;
     console.log = originalLog;

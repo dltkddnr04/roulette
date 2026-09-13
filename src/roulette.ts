@@ -22,14 +22,16 @@ import { VideoRecorder } from './utils/videoRecorder';
 
 export type {
   FairnessCurrentEpoch,
+  FairnessDrawEntrySnapshot,
   FairnessDrawStatus,
   FairnessDrawSummary,
   FairnessEvent,
   FairnessExport,
+  FairnessMemberSnapshot,
   FairnessMode,
-  FairnessParticipantSnapshot,
   FairnessPublicParticipant,
   FairnessState,
+  FairnessWinnerMemberSnapshot,
 } from './fairness';
 export type { ReplayDescriptor, ReplayDescriptorV1, RouletteState, ThemeName } from './replay';
 export type { RoundState } from './roundSession';
@@ -41,6 +43,7 @@ export class Roulette extends EventTarget {
     drawId: string;
     operationToken: number;
     generation: number;
+    expectedWinnerEntryIds: readonly string[] | null;
     expectedWinnerParticipantIds: readonly string[] | null;
     expectedWinnerMarbleIds: readonly number[] | null;
   } | null = null;
@@ -268,7 +271,8 @@ export class Roulette extends EventTarget {
           finish.result.map((marble) => marble.id),
           fairnessRound.operationToken,
           fairnessRound.expectedWinnerParticipantIds,
-          fairnessRound.expectedWinnerMarbleIds
+          fairnessRound.expectedWinnerMarbleIds,
+          fairnessRound.expectedWinnerEntryIds
         )
         .then((confirmation) => {
           if (!confirmation.confirmed && confirmation.reason) this._emitMessage(confirmation.reason);
@@ -631,6 +635,9 @@ export class Roulette extends EventTarget {
       drawId: prepared.drawId,
       operationToken,
       generation: roundGeneration,
+      expectedWinnerEntryIds: prepared.expectedWinnerEntryIds
+        ? [prepared.expectedWinnerEntryIds[prepared.expectedWinnerEntryIds.length - 1]]
+        : null,
       expectedWinnerParticipantIds: prepared.expectedWinnerParticipantIds
         ? [prepared.expectedWinnerParticipantIds[prepared.expectedWinnerParticipantIds.length - 1]]
         : null,

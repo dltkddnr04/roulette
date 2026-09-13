@@ -355,12 +355,24 @@ function FairnessSettings({
                   <div className="fairness-draw" key={draw.id}>
                     <span>
                       {new Date(draw.confirmedAt ?? draw.preparedAt).toLocaleString()} · {draw.status} ·{' '}
-                      {draw.winners.map((winner) => winner.displayName).join(', ') || '—'}
+                      {draw.winners.map((winner) => winner.entryDisplayName).join(', ') || '—'}
                     </span>
                     {complete ? (
                       <span className="fairness-draw-details">
                         {draw.mapTitle} · {String(draw.seed)} · {draw.rawParticipantInputs.join(', ')} ·{' '}
-                        {draw.policy.id}
+                        {draw.policy.id} ·{' '}
+                        {draw.entries
+                          .map(
+                            (entry) =>
+                              `${entry.displayName} (${entry.memberIds
+                                .map(
+                                  (memberId) =>
+                                    draw.members.find((member) => member.participantId === memberId)?.displayName
+                                )
+                                .filter((name): name is string => name !== undefined)
+                                .join(' + ')})`
+                          )
+                          .join(', ')}
                       </span>
                     ) : null}
                     {complete && draw.status === 'confirmed' ? (
