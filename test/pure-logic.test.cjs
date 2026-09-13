@@ -39,6 +39,7 @@ const { getStepBudget, preservePhysicsDebt, RaceSimulation } = loadTypeScriptMod
 const { RoundSession } = loadTypeScriptModule('src/roundSession.ts');
 const { validateReplayDescriptor } = loadTypeScriptModule('src/replay.ts');
 const { createSeededRandom } = loadTypeScriptModule('src/utils/random.ts');
+const { SimulationClient } = loadTypeScriptModule('src/simulationClient.ts');
 const {
   canUseStrictBalanceEntryFastPath,
   canUseStrictBalanceFastPath,
@@ -1477,6 +1478,92 @@ test('fairness headless runner uses the real Box2D simulation', async () => {
   console.log = () => {};
   try {
     assert.deepEqual(await runHeadlessRace(request), await runHeadlessRace(request));
+  } finally {
+    globalThis.fetch = originalFetch;
+    console.log = originalLog;
+  }
+});
+
+test('public simulation client is repeatable and isolated from its input', async () => {
+  const stage = {
+    title: 'public simulation test',
+    finish: { y: 2.5 },
+    camera: { zoomTriggerY: 2 },
+    spawn: {
+      origin: { x: 10.25, y: 1 },
+      maxColumns: 10,
+      columnSpacing: 0.6,
+      rowSpacing: 1,
+      maxUnshiftedRows: 5,
+    },
+    entities: [],
+  };
+  const replay = {
+    version: 1,
+    seed: 'public-simulation-seed',
+    mapIndex: 0,
+    participants: ['A*2', 'B'],
+    winnerRange: { start: 0, end: 1 },
+    skillsEnabled: false,
+  };
+  const client = new SimulationClient([stage]);
+  const originalFetch = globalThis.fetch;
+  const originalLog = console.log;
+  globalThis.fetch = undefined;
+  console.log = () => {};
+  try {
+    const first = await client.simulate(replay);
+    const second = await client.preview(JSON.parse(JSON.stringify(replay)));
+    assert.deepEqual(second, first);
+    assert.equal(first.finished.length, 2);
+    assert.equal(first.winners.length, 2);
+    assert.equal(first.finished.filter(({ name }) => name === 'A').length <= 2, true);
+
+    const liveSimulation = new RaceSimulation(undefined, replay.seed);
+    const liveSession = new RoundSession(liveSimulation);
+    try {
+      await liveSession.init();
+      liveSession.markReady();
+      liveSession.loadStage(stage);
+      liveSession.setSeed(replay.seed);
+      liveSession.setSkillsEnabled(replay.skillsEnabled);
+      liveSession.setParticipants(replay.participants);
+      liveSession.setWinnerRange(replay.winnerRange.start, replay.winnerRange.end);
+      const generation = liveSession.prepareStart();
+      assert.notEqual(generation, null);
+      assert.equal(liveSession.activate(generation), true);
+
+      const liveFinished = [];
+      let liveSteps = 0;
+      while (liveFinished.length <= replay.winnerRange.end) {
+        liveSession.advance(80, 1, 1, {
+          onImpact() {},
+          onFinish(marble) {
+            liveFinished.push({ marbleId: marble.id, name: marble.name });
+          },
+          afterStep() {
+            return 1;
+          },
+          onStepComplete() {
+            liveSteps++;
+          },
+        });
+      }
+      assert.deepEqual(first.finished, liveFinished.slice(0, first.finished.length));
+      assert.equal(first.steps, liveSteps);
+    } finally {
+      liveSimulation.dispose();
+    }
+
+    const alternate = await client.preview({ ...replay, seed: 'other-public-seed' });
+    assert.equal(alternate.replay.seed, 'other-public-seed');
+    assert.equal(replay.seed, 'public-simulation-seed');
+
+    assert.equal((await client.verify(replay, first)).matches, true);
+    assert.equal((await client.verify(replay, { ...first, steps: first.steps + 1 })).matches, false);
+    await assert.rejects(() => client.simulate({ ...replay, version: 2 }), /unsupported version/);
+    await assert.rejects(() => client.simulate(replay, { stepLimit: 1 }), /did not reach the requested rank/);
+    assert.deepEqual(await client.simulate(replay), first);
   } finally {
     globalThis.fetch = originalFetch;
     console.log = originalLog;

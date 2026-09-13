@@ -23,18 +23,23 @@ import {
   validateFairnessExport,
 } from './fairness';
 import { type FairnessEventStore, IndexedDbFairnessStore } from './fairnessStore';
-import { type MarbleParticipant, RaceSimulation } from './raceSimulation';
+import {
+  DEFAULT_HEADLESS_STEP_LIMIT,
+  type HeadlessSimulationRequest,
+  mapMarbleIdsToLabels,
+  simulateHeadlessRace,
+} from './headlessSimulation';
+import type { MarbleParticipant } from './raceSimulation';
 import { MAX_MARBLES } from './roundSession';
 import { getMarbleSpawnLayout } from './utils/marbleSpawn';
 import { getSimulationParticipantSetup } from './utils/participants';
-import { createSeededRandom, type Seed } from './utils/random';
+import type { Seed } from './utils/random';
 import { readLocalStorage, writeLocalStorage } from './utils/storage';
-import { parseName, shuffle } from './utils/utils';
+import { parseName } from './utils/utils';
 
 const FAIRNESS_ENABLED_STORAGE_KEY = 'mbr_fairness_enabled';
 const FAIRNESS_MODE_STORAGE_KEY = 'mbr_fairness_mode';
 
-const DEFAULT_HEADLESS_STEP_LIMIT = 30000;
 const DEFAULT_RECENT_ERROR = 'Fairness is unavailable';
 
 export type FairnessStartRequest = Readonly<{
@@ -46,15 +51,7 @@ export type FairnessStartRequest = Readonly<{
   currentSeed: Seed;
 }>;
 
-export type FairnessHeadlessSearchRequest = Readonly<{
-  seed: Seed;
-  stage: StageDef;
-  participants: readonly MarbleParticipant[];
-  totalCount: number;
-  spawnPositions: readonly { x: number; y: number }[];
-  skillsEnabled: boolean;
-  targetRank: number;
-}>;
+export type FairnessHeadlessSearchRequest = HeadlessSimulationRequest;
 
 export type FairnessHeadlessRunner = (request: FairnessHeadlessSearchRequest) => Promise<readonly number[]>;
 
@@ -226,19 +223,10 @@ export function mapMarbleIdsToParticipants(
   seed: Seed,
   participants: readonly Readonly<{ participantId: string; count: number }>[]
 ): Map<number, string> {
-  const totalCount = participants.reduce((total, participant) => total + participant.count, 0);
-  const orders = shuffle(
-    Array.from({ length: totalCount }, (_, index) => index),
-    createSeededRandom(seed)
+  return mapMarbleIdsToLabels(
+    seed,
+    participants.map((participant) => ({ label: participant.participantId, count: participant.count }))
   );
-  const mapping = new Map<number, string>();
-  participants.forEach((participant) => {
-    for (let index = 0; index < participant.count; index++) {
-      const order = orders.pop();
-      if (order !== undefined) mapping.set(order, participant.participantId);
-    }
-  });
-  return mapping;
 }
 
 export function mapMarbleIdsToEntries(
@@ -251,39 +239,12 @@ export function mapMarbleIdsToEntries(
   );
 }
 
-export async function runHeadlessRace(request: FairnessHeadlessSearchRequest, stepLimit = DEFAULT_HEADLESS_STEP_LIMIT) {
-  const simulation = new RaceSimulation(undefined, request.seed);
-  try {
-    await simulation.init();
-    simulation.loadStage(request.stage);
-    simulation.setSkillsEnabled(request.skillsEnabled);
-    simulation.replaceMarbles(request.participants, request.totalCount, [...request.spawnPositions]);
-    simulation.start();
-
-    const finished: number[] = [];
-    let iterations = 0;
-    while (finished.length <= request.targetRank && iterations < stepLimit) {
-      simulation.advance(80, 1, 1, {
-        onImpact() {},
-        onFinish(marble) {
-          finished.push(marble.id);
-        },
-        afterStep() {
-          return 1;
-        },
-        onStepComplete() {},
-      });
-      iterations += 1;
-      if (iterations % 16 === 0) await yieldToHost();
-    }
-
-    if (finished.length <= request.targetRank) {
-      throw new Error('Headless fairness simulation did not reach the requested rank');
-    }
-    return finished.slice(0, request.targetRank + 1);
-  } finally {
-    simulation.dispose();
-  }
+export async function runHeadlessRace(
+  request: FairnessHeadlessSearchRequest,
+  stepLimit = DEFAULT_HEADLESS_STEP_LIMIT
+): Promise<readonly number[]> {
+  const result = await simulateHeadlessRace(request, { stepLimit });
+  return result.finishedMarbleIds;
 }
 
 async function yieldToHost(): Promise<void> {

@@ -42,6 +42,21 @@ yarn build
 yarn deploy
 ```
 
+### Public simulation API
+
+`window.roulette.simulation`은 ReplayDescriptor를 렌더링 없이 검증·미리보기·테스트·벤치마크·외부 연동에 사용할 수 있습니다.
+
+```js
+const replay = roulette.exportReplay();
+const result = await roulette.simulation.preview({
+  ...replay,
+  seed: 123456,
+});
+console.log(result.winners);
+```
+
+이 결과는 주어진 seed와 설정에서 어떤 결과가 나오는지를 검증하지만, 해당 seed가 결과를 보기 전에 공정하게 선택되었다는 것을 증명하지는 않습니다. 신뢰 가능한 추첨에서는 simulation 전에 authority가 seed를 생성하고 확정해야 합니다.
+
 ## 참고
 
 결정론적 시뮬레이션과 seeded PRNG 설계에는 [personal-marble-roulette](https://github.com/zc142365/personal-marble-roulette)의 아이디어가 일부 참고되었습니다.

@@ -12,6 +12,7 @@ import { RankRenderer } from './rankRenderer';
 import { type ReplayDescriptor, type RouletteState, type ThemeName, validateReplayDescriptor } from './replay';
 import { RouletteRenderer } from './rouletteRenderer';
 import { RoundSession, type RoundState } from './roundSession';
+import { SimulationClient } from './simulationClient';
 import { type SponsorAssetInfo, SponsorManager, type SponsorState } from './sponsorStore';
 import type { ColorTheme } from './types/ColorTheme';
 import type { MouseEventHandlerName, MouseEventName } from './types/mouseEvents.type';
@@ -35,6 +36,13 @@ export type {
 } from './fairness';
 export type { ReplayDescriptor, ReplayDescriptorV1, RouletteState, ThemeName } from './replay';
 export type { RoundState } from './roundSession';
+export type {
+  SimulationExpectation,
+  SimulationFinisher,
+  SimulationOptions,
+  SimulationResult,
+  SimulationVerificationResult,
+} from './simulationClient';
 
 export class Roulette extends EventTarget {
   private _roundSession = new RoundSession();
@@ -60,6 +68,8 @@ export class Roulette extends EventTarget {
   private _speed = 1;
 
   private _presentationEffects = new PresentationEffects();
+
+  public readonly simulation = new SimulationClient();
 
   protected _camera: Camera = new Camera();
   protected _renderer: RouletteRenderer;
