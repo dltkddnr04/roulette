@@ -469,9 +469,14 @@ export function App({ roulette }: { roulette: Roulette }) {
         />
       </div>
       <div className="copyright">
-        &copy; 2026 <a href="https://github.com/dltkddnr04">dltkddnr04</a> / Based on{' '}
-        <a href="https://lazygyu.github.io/roulette">Marble Roulette</a> by{' '}
-        <a href="https://github.com/lazygyu">LazyGyu</a>
+        <span className="copyright-owner">
+          &copy; 2026 <a href="https://github.com/dltkddnr04">dltkddnr04</a>
+        </span>
+        <span className="copyright-attribution">
+          {' / Based on '}
+          <a href="https://lazygyu.github.io/roulette">Marble Roulette</a> by{' '}
+          <a href="https://github.com/lazygyu">LazyGyu</a>
+        </span>
       </div>
       {toast ? <Toast key={`${toastId}-${toast}`} message={toast} /> : null}
     </div>

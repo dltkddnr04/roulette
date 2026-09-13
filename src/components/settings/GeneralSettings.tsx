@@ -1,3 +1,4 @@
+import { Camera, Gauge, Map as MapIcon, Moon, Sparkles, Sun } from 'lucide-react';
 import { isRenderScale, type RenderScale } from '../../options';
 import type { Roulette } from '../../roulette';
 import { SettingsRow } from './SettingsRow';
@@ -36,62 +37,70 @@ export function GeneralSettings({
 }: GeneralSettingsProps) {
   return (
     <div className="settings-general">
-      <SettingsRow label={<span data-trans>Map</span>} htmlFor="sltMap" icon="map">
-        <select id="sltMap" value={mapIndex} onChange={(event) => onMapChange(Number(event.currentTarget.value))}>
-          {maps.map((map) => (
-            <option key={map.index} value={map.index} data-trans>
-              {map.title}
-            </option>
-          ))}
-        </select>
-      </SettingsRow>
-      <SettingsRow label={<span data-trans>Render quality</span>} htmlFor="sltRenderScale">
-        <select
-          id="sltRenderScale"
-          value={renderScale}
-          onChange={(event) => {
-            const value = Number(event.currentTarget.value);
-            if (isRenderScale(value)) onRenderScaleChange(value);
-          }}
-        >
-          <option value="0.5" data-trans>
-            Performance
-          </option>
-          <option value="1" data-trans>
-            Native
-          </option>
-        </select>
-      </SettingsRow>
-      <div className="settings-toggle-grid">
-        <SettingsToggle
-          id="chkAutoRecording"
-          label={<span data-trans>Recording</span>}
-          icon="record"
-          checked={autoRecording}
-          onChange={onAutoRecordingChange}
-        />
-        <SettingsToggle
-          id="chkSkill"
-          label={<span data-trans>Using skills</span>}
-          icon="bomb"
-          checked={useSkills}
-          onChange={onSkillsChange}
-        />
-      </div>
-      <WinnerSettings {...winnerSettings} />
-      <SettingsRow className="settings-row-theme" label={<span data-trans>Theme</span>} htmlFor="chkDarkMode">
-        <div className="theme">
-          <i className="icon sun" aria-hidden="true"></i>
-          <input
-            type="checkbox"
-            id="chkDarkMode"
-            checked={darkMode}
-            aria-label="Dark mode"
-            onChange={(event) => onDarkModeChange(event.currentTarget.checked)}
-          />
-          <i className="icon moon" aria-hidden="true"></i>
+      <div className="settings-general-list">
+        <div className="settings-general-group settings-general-group-map">
+          <SettingsRow label={<span data-trans>Map</span>} htmlFor="sltMap" icon={MapIcon}>
+            <select id="sltMap" value={mapIndex} onChange={(event) => onMapChange(Number(event.currentTarget.value))}>
+              {maps.map((map) => (
+                <option key={map.index} value={map.index} data-trans>
+                  {map.title}
+                </option>
+              ))}
+            </select>
+          </SettingsRow>
+          <SettingsRow label={<span data-trans>Render quality</span>} htmlFor="sltRenderScale" icon={Gauge}>
+            <select
+              id="sltRenderScale"
+              value={renderScale}
+              onChange={(event) => {
+                const value = Number(event.currentTarget.value);
+                if (isRenderScale(value)) onRenderScaleChange(value);
+              }}
+            >
+              <option value="0.5" data-trans>
+                Performance
+              </option>
+              <option value="1" data-trans>
+                Native
+              </option>
+            </select>
+          </SettingsRow>
         </div>
-      </SettingsRow>
+        <div className="settings-general-group settings-general-group-toggles">
+          <SettingsToggle
+            id="chkAutoRecording"
+            label={<span data-trans>Recording</span>}
+            icon={Camera}
+            checked={autoRecording}
+            onChange={onAutoRecordingChange}
+          />
+          <SettingsToggle
+            id="chkSkill"
+            label={<span data-trans>Using skills</span>}
+            icon={Sparkles}
+            checked={useSkills}
+            onChange={onSkillsChange}
+          />
+        </div>
+        <div className="settings-general-group settings-general-group-winner">
+          <WinnerSettings {...winnerSettings} />
+        </div>
+        <div className="settings-general-group settings-general-group-theme">
+          <SettingsRow className="settings-row-theme" label={<span data-trans>Theme</span>} htmlFor="chkDarkMode">
+            <div className="theme">
+              <Sun className="settings-icon" aria-hidden="true" />
+              <input
+                type="checkbox"
+                id="chkDarkMode"
+                checked={darkMode}
+                aria-label="Dark mode"
+                onChange={(event) => onDarkModeChange(event.currentTarget.checked)}
+              />
+              <Moon className="settings-icon" aria-hidden="true" />
+            </div>
+          </SettingsRow>
+        </div>
+      </div>
     </div>
   );
 }

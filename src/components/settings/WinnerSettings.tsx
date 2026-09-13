@@ -1,3 +1,4 @@
+import { Trophy } from 'lucide-react';
 import { SegmentedControl } from './SegmentedControl';
 import { SettingsRow } from './SettingsRow';
 
@@ -31,7 +32,7 @@ export function WinnerSettings({
         className="settings-row-winner"
         label={<span data-trans>The winner is</span>}
         htmlFor="in_winningRank"
-        icon="trophy"
+        icon={Trophy}
       >
         <SegmentedControl className="settings-winner-control">
           <button

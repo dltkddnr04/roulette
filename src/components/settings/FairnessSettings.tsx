@@ -1,3 +1,4 @@
+import { Scale } from 'lucide-react';
 import type { FairnessState } from '../../fairness';
 import { SettingsRow } from './SettingsRow';
 import { SettingsToggle } from './SettingsToggle';
@@ -30,138 +31,249 @@ export function FairnessSettings({
   const complete = state?.mode === 'complete';
 
   return (
-    <SettingsRow className="settings-row-fairness" label={<span data-trans>Cumulative fairness</span>}>
-      <div className="settings-fairness-controls">
-        <div className="settings-fairness-toolbar">
-          <SettingsToggle
-            id="chkFairness"
-            label={<span data-trans>Enabled</span>}
-            checked={state?.enabled ?? false}
-            disabled={state !== null && !state.available}
-            onChange={onEnabled}
-            className="settings-fairness-enabled"
-          />
-          <select
-            id="sltFairnessMode"
-            value={state?.mode ?? 'simple'}
-            onChange={(event) => {
-              if (event.currentTarget.value === 'simple' || event.currentTarget.value === 'complete') {
-                onModeChange(event.currentTarget.value);
-              }
-            }}
+    <div className="settings-fairness">
+      <SettingsRow className="settings-row-fairness" label={<span data-trans>Cumulative fairness</span>} icon={Scale}>
+        <SettingsToggle
+          id="chkFairness"
+          label={<span data-trans>Enabled</span>}
+          checked={state?.enabled ?? false}
+          disabled={state !== null && !state.available}
+          onChange={onEnabled}
+          className="settings-fairness-enabled"
+        />
+      </SettingsRow>
+      {state?.enabled ? (
+        <div className="settings-fairness-details">
+          <SettingsRow
+            className="settings-row-fairness-mode"
+            label={<span data-trans>Mode</span>}
+            htmlFor="sltFairnessMode"
           >
-            <option value="simple" data-trans>
-              Simple
-            </option>
-            <option value="complete" data-trans>
-              Complete
-            </option>
-          </select>
-        </div>
-        {state?.error ? <div className="fairness-error">{state.error}</div> : null}
-        {state?.enabled ? (
-          <>
-            <div className="settings-fairness-actions">
-              <button type="button" onClick={onNewEpoch} data-trans>
-                Start a new fairness period
-              </button>
-              {complete ? (
-                <>
-                  <button type="button" onClick={onExport} data-trans>
-                    Export
-                  </button>
-                  <label className="settings-fairness-import" htmlFor="inFairnessImport">
-                    <span data-trans>Import</span>
-                    <input
-                      type="file"
-                      id="inFairnessImport"
-                      accept="application/json,.json"
-                      onChange={(event) => {
-                        const file = event.currentTarget.files?.[0];
-                        event.currentTarget.value = '';
-                        if (!file) return;
-                        void file
-                          .text()
-                          .then(onImport)
-                          .catch(() => undefined);
-                      }}
-                    />
-                  </label>
-                  <button type="button" onClick={onDelete} data-trans>
-                    Delete history
-                  </button>
-                </>
-              ) : null}
-            </div>
-            <div className="settings-fairness-participants">
-              {state.participants.map((participant) => (
-                <div className={`fairness-participant${participant.active ? '' : ' inactive'}`} key={participant.id}>
-                  <span className="fairness-participant-name">{participant.displayName}</span>
-                  {complete ? <code>{participant.id}</code> : null}
-                  <span className="fairness-stats">
-                    {complete
-                      ? `actual ${participant.actualWins} · fairness ${participant.fairnessCountedWins} · credit ${participant.balanceCredit} · effective ${participant.effectiveBalance}`
-                      : `wins ${participant.currentEpochWins}`}
-                  </span>
-                  {complete ? (
-                    <span className="fairness-status">
-                      {participant.active ? 'active' : 'inactive'} · {participant.participationHistory.length} status
-                      changes
-                    </span>
-                  ) : null}
-                  <label className="settings-fairness-excluded" htmlFor={`exclude-${participant.id}`}>
-                    <span data-trans>Excluded</span>
-                    <input
-                      type="checkbox"
-                      id={`exclude-${participant.id}`}
-                      checked={participant.excluded}
-                      onChange={(event) => onExcluded(participant.id, event.currentTarget.checked)}
-                    />
-                  </label>
-                  <button type="button" onClick={() => onRename(participant.id, participant.displayName)} data-trans>
-                    Rename
-                  </button>
-                </div>
-              ))}
-            </div>
-            {state.recentDraws.length > 0 ? (
-              <div className="settings-fairness-history">
-                {state.recentDraws.map((draw) => (
-                  <div className="fairness-draw" key={draw.id}>
-                    <span>
-                      {new Date(draw.confirmedAt ?? draw.preparedAt).toLocaleString()} · {draw.status} ·{' '}
-                      {draw.winners.map((winner) => winner.entryDisplayName).join(', ') || '—'}
-                    </span>
-                    {complete ? (
-                      <span className="fairness-draw-details">
-                        {draw.mapTitle} · {String(draw.seed)} · {draw.rawParticipantInputs.join(', ')} ·{' '}
-                        {draw.policy.id} ·{' '}
-                        {draw.entries
-                          .map(
-                            (entry) =>
-                              `${entry.displayName} (${entry.memberIds
-                                .map(
-                                  (memberId) =>
-                                    draw.members.find((member) => member.participantId === memberId)?.displayName
-                                )
-                                .filter((name): name is string => name !== undefined)
-                                .join(' + ')})`
-                          )
-                          .join(', ')}
-                      </span>
-                    ) : null}
-                    {complete && draw.status === 'confirmed' ? (
-                      <button type="button" onClick={() => onVoid(draw.id)} data-trans>
-                        Void
-                      </button>
-                    ) : null}
-                  </div>
-                ))}
-              </div>
+            <select
+              id="sltFairnessMode"
+              value={state.mode}
+              onChange={(event) => {
+                if (event.currentTarget.value === 'simple' || event.currentTarget.value === 'complete') {
+                  onModeChange(event.currentTarget.value);
+                }
+              }}
+            >
+              <option value="simple" data-trans>
+                Simple
+              </option>
+              <option value="complete" data-trans>
+                Complete
+              </option>
+            </select>
+          </SettingsRow>
+          {state.error ? <div className="fairness-error">{state.error}</div> : null}
+          <div className="settings-fairness-actions">
+            <button type="button" onClick={onNewEpoch} data-trans>
+              Start a new fairness period
+            </button>
+            {complete ? (
+              <>
+                <button type="button" onClick={onExport} data-trans>
+                  Export
+                </button>
+                <label className="settings-fairness-import" htmlFor="inFairnessImport">
+                  <span data-trans>Import</span>
+                  <input
+                    type="file"
+                    id="inFairnessImport"
+                    accept="application/json,.json"
+                    onChange={(event) => {
+                      const file = event.currentTarget.files?.[0];
+                      event.currentTarget.value = '';
+                      if (!file) return;
+                      void file
+                        .text()
+                        .then(onImport)
+                        .catch(() => undefined);
+                    }}
+                  />
+                </label>
+                <button type="button" onClick={onDelete} data-trans>
+                  Delete history
+                </button>
+              </>
             ) : null}
-          </>
-        ) : null}
-      </div>
-    </SettingsRow>
+          </div>
+          <h4 className="settings-section-heading" data-trans>
+            Participants
+          </h4>
+          <div className="settings-table-wrapper settings-fairness-participants">
+            <table className="settings-table settings-fairness-participant-table">
+              <thead>
+                <tr>
+                  <th scope="col" data-trans>
+                    Participant
+                  </th>
+                  {complete ? (
+                    <>
+                      <th scope="col" data-trans>
+                        Actual
+                      </th>
+                      <th scope="col" data-trans>
+                        Fairness
+                      </th>
+                      <th scope="col" data-trans>
+                        Credit
+                      </th>
+                      <th scope="col" data-trans>
+                        Effective
+                      </th>
+                    </>
+                  ) : (
+                    <th scope="col" data-trans>
+                      Wins
+                    </th>
+                  )}
+                  <th scope="col" data-trans>
+                    Excluded
+                  </th>
+                  <th scope="col" data-trans>
+                    Action
+                  </th>
+                </tr>
+              </thead>
+              <tbody>
+                {state.participants.map((participant) => (
+                  <tr className={`fairness-participant${participant.active ? '' : ' inactive'}`} key={participant.id}>
+                    <th scope="row" className="fairness-participant-name-cell">
+                      <span className="fairness-participant-name">{participant.displayName}</span>
+                      {complete ? (
+                        <>
+                          <code className="fairness-participant-id">{participant.id}</code>
+                          <span className="fairness-status">
+                            {participant.active ? 'active' : 'inactive'} · {participant.participationHistory.length}{' '}
+                            status changes
+                          </span>
+                        </>
+                      ) : null}
+                    </th>
+                    {complete ? (
+                      <>
+                        <td>{participant.actualWins}</td>
+                        <td>{participant.fairnessCountedWins}</td>
+                        <td>{participant.balanceCredit}</td>
+                        <td>{participant.effectiveBalance}</td>
+                      </>
+                    ) : (
+                      <td>{participant.currentEpochWins}</td>
+                    )}
+                    <td>
+                      <label className="settings-fairness-excluded" htmlFor={`exclude-${participant.id}`}>
+                        <input
+                          type="checkbox"
+                          id={`exclude-${participant.id}`}
+                          aria-label={`Exclude ${participant.displayName}`}
+                          checked={participant.excluded}
+                          onChange={(event) => onExcluded(participant.id, event.currentTarget.checked)}
+                        />
+                      </label>
+                    </td>
+                    <td>
+                      <button
+                        type="button"
+                        onClick={() => onRename(participant.id, participant.displayName)}
+                        data-trans
+                      >
+                        Rename
+                      </button>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+          {state.recentDraws.length > 0 ? (
+            <>
+              <h4 className="settings-section-heading" data-trans>
+                History
+              </h4>
+              <div className="settings-table-wrapper settings-fairness-history">
+                <table className="settings-table settings-fairness-history-table">
+                  <thead>
+                    <tr>
+                      <th scope="col" data-trans>
+                        Time
+                      </th>
+                      <th scope="col" data-trans>
+                        Winner
+                      </th>
+                      <th scope="col" data-trans>
+                        Status
+                      </th>
+                      {complete ? (
+                        <>
+                          <th scope="col" data-trans>
+                            Map
+                          </th>
+                          <th scope="col" data-trans>
+                            Seed
+                          </th>
+                          <th scope="col" data-trans>
+                            Action
+                          </th>
+                        </>
+                      ) : null}
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {state.recentDraws.map((draw) => (
+                      <tr className="fairness-draw" key={draw.id}>
+                        <td className="fairness-draw-time">
+                          <time dateTime={new Date(draw.confirmedAt ?? draw.preparedAt).toISOString()}>
+                            {new Date(draw.confirmedAt ?? draw.preparedAt).toLocaleString()}
+                          </time>
+                          {complete ? (
+                            <details className="fairness-draw-details">
+                              <summary data-trans>Details</summary>
+                              <div className="fairness-draw-details-content">
+                                {draw.mapTitle} · {String(draw.seed)} · {draw.rawParticipantInputs.join(', ')} ·{' '}
+                                {draw.policy.id} ·{' '}
+                                {draw.entries
+                                  .map(
+                                    (entry) =>
+                                      `${entry.displayName} (${entry.memberIds
+                                        .map(
+                                          (memberId) =>
+                                            draw.members.find((member) => member.participantId === memberId)
+                                              ?.displayName
+                                        )
+                                        .filter((name): name is string => name !== undefined)
+                                        .join(' + ')})`
+                                  )
+                                  .join(', ')}
+                              </div>
+                            </details>
+                          ) : null}
+                        </td>
+                        <td>{draw.winners.map((winner) => winner.entryDisplayName).join(', ') || '—'}</td>
+                        <td>{draw.status}</td>
+                        {complete ? (
+                          <>
+                            <td>{draw.mapTitle}</td>
+                            <td>{String(draw.seed)}</td>
+                            <td>
+                              {draw.status === 'confirmed' ? (
+                                <button type="button" onClick={() => onVoid(draw.id)} data-trans>
+                                  Void
+                                </button>
+                              ) : null}
+                            </td>
+                          </>
+                        ) : null}
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </>
+          ) : null}
+        </div>
+      ) : null}
+    </div>
   );
 }

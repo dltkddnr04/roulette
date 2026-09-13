@@ -1,3 +1,5 @@
+import { Play, Shuffle } from 'lucide-react';
+
 export type ParticipantInputProps = {
   value: string;
   onChange: (value: string) => void;
@@ -21,11 +23,11 @@ export function ParticipantInput({ value, onChange, onBlur, onShuffle, onStart }
       <div className="actions">
         <div className="sep"></div>
         <button id="btnShuffle" type="button" onClick={onShuffle}>
-          <i className="icon shuffle"></i>
+          <Shuffle className="settings-icon" aria-hidden="true" />
           <span data-trans>Shuffle</span>
         </button>
         <button id="btnStart" type="button" onClick={onStart}>
-          <i className="icon play"></i>
+          <Play className="settings-icon" aria-hidden="true" />
           <span data-trans>Start</span>
         </button>
       </div>

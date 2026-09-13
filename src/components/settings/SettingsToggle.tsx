@@ -1,3 +1,4 @@
+import type { LucideIcon } from 'lucide-react';
 import type { ReactNode } from 'react';
 
 export type SettingsToggleProps = {
@@ -5,18 +6,19 @@ export type SettingsToggleProps = {
   label: ReactNode;
   checked: boolean;
   onChange: (checked: boolean) => void;
-  icon?: string;
+  icon?: LucideIcon;
   disabled?: boolean;
   className?: string;
 };
 
 export function SettingsToggle({ id, label, checked, onChange, icon, disabled, className }: SettingsToggleProps) {
   const toggleClassName = ['settings-toggle', className].filter(Boolean).join(' ');
+  const Icon = icon;
 
   return (
     <label className={toggleClassName} htmlFor={id}>
       <span className="settings-toggle-label">
-        {icon ? <i className={`icon ${icon}`} aria-hidden="true"></i> : null}
+        {Icon ? <Icon className="settings-icon" aria-hidden="true" /> : null}
         {label}
       </span>
       <input
