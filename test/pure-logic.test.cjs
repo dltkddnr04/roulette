@@ -1624,3 +1624,203 @@ test('real Box2D winner mapping keeps a grouped entry together', async () => {
     console.log = originalLog;
   }
 });
+
+function searchTestStage() {
+  return {
+    title: 'fairness search test',
+    finish: { y: 20 },
+    camera: { zoomTriggerY: 10 },
+    spawn: { origin: { x: 10.25, y: 1 }, maxColumns: 10, columnSpacing: 0.6, rowSpacing: 1, maxUnshiftedRows: 5 },
+    entities: [],
+  };
+}
+
+function searchTestRequest(stage, participantInputs, currentSeed = 'current') {
+  return {
+    stage,
+    mapIndex: 0,
+    participantInputs,
+    winnerRange: { start: 0, end: 0 },
+    skillsEnabled: false,
+    currentSeed,
+  };
+}
+
+function marbleForEntry(seed, entryIds) {
+  const mapping = mapMarbleIdsToParticipants(
+    seed,
+    entryIds.map((participantId) => ({ participantId, count: 1 }))
+  );
+  return Array.from(mapping.entries()).find(([, participantId]) => participantId === entryIds[entryIds.length - 1])[0];
+}
+
+async function createUnbalancedSearchCoordinator(headlessRunner, createCandidateSeed) {
+  let id = 0;
+  const coordinator = new FairnessCoordinator({
+    store: new InMemoryFairnessStore(),
+    createId: (prefix) => `${prefix}-${++id}`,
+    now: () => id,
+    createCandidateSeed,
+    headlessRunner,
+  });
+  coordinator.setCurrentParticipantInputs(['A', 'B']);
+  await coordinator.setEnabled(true);
+  const stage = searchTestStage();
+  const base = await coordinator.prepareUnconstrainedDraw(searchTestRequest(stage, ['A', 'B'], 'base'));
+  const winner = base.event.entries.find(({ displayName }) => displayName === 'A').marbleIds;
+  assert.equal((await coordinator.confirmDraw(base.drawId, winner, null)).confirmed, true);
+  return { coordinator, stage };
+}
+
+test('fairness precompute reuses one ready candidate without creating draw events', async () => {
+  let calls = 0;
+  const { coordinator, stage } = await createUnbalancedSearchCoordinator(
+    async ({ seed }) => {
+      calls++;
+      return [marbleForEntry(seed, ['entry-0', 'entry-1'])];
+    },
+    () => 'precomputed-seed'
+  );
+  const request = searchTestRequest(stage, ['A', 'B'], 'unused-current-seed');
+  const before = await coordinator.getState();
+
+  await coordinator.precompute(request);
+  assert.equal(calls, 1);
+  assert.equal((await coordinator.getState()).recentDraws.length, before.recentDraws.length);
+  await coordinator.precompute({ ...request, currentSeed: 'another-current-seed' });
+  assert.equal(calls, 1);
+
+  const prepared = await coordinator.prepareDraw(request, coordinator.beginStart());
+  assert.equal(calls, 1);
+  assert.equal(prepared.seed, 'precomputed-seed');
+});
+
+test('fairness start joins an in-flight precompute instead of starting a second search', async () => {
+  let calls = 0;
+  let resolveRunner;
+  let signalRunnerStarted;
+  const runnerStarted = new Promise((resolve) => {
+    signalRunnerStarted = resolve;
+  });
+  const { coordinator, stage } = await createUnbalancedSearchCoordinator(
+    ({ seed }) => {
+      calls++;
+      return new Promise((resolve) => {
+        resolveRunner = () => resolve([marbleForEntry(seed, ['entry-0', 'entry-1'])]);
+        signalRunnerStarted();
+      });
+    },
+    () => 'in-flight-seed'
+  );
+  const request = searchTestRequest(stage, ['A', 'B']);
+  const precompute = coordinator.precompute(request);
+  await runnerStarted;
+  const start = coordinator.prepareDraw(request, coordinator.beginStart());
+  resolveRunner();
+
+  const prepared = await start;
+  await precompute;
+  assert.equal(calls, 1);
+  assert.equal(prepared.seed, 'in-flight-seed');
+});
+
+test('stale fairness precompute cannot overwrite a newer generation candidate', async () => {
+  let calls = 0;
+  let resolveOldRunner;
+  let signalOldRunnerStarted;
+  const oldRunnerStarted = new Promise((resolve) => {
+    signalOldRunnerStarted = resolve;
+  });
+  const { coordinator, stage } = await createUnbalancedSearchCoordinator(
+    ({ seed }) => {
+      calls++;
+      if (calls === 1) {
+        return new Promise((resolve) => {
+          resolveOldRunner = () => resolve([marbleForEntry(seed, ['entry-0', 'entry-1'])]);
+          signalOldRunnerStarted();
+        });
+      }
+      return Promise.resolve([marbleForEntry(seed, ['entry-0', 'entry-1', 'entry-2'])]);
+    },
+    (() => {
+      const seeds = ['old-seed', 'new-seed'];
+      return () => seeds.shift();
+    })()
+  );
+  const oldRequest = searchTestRequest(stage, ['A', 'B']);
+  const oldPrecompute = coordinator.precompute(oldRequest).catch((error) => error);
+  await oldRunnerStarted;
+
+  coordinator.setCurrentParticipantInputs(['A', 'B', 'C']);
+  await coordinator.getState();
+  const newRequest = searchTestRequest(stage, ['A', 'B', 'C']);
+  await coordinator.precompute(newRequest);
+  resolveOldRunner();
+  const staleResult = await oldPrecompute;
+
+  assert.equal(staleResult instanceof Error, true);
+  assert.equal(calls, 2);
+  const prepared = await coordinator.prepareDraw(newRequest, coordinator.beginStart());
+  assert.equal(prepared.seed, 'new-seed');
+  assert.equal(calls, 2);
+});
+
+test('strict-balance fast path skips speculative headless search', async () => {
+  let calls = 0;
+  const coordinator = new FairnessCoordinator({
+    store: new InMemoryFairnessStore(),
+    headlessRunner: async () => {
+      calls++;
+      return [0];
+    },
+    createCandidateSeed: () => 'unused-seed',
+  });
+  coordinator.setCurrentParticipantInputs(['A', 'B']);
+  await coordinator.setEnabled(true);
+  const stage = searchTestStage();
+
+  await coordinator.precompute(searchTestRequest(stage, ['A', 'B']));
+  assert.equal(calls, 0);
+  assert.equal((await coordinator.getState()).recentDraws.length, 0);
+});
+
+test('confirmed fairness balance changes invalidate a ready candidate', async () => {
+  let calls = 0;
+  const seeds = ['first-candidate', 'second-candidate'];
+  const { coordinator, stage } = await createUnbalancedSearchCoordinator(
+    async ({ seed }) => {
+      calls++;
+      return [marbleForEntry(seed, ['entry-0', 'entry-1'])];
+    },
+    () => seeds.shift()
+  );
+  const request = searchTestRequest(stage, ['A', 'B']);
+  await coordinator.precompute(request);
+  assert.equal(calls, 1);
+
+  const ordinary = await coordinator.prepareUnconstrainedDraw(searchTestRequest(stage, ['A', 'B'], 'ordinary'));
+  const aWinner = ordinary.event.entries.find(({ displayName }) => displayName === 'A').marbleIds;
+  assert.equal((await coordinator.confirmDraw(ordinary.drawId, aWinner, null)).confirmed, true);
+
+  const prepared = await coordinator.prepareDraw(request, coordinator.beginStart());
+  assert.equal(calls, 2);
+  assert.equal(prepared.seed, 'second-candidate');
+});
+
+test('start bypasses a pending fairness precompute debounce', async () => {
+  let calls = 0;
+  const { coordinator, stage } = await createUnbalancedSearchCoordinator(
+    async ({ seed }) => {
+      calls++;
+      return [marbleForEntry(seed, ['entry-0', 'entry-1'])];
+    },
+    () => 'immediate-start-seed'
+  );
+  const request = searchTestRequest(stage, ['A', 'B']);
+
+  coordinator.schedulePrecompute(request, 1000);
+  const prepared = await coordinator.prepareDraw(request, coordinator.beginStart());
+
+  assert.equal(calls, 1);
+  assert.equal(prepared.seed, 'immediate-start-seed');
+});

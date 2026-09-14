@@ -226,6 +226,23 @@ export class Roulette extends EventTarget {
     this.dispatchEvent(new Event('fairness'));
   }
 
+  private _scheduleFairnessPrecompute(): void {
+    if (this._applyingReplay) return;
+    if (!this._fairnessCoordinator.getFairnessEnabled()) return;
+    if (this._roundSession.roundState !== 'ready' || this._roundSession.getCount() === 0) return;
+
+    const stage = this._roundSession.currentStage;
+    if (!stage) return;
+    this._fairnessCoordinator.schedulePrecompute({
+      stage,
+      mapIndex: stages.indexOf(stage),
+      participantInputs: this._roundSession.getParticipantInputs(),
+      winnerRange: this._roundSession.getWinnerRange(),
+      skillsEnabled: this._roundSession.getSkillsEnabled(),
+      currentSeed: this._roundSession.getSeed(),
+    });
+  }
+
   private _cancelActiveFairnessDraw(reason: string, cancelNormalDraw = true): void {
     const activeDraw = this._fairnessRound;
     this._fairnessRound = null;
@@ -504,6 +521,7 @@ export class Roulette extends EventTarget {
   }
 
   private _startWithoutFairness(recordHistory = true) {
+    this._fairnessCoordinator.invalidatePrecompute();
     const roundGeneration = this._roundSession.prepareStart();
     if (roundGeneration === null) return;
 
@@ -752,6 +770,7 @@ export class Roulette extends EventTarget {
   public setWinnerRange(start: number, end: number) {
     if (!this._applyingReplay) this._cancelActiveFairnessDraw('Fairness draw was cancelled because the winner changed');
     this._roundSession.setWinnerRange(start, end);
+    this._scheduleFairnessPrecompute();
     return true;
   }
 
@@ -771,6 +790,7 @@ export class Roulette extends EventTarget {
   public setSkillsEnabled(enabled: boolean): void {
     if (!this._applyingReplay) this._cancelActiveFairnessDraw('Fairness draw was cancelled because skills changed');
     this._roundSession.setSkillsEnabled(enabled);
+    this._scheduleFairnessPrecompute();
   }
 
   public getSkillsEnabled(): boolean {
@@ -781,11 +801,12 @@ export class Roulette extends EventTarget {
     return this._fairnessCoordinator.getState();
   }
 
-  public setFairnessEnabled(enabled: boolean): Promise<void> {
+  public async setFairnessEnabled(enabled: boolean): Promise<void> {
     if (!enabled && this._roundSession.roundState !== 'running') {
       this._cancelActiveFairnessDraw('Fairness was disabled', false);
     }
-    return this._fairnessCoordinator.setEnabled(enabled);
+    await this._fairnessCoordinator.setEnabled(enabled);
+    this._scheduleFairnessPrecompute();
   }
 
   public getFairnessEnabled(): boolean {
@@ -801,19 +822,27 @@ export class Roulette extends EventTarget {
   }
 
   public setFairnessParticipantExcluded(participantId: string, excluded: boolean): Promise<void> {
-    return this._fairnessCoordinator.setParticipantExcluded(participantId, excluded);
+    return this._fairnessCoordinator.setParticipantExcluded(participantId, excluded).then(() => {
+      this._scheduleFairnessPrecompute();
+    });
   }
 
   public renameFairParticipant(participantId: string, name: string): Promise<void> {
-    return this._fairnessCoordinator.renameParticipant(participantId, name);
+    return this._fairnessCoordinator.renameParticipant(participantId, name).then(() => {
+      this._scheduleFairnessPrecompute();
+    });
   }
 
   public startNewFairnessEpoch(): Promise<void> {
-    return this._fairnessCoordinator.startNewEpoch();
+    return this._fairnessCoordinator.startNewEpoch().then(() => {
+      this._scheduleFairnessPrecompute();
+    });
   }
 
   public voidFairnessDraw(drawId: string): Promise<void> {
-    return this._fairnessCoordinator.voidDraw(drawId);
+    return this._fairnessCoordinator.voidDraw(drawId).then(() => {
+      this._scheduleFairnessPrecompute();
+    });
   }
 
   public exportFairnessData(): Promise<FairnessExport> {
@@ -821,11 +850,15 @@ export class Roulette extends EventTarget {
   }
 
   public importFairnessData(value: unknown): Promise<void> {
-    return this._fairnessCoordinator.importData(value);
+    return this._fairnessCoordinator.importData(value).then(() => {
+      this._scheduleFairnessPrecompute();
+    });
   }
 
   public deleteFairnessData(): Promise<void> {
-    return this._fairnessCoordinator.clearData();
+    return this._fairnessCoordinator.clearData().then(() => {
+      this._scheduleFairnessPrecompute();
+    });
   }
 
   public setFastForward(enabled: boolean): void {
@@ -878,6 +911,7 @@ export class Roulette extends EventTarget {
     this._presentationEffects.clear();
     const spawnLayout = this._roundSession.setParticipants(names);
     this._fairnessCoordinator.setCurrentParticipantInputs(names, this._applyingReplay);
+    this._scheduleFairnessPrecompute();
     if (!spawnLayout) return;
 
     // 카메라를 구슬 생성 위치 중앙으로 이동 + 줌인
@@ -902,6 +936,7 @@ export class Roulette extends EventTarget {
     this._roundSession.reset();
     this._lastTime = Date.now();
     this._goalDist = Infinity;
+    this._scheduleFairnessPrecompute();
   }
 
   public getCount() {
@@ -1002,5 +1037,6 @@ export class Roulette extends EventTarget {
     this._presentationEffects.clear();
     this._roundSession.setMap(stages[index]);
     this._camera.initializePosition();
+    this._scheduleFairnessPrecompute();
   }
 }

@@ -95,6 +95,30 @@ type SearchResult = Readonly<{
   winnerEntryIds: readonly string[];
 }>;
 
+type FairnessSearchContext = Readonly<{
+  request: FairnessStartRequest;
+  syncedInputs: readonly SyncedEntry[];
+  participants: readonly MarbleParticipant[];
+  totalCount: number;
+  spawnPositions: readonly { x: number; y: number }[];
+  mappingRows: readonly Readonly<{ entryId: string; count: number }>[];
+  eligibleEntryIds: readonly string[];
+  budget: number;
+  key: string;
+  generation: number;
+  mustSearch: boolean;
+}>;
+
+type SearchCandidate = SearchResult & Readonly<{ key: string; generation: number }>;
+
+type SearchWork = Readonly<{
+  key: string;
+  generation: number;
+  promise: Promise<SearchResult>;
+}>;
+
+const FAIRNESS_PRECOMPUTE_DEBOUNCE_MS = 150;
+
 export class FairnessCancelledError extends Error {
   constructor() {
     super('Fairness start was cancelled');
@@ -104,6 +128,49 @@ export class FairnessCancelledError extends Error {
 
 function clone<T>(value: T): T {
   return JSON.parse(JSON.stringify(value)) as T;
+}
+
+function createFairnessSearchKey(
+  request: FairnessStartRequest,
+  participants: readonly MarbleParticipant[],
+  syncedInputs: readonly SyncedEntry[],
+  projection: FairnessProjection,
+  eligibleEntryIds: readonly string[],
+  budget: number,
+  headlessStepLimit: number
+): string {
+  return JSON.stringify({
+    mapIndex: request.mapIndex,
+    stage: request.stage,
+    participantInputs: request.participantInputs,
+    participants,
+    winnerRange: request.winnerRange,
+    skillsEnabled: request.skillsEnabled,
+    epochId: projection.currentEpochId,
+    members: projection.participants.map((participant) => ({
+      id: participant.id,
+      displayName: participant.displayName,
+      active: participant.active,
+      excluded: participant.excluded,
+      effectiveBalance: participant.effectiveBalance,
+      previousEffectiveBalance: participant.previousEffectiveBalance,
+    })),
+    entries: syncedInputs.map((entry) => ({
+      entryId: entry.entryId,
+      memberIds: entry.memberIds,
+      rawInput: entry.rawInput,
+      displayName: entry.displayName,
+      weight: entry.weight,
+      count: entry.count,
+    })),
+    eligibleEntryIds,
+    policy: {
+      id: STRICT_BALANCE_POLICY_ID,
+      version: STRICT_BALANCE_POLICY_VERSION,
+    },
+    budget,
+    headlessStepLimit,
+  });
 }
 
 function getErrorMessage(error: unknown, fallback = DEFAULT_RECENT_ERROR): string {
@@ -276,6 +343,10 @@ export class FairnessCoordinator {
   private mode: FairnessMode;
   private error: string | null = null;
   private operationToken = 0;
+  private searchGeneration = 0;
+  private cachedCandidate: SearchCandidate | null = null;
+  private inFlightSearch: SearchWork | null = null;
+  private precomputeTimer: ReturnType<typeof setTimeout> | null = null;
 
   constructor(options: FairnessCoordinatorOptions = {}) {
     this.store = options.store ?? new IndexedDbFairnessStore();
@@ -308,6 +379,49 @@ export class FairnessCoordinator {
 
   invalidateStart(): void {
     this.operationToken += 1;
+    this.invalidateSearchState();
+  }
+
+  /** Invalidate speculative work without cancelling an active start token. */
+  invalidatePrecompute(): void {
+    this.invalidateSearchState();
+  }
+
+  schedulePrecompute(request: FairnessStartRequest, delay = FAIRNESS_PRECOMPUTE_DEBOUNCE_MS): void {
+    if (!this.enabled) return;
+    this.clearPrecomputeTimer();
+    if (delay <= 0) {
+      void this.precompute(request).catch(() => undefined);
+      return;
+    }
+
+    this.precomputeTimer = setTimeout(() => {
+      this.precomputeTimer = null;
+      void this.precompute(request).catch(() => undefined);
+    }, delay);
+  }
+
+  async precompute(request: FairnessStartRequest): Promise<void> {
+    const generation = this.searchGeneration;
+    const context = await this.createSearchContext(request, undefined, generation);
+    if (!context.mustSearch) return;
+    await this.ensureSearch(context);
+  }
+
+  private clearPrecomputeTimer(): void {
+    if (this.precomputeTimer === null) return;
+    clearTimeout(this.precomputeTimer);
+    this.precomputeTimer = null;
+  }
+
+  private invalidateSearchState(): void {
+    this.searchGeneration += 1;
+    this.cachedCandidate = null;
+    this.clearPrecomputeTimer();
+  }
+
+  private assertSearchCurrent(generation: number): void {
+    if (generation !== this.searchGeneration) throw new FairnessCancelledError();
   }
 
   setCurrentParticipantInputs(inputs: readonly string[], suppressSync = false): void {
@@ -315,7 +429,16 @@ export class FairnessCoordinator {
     if (!suppressSync) this.invalidateStart();
     if (!this.enabled || suppressSync) return;
 
-    void this.syncCurrentParticipants().catch((error) => {
+    const generation = this.searchGeneration;
+
+    void this.syncCurrentParticipants(
+      false,
+      this.currentInputs,
+      undefined,
+      this.enabled || this.events.length > 0,
+      generation
+    ).catch((error) => {
+      if (error instanceof FairnessCancelledError) return;
       if (isFairnessInputError(error)) this.error = getErrorMessage(error);
       else this.markUnavailable(error);
     });
@@ -323,19 +446,23 @@ export class FairnessCoordinator {
 
   async setEnabled(enabled: boolean): Promise<void> {
     if (!enabled) {
+      this.invalidateSearchState();
       this.enabled = false;
       writeLocalStorage(FAIRNESS_ENABLED_STORAGE_KEY, 'false');
       return;
     }
 
     try {
+      this.invalidateSearchState();
       await this.ensureLoaded();
       this.available = true;
       this.error = null;
       this.enabled = true;
-      await this.syncCurrentParticipants();
+      const generation = this.searchGeneration;
+      await this.syncCurrentParticipants(false, this.currentInputs, undefined, true, generation);
       writeLocalStorage(FAIRNESS_ENABLED_STORAGE_KEY, 'true');
     } catch (error) {
+      if (error instanceof FairnessCancelledError) return;
       if (isFairnessInputError(error)) {
         this.enabled = false;
         this.error = getErrorMessage(error);
@@ -474,39 +601,9 @@ export class FairnessCoordinator {
   }
 
   async prepareDraw(request: FairnessStartRequest, token: number): Promise<FairnessPreparedDraw> {
-    await this.ensureOperational();
-    const syncedInputs = await this.syncCurrentParticipants(true, request.participantInputs, token);
-    this.assertCurrent(token);
-
-    const setup = getSimulationParticipantSetup(request.participantInputs);
-    if (!setup || setup.totalCount <= 0 || setup.totalCount > MAX_MARBLES) {
-      throw new Error(`Fairness participant count must be between 1 and ${MAX_MARBLES}`);
-    }
-    if (request.winnerRange.start !== request.winnerRange.end) {
-      throw new Error('Cumulative fairness supports one winning rank at a time');
-    }
-
-    const policyInputs = new Map(
-      this.projection.participants.map((participant) => [
-        participant.id,
-        {
-          id: participant.id,
-          active: participant.active,
-          excluded: participant.excluded,
-          effectiveBalance: participant.effectiveBalance,
-        },
-      ])
-    );
-    const entryPolicyInputs = syncedInputs.map((entry) => ({
-      id: entry.entryId,
-      members: entry.memberIds.map((memberId) => policyInputs.get(memberId)).filter((member) => member !== undefined),
-    }));
-    const evaluation = evaluateStrictBalanceEntries(entryPolicyInputs);
-    if (evaluation.eligibleEntryIds.length === 0) throw new Error('Fairness has no eligible draw entries');
-
-    const mappingRows = syncedInputs.map((input) => ({ entryId: input.entryId, count: input.count }));
-    const spawnLayout = getMarbleSpawnLayout(setup.totalCount, request.stage.spawn);
-    const mustSearch = !canUseStrictBalanceEntryFastPath(evaluation);
+    this.clearPrecomputeTimer();
+    const context = await this.createSearchContext(request, token);
+    const { syncedInputs, mappingRows, totalCount } = context;
     let seed = request.currentSeed;
     let expectedWinnerEntryIds: readonly string[] | null = null;
     let expectedWinnerParticipantIds: readonly string[] | null = null;
@@ -515,16 +612,9 @@ export class FairnessCoordinator {
     let preparedEvent: FairnessDrawPreparedEvent | null = null;
 
     try {
-      if (mustSearch) {
-        const searchResult = await this.searchForWinner(
-          request,
-          setup.participants,
-          setup.totalCount,
-          spawnLayout.positions,
-          mappingRows,
-          evaluation.eligibleEntryIds,
-          token
-        );
+      if (context.mustSearch) {
+        const searchResult = await this.ensureSearch(context, token);
+        this.consumeCandidate(context);
         seed = searchResult.seed;
         expectedWinnerEntryIds = [searchResult.winnerEntryIds[request.winnerRange.end]];
         const winningEntry = syncedInputs.find((entry) => entry.entryId === expectedWinnerEntryIds?.[0]);
@@ -533,7 +623,7 @@ export class FairnessCoordinator {
       }
 
       this.assertCurrent(token);
-      const event = this.createPreparedEvent(request, seed, syncedInputs, mappingRows, setup.totalCount, drawId, true);
+      const event = this.createPreparedEvent(request, seed, syncedInputs, mappingRows, totalCount, drawId, true);
       preparedEvent = event;
       await this.enqueueMutation(async () => {
         this.assertCurrent(token);
@@ -557,7 +647,7 @@ export class FairnessCoordinator {
             request.currentSeed,
             syncedInputs,
             mappingRows,
-            setup.totalCount,
+            totalCount,
             drawId,
             true
           );
@@ -643,6 +733,7 @@ export class FairnessCoordinator {
         drawId,
         winners,
       });
+      this.invalidateSearchState();
       return { confirmed: true };
     });
   }
@@ -744,19 +835,23 @@ export class FairnessCoordinator {
     force = false,
     inputs: readonly string[] = this.currentInputs,
     token?: number,
-    parseGroups = this.enabled || this.events.length > 0
+    parseGroups = this.enabled || this.events.length > 0,
+    generation?: number
   ): Promise<SyncedEntry[]> {
     if (!force && !this.enabled) return [];
     await this.ensureLoaded();
     if (!this.available) throw new Error(this.error ?? DEFAULT_RECENT_ERROR);
+    if (generation !== undefined) this.assertSearchCurrent(generation);
     const rows = parseFairnessEntries(inputs, parseGroups);
 
     return this.enqueueMutation(async () => {
+      if (generation !== undefined) this.assertSearchCurrent(generation);
       if (token !== undefined) this.assertCurrent(token);
       if (!force && !this.enabled) return [];
       await this.ensureEpoch();
-      const syncedInputs = await this.syncCurrentParticipantsNow(rows, token);
+      const syncedInputs = await this.syncCurrentParticipantsNow(rows, token, generation);
       this.error = null;
+      if (generation !== undefined) this.assertSearchCurrent(generation);
       if (token !== undefined) this.assertCurrent(token);
       return syncedInputs;
     });
@@ -764,7 +859,8 @@ export class FairnessCoordinator {
 
   private async syncCurrentParticipantsNow(
     rows: readonly ParsedFairnessEntry[],
-    token?: number
+    token?: number,
+    generation?: number
   ): Promise<SyncedEntry[]> {
     const previousMemberNames: string[][] = [];
     let previousRowIndex = 0;
@@ -791,6 +887,7 @@ export class FairnessCoordinator {
     const syncedInputs: SyncedEntry[] = [];
 
     for (let rowIndex = 0; rowIndex < rows.length; rowIndex++) {
+      if (generation !== undefined) this.assertSearchCurrent(generation);
       if (token !== undefined) this.assertCurrent(token);
       const row = rows[rowIndex];
       const priorBinding = this.inputBindings[rowIndex];
@@ -881,14 +978,89 @@ export class FairnessCoordinator {
     // Keep absence events sequential so each event is persisted and projected
     // before the next participant operation can observe the roster.
     for (const participant of this.projection.participants.slice()) {
+      if (generation !== undefined) this.assertSearchCurrent(generation);
       if (token !== undefined) this.assertCurrent(token);
       if (!participant.active || currentIds.has(participant.id)) continue;
       const base = createBaseEvent('participantParticipationChanged', this.now, this.createId);
       await this.appendEvent({ ...base, participantId: participant.id, active: false });
     }
+    if (generation !== undefined) this.assertSearchCurrent(generation);
     this.inputBindings = nextBindings;
     this.boundInputs = rows.map((row) => row.rawInput);
     return syncedInputs;
+  }
+
+  private async createSearchContext(
+    request: FairnessStartRequest,
+    token?: number,
+    generation = this.searchGeneration
+  ): Promise<FairnessSearchContext> {
+    await this.ensureOperational();
+    this.assertSearchCurrent(generation);
+    if (token !== undefined) this.assertCurrent(token);
+
+    const syncedInputs = await this.syncCurrentParticipants(
+      true,
+      request.participantInputs,
+      token,
+      undefined,
+      generation
+    );
+    this.assertSearchCurrent(generation);
+    if (token !== undefined) this.assertCurrent(token);
+
+    const setup = getSimulationParticipantSetup(request.participantInputs);
+    if (!setup || setup.totalCount <= 0 || setup.totalCount > MAX_MARBLES) {
+      throw new Error(`Fairness participant count must be between 1 and ${MAX_MARBLES}`);
+    }
+    if (request.winnerRange.start !== request.winnerRange.end) {
+      throw new Error('Cumulative fairness supports one winning rank at a time');
+    }
+
+    const policyInputs = new Map(
+      this.projection.participants.map((participant) => [
+        participant.id,
+        {
+          id: participant.id,
+          active: participant.active,
+          excluded: participant.excluded,
+          effectiveBalance: participant.effectiveBalance,
+        },
+      ])
+    );
+    const entryPolicyInputs = syncedInputs.map((entry) => ({
+      id: entry.entryId,
+      members: entry.memberIds.map((memberId) => policyInputs.get(memberId)).filter((member) => member !== undefined),
+    }));
+    const evaluation = evaluateStrictBalanceEntries(entryPolicyInputs);
+    if (evaluation.eligibleEntryIds.length === 0) throw new Error('Fairness has no eligible draw entries');
+
+    const mappingRows = syncedInputs.map((input) => ({ entryId: input.entryId, count: input.count }));
+    const spawnLayout = getMarbleSpawnLayout(setup.totalCount, request.stage.spawn);
+    const budget = searchBudget(setup.totalCount, Math.max(1, mappingRows.length), evaluation.eligibleEntryIds.length);
+    const key = createFairnessSearchKey(
+      request,
+      setup.participants,
+      syncedInputs,
+      this.projection,
+      evaluation.eligibleEntryIds,
+      budget,
+      this.headlessStepLimit
+    );
+
+    return {
+      request,
+      syncedInputs,
+      participants: setup.participants,
+      totalCount: setup.totalCount,
+      spawnPositions: spawnLayout.positions,
+      mappingRows,
+      eligibleEntryIds: evaluation.eligibleEntryIds,
+      budget,
+      key,
+      generation,
+      mustSearch: !canUseStrictBalanceEntryFastPath(evaluation),
+    };
   }
 
   private createPreparedEvent(
@@ -949,52 +1121,92 @@ export class FairnessCoordinator {
     };
   }
 
-  private async searchForWinner(
-    request: FairnessStartRequest,
-    participants: readonly MarbleParticipant[],
-    totalCount: number,
-    spawnPositions: readonly { x: number; y: number }[],
-    mappingRows: readonly Readonly<{ entryId: string; count: number }>[],
-    eligibleEntryIds: readonly string[],
-    token: number
-  ): Promise<SearchResult> {
-    const budget = searchBudget(totalCount, Math.max(1, mappingRows.length), eligibleEntryIds.length);
-    if (budget <= 0) throw new Error('Fairness search has no valid budget');
+  private ensureSearch(context: FairnessSearchContext, token?: number): Promise<SearchResult> {
+    this.assertSearchCurrent(context.generation);
+    if (token !== undefined) this.assertCurrent(token);
 
-    const mappingByMarble = (seed: Seed) => mapMarbleIdsToEntries(seed, mappingRows);
-    const eligible = new Set(eligibleEntryIds);
-    let lastError: unknown;
-    for (let attempt = 0; attempt < budget; attempt++) {
-      this.assertCurrent(token);
-      const seed = this.createCandidateSeed();
-      try {
-        const winnerMarbleIds = await this.headlessRunner({
-          seed,
-          stage: request.stage,
-          participants,
-          totalCount,
-          spawnPositions,
-          skillsEnabled: request.skillsEnabled,
-          targetRank: request.winnerRange.end,
-        });
-        const mapping = mappingByMarble(seed);
-        const winnerEntryIds = winnerMarbleIds.map((marbleId) => mapping.get(marbleId));
-        const winnerId = winnerEntryIds[request.winnerRange.end];
-        if (winnerId && eligible.has(winnerId)) {
-          return {
-            seed,
-            winnerMarbleIds: winnerMarbleIds.slice(),
-            winnerEntryIds: winnerEntryIds.filter((id): id is string => id !== undefined),
-          };
+    if (this.cachedCandidate?.key === context.key && this.cachedCandidate.generation === context.generation) {
+      return Promise.resolve(this.cachedCandidate);
+    }
+
+    if (this.inFlightSearch?.key === context.key && this.inFlightSearch.generation === context.generation) {
+      return this.inFlightSearch.promise;
+    }
+
+    const promise = this.searchForWinner(context, token);
+    const work: SearchWork = { key: context.key, generation: context.generation, promise };
+    this.inFlightSearch = work;
+    void promise
+      .then((result) => {
+        if (this.inFlightSearch === work && this.searchGeneration === context.generation) {
+          this.cachedCandidate = { ...result, key: context.key, generation: context.generation };
         }
+      })
+      .catch(() => undefined)
+      .then(
+        () => {
+          if (this.inFlightSearch === work) this.inFlightSearch = null;
+        },
+        () => {
+          if (this.inFlightSearch === work) this.inFlightSearch = null;
+        }
+      );
+    return promise;
+  }
+
+  private consumeCandidate(context: FairnessSearchContext): void {
+    if (this.cachedCandidate?.key === context.key && this.cachedCandidate.generation === context.generation) {
+      this.cachedCandidate = null;
+    }
+  }
+
+  private async searchForWinner(context: FairnessSearchContext, token?: number): Promise<SearchResult> {
+    if (context.budget <= 0) throw new Error('Fairness search has no valid budget');
+
+    const mappingByMarble = (seed: Seed) => mapMarbleIdsToEntries(seed, context.mappingRows);
+    const eligible = new Set(context.eligibleEntryIds);
+    let lastError: unknown;
+    for (let attempt = 0; attempt < context.budget; attempt++) {
+      this.assertSearchCurrent(context.generation);
+      if (token !== undefined) this.assertCurrent(token);
+      const seed = this.createCandidateSeed();
+      let winnerMarbleIds: readonly number[];
+      try {
+        winnerMarbleIds = await this.headlessRunner({
+          seed,
+          stage: context.request.stage,
+          participants: context.participants,
+          totalCount: context.totalCount,
+          spawnPositions: context.spawnPositions,
+          skillsEnabled: context.request.skillsEnabled,
+          targetRank: context.request.winnerRange.end,
+        });
       } catch (error) {
+        if (error instanceof FairnessCancelledError) throw error;
         lastError = error;
+        await yieldToHost();
+        continue;
+      }
+
+      this.assertSearchCurrent(context.generation);
+      if (token !== undefined) this.assertCurrent(token);
+      const mapping = mappingByMarble(seed);
+      const winnerEntryIds = winnerMarbleIds.map((marbleId) => mapping.get(marbleId));
+      const winnerId = winnerEntryIds[context.request.winnerRange.end];
+      if (winnerId && eligible.has(winnerId)) {
+        return {
+          seed,
+          winnerMarbleIds: winnerMarbleIds.slice(),
+          winnerEntryIds: winnerEntryIds.filter((id): id is string => id !== undefined),
+        };
       }
       await yieldToHost();
     }
 
+    this.assertSearchCurrent(context.generation);
+    if (token !== undefined) this.assertCurrent(token);
     const detail = lastError instanceof Error ? `: ${lastError.message}` : '';
-    throw new Error(`Fairness could not find an eligible winner within ${budget} attempts${detail}`);
+    throw new Error(`Fairness could not find an eligible winner within ${context.budget} attempts${detail}`);
   }
 
   private async recordFailedDraw(

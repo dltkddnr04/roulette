@@ -1,5 +1,10 @@
 # Changelog
 
+- 2026-09-13:
+    - Added cumulative and grouped fairness support.
+    - Added a public deterministic simulation API.
+    - Refactored Settings into tabs with improved responsive layouts.
+    - Migrated React UI icons to Lucide.
 - 2025-11-13:
     - Optimized the rendering process.
 - 2025-11-10:
@@ -37,4 +42,3 @@
     - Now you can adjust the game speed.
 - 2023-05-29:
     - Now you can shake the game if the marbles are being stuck for more than 3 seconds.
-
