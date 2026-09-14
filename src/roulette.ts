@@ -21,6 +21,10 @@ import { bound } from './utils/bound.decorator';
 import type { Seed } from './utils/random';
 import { VideoRecorder } from './utils/videoRecorder';
 
+function sameStrings(left: readonly string[], right: readonly string[]): boolean {
+  return left.length === right.length && left.every((value, index) => value === right[index]);
+}
+
 export type {
   FairnessCurrentEpoch,
   FairnessDrawEntrySnapshot,
@@ -636,7 +640,7 @@ export class Roulette extends EventTarget {
     this._invalidateRecording();
     this._presentationEffects.clear();
     this._roundSession.setSeed(prepared.seed);
-    const spawnLayout = this._roundSession.setParticipants(request.participantInputs.slice());
+    const spawnLayout = this._roundSession.rebuildMarblesForCurrentParticipants();
     if (!spawnLayout) {
       await this._fairnessCoordinator.cancelDraw(prepared.drawId, 'Fairness could not rebuild the round');
       this._emitMessage('Fairness could not rebuild the round');
@@ -768,8 +772,9 @@ export class Roulette extends EventTarget {
   }
 
   public setWinnerRange(start: number, end: number) {
+    const changed = this._roundSession.setWinnerRange(start, end);
+    if (!changed) return true;
     if (!this._applyingReplay) this._cancelActiveFairnessDraw('Fairness draw was cancelled because the winner changed');
-    this._roundSession.setWinnerRange(start, end);
     this._scheduleFairnessPrecompute();
     return true;
   }
@@ -788,8 +793,9 @@ export class Roulette extends EventTarget {
   }
 
   public setSkillsEnabled(enabled: boolean): void {
+    const changed = this._roundSession.setSkillsEnabled(enabled);
+    if (!changed) return;
     if (!this._applyingReplay) this._cancelActiveFairnessDraw('Fairness draw was cancelled because skills changed');
-    this._roundSession.setSkillsEnabled(enabled);
     this._scheduleFairnessPrecompute();
   }
 
@@ -903,15 +909,22 @@ export class Roulette extends EventTarget {
   public setMarbles(names: string[]) {
     if (!this._roundSession.isInitialized) return;
 
+    const participantsChanged = !sameStrings(this._roundSession.getParticipantInputs(), names);
     if (!this._applyingReplay) {
       this._replayPending = false;
-      this._cancelActiveFairnessDraw('Fairness draw was cancelled because the participants changed');
+      if (participantsChanged) {
+        this._cancelActiveFairnessDraw('Fairness draw was cancelled because the participants changed');
+      }
     }
     this._invalidateRecording();
     this._presentationEffects.clear();
     const spawnLayout = this._roundSession.setParticipants(names);
-    this._fairnessCoordinator.setCurrentParticipantInputs(names, this._applyingReplay);
-    this._scheduleFairnessPrecompute();
+    this._fairnessCoordinator.setCurrentParticipantInputs(
+      names,
+      this._applyingReplay,
+      !this._applyingReplay && participantsChanged
+    );
+    if (participantsChanged) this._scheduleFairnessPrecompute();
     if (!spawnLayout) return;
 
     // 카메라를 구슬 생성 위치 중앙으로 이동 + 줌인
@@ -1029,6 +1042,7 @@ export class Roulette extends EventTarget {
     if (index < 0 || index > stages.length - 1) {
       throw new Error('Incorrect map number');
     }
+    if (this._roundSession.currentStage === stages[index]) return;
     if (!this._applyingReplay) {
       this._replayPending = false;
       this._cancelActiveFairnessDraw('Fairness draw was cancelled because the map changed');

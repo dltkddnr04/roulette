@@ -36,6 +36,7 @@ const { normalizeParticipantNames } = loadTypeScriptModule('src/utils/participan
 const { getMarbleSpawnLayout } = loadTypeScriptModule('src/utils/marbleSpawn.ts');
 const { Marble } = loadTypeScriptModule('src/marble.ts');
 const { getStepBudget, preservePhysicsDebt, RaceSimulation } = loadTypeScriptModule('src/raceSimulation.ts');
+const { HeadlessSimulationCancelledError, simulateHeadlessRace } = loadTypeScriptModule('src/headlessSimulation.ts');
 const { RoundSession } = loadTypeScriptModule('src/roundSession.ts');
 const { validateReplayDescriptor } = loadTypeScriptModule('src/replay.ts');
 const { createSeededRandom } = loadTypeScriptModule('src/utils/random.ts');
@@ -48,6 +49,7 @@ const {
   evaluateStrictBalance,
   evaluateStrictBalanceEntries,
   LEGACY_FAIRNESS_DATA_VERSION,
+  applyFairnessEvent,
   projectFairnessEvents,
   searchBudget,
   validateFairnessExport,
@@ -267,9 +269,12 @@ test('setSeed supports deterministic rebuild and auto-seed replay', () => {
 
 test('RoundSession owns round lifecycle and participant rebuild state', async () => {
   const positions = new Map();
+  let loadStageCalls = 0;
   const physics = {
     init: async () => {},
-    loadStage() {},
+    loadStage() {
+      loadStageCalls++;
+    },
     clearEntities() {},
     clearMarbles() {
       positions.clear();
@@ -328,6 +333,10 @@ test('RoundSession owns round lifecycle and participant rebuild state', async ()
   assert.equal(session.getCount(), 5);
   assert.equal(session.getSeed(), 'round-session-seed');
 
+  session.setSeed('round-session-seed');
+  assert.ok(session.rebuildMarblesForCurrentParticipants());
+  assert.equal(loadStageCalls, 1);
+
   const generation = session.prepareStart();
   assert.equal(session.roundState, 'running');
   assert.ok(generation !== null);
@@ -337,11 +346,13 @@ test('RoundSession owns round lifecycle and participant rebuild state', async ()
   session.reset();
   assert.equal(session.roundState, 'ready');
   assert.equal(session.getCount(), 0);
+  assert.equal(loadStageCalls, 2);
 
   const rebuilt = session.setMap(replacementStage);
   assert.equal(rebuilt.positions.length, 5);
   assert.equal(session.getCount(), 5);
   assert.equal(session.currentStage, replacementStage);
+  assert.equal(loadStageCalls, 3);
 });
 
 test('presentation-side Math.random calls cannot consume the simulation stream', () => {
@@ -822,6 +833,59 @@ test('group winner accounting credits every member once and void reverses it', (
   const voided = projectFairnessEvents([...events, event('drawVoided', 8, { drawId: 'draw-group' })]);
   assert.equal(voided.participants.find(({ id }) => id === 'B').actualWins, 0);
   assert.equal(voided.participants.find(({ id }) => id === 'C').currentEpochWins, 0);
+});
+
+test('incremental fairness projection matches a full event replay', () => {
+  const event = (type, timestamp, details) => ({ ...fairnessEvent(type, timestamp, details), version: 2 });
+  const events = [
+    event('epochStarted', 1, { epochId: 'epoch-1' }),
+    event('participantDiscovered', 2, { participantId: 'A', displayName: 'A', active: true, excluded: false }),
+    event('participantDiscovered', 3, { participantId: 'B', displayName: 'B', active: true, excluded: false }),
+    event('participantRenamed', 4, { participantId: 'A', displayName: 'Alpha', rawInput: 'Alpha' }),
+    event('participantExclusionChanged', 5, { participantId: 'B', excluded: true }),
+    event('participantParticipationChanged', 6, { participantId: 'B', active: false }),
+    event('participantParticipationChanged', 7, { participantId: 'B', active: true }),
+    event('drawPrepared', 8, {
+      drawId: 'draw-1',
+      epochId: 'epoch-1',
+      seed: 'projection-seed',
+      mapIndex: 0,
+      mapTitle: 'Projection',
+      rawParticipantInputs: ['Alpha', 'B'],
+      winnerRange: { start: 0, end: 0 },
+      skillsEnabled: false,
+      fairnessEnabledAtDraw: true,
+      policy: { id: 'strict-balance-v1', version: 1 },
+      members: [fairnessParticipant('A', 'Alpha', 0, 0, true), fairnessParticipant('B', 'B', 1, 0, false)],
+      entries: [
+        {
+          entryId: 'entry-a',
+          displayName: 'Alpha',
+          rawInput: 'Alpha',
+          memberIds: ['A'],
+          weight: 1,
+          count: 1,
+          marbleIds: [0],
+        },
+        { entryId: 'entry-b', displayName: 'B', rawInput: 'B', memberIds: ['B'], weight: 1, count: 1, marbleIds: [1] },
+      ],
+    }),
+    event('drawConfirmed', 9, {
+      drawId: 'draw-1',
+      winners: [
+        {
+          entryId: 'entry-a',
+          entryDisplayName: 'Alpha',
+          marbleId: 0,
+          members: [{ participantId: 'A', displayName: 'Alpha' }],
+        },
+      ],
+    }),
+    event('drawVoided', 10, { drawId: 'draw-1', reason: 'test' }),
+  ];
+  const incremental = projectFairnessEvents([]);
+  events.forEach((item) => applyFairnessEvent(incremental, item));
+  assert.deepEqual(incremental, projectFairnessEvents(events));
 });
 
 test('group identity survives regrouping and duplicate member entries are rejected', async () => {
@@ -1484,6 +1548,70 @@ test('fairness headless runner uses the real Box2D simulation', async () => {
   }
 });
 
+function cancellableHeadlessRequest(finishY = 1000) {
+  return {
+    seed: 'cancellable-headless-seed',
+    stage: {
+      title: 'cancellable headless test',
+      finish: { y: finishY },
+      camera: { zoomTriggerY: 10 },
+      spawn: {
+        origin: { x: 10.25, y: 1 },
+        maxColumns: 10,
+        columnSpacing: 0.6,
+        rowSpacing: 1,
+        maxUnshiftedRows: 5,
+      },
+      entities: [],
+    },
+    participants: [
+      { name: 'A', weight: 1, count: 1 },
+      { name: 'B', weight: 1, count: 1 },
+    ],
+    totalCount: 2,
+    spawnPositions: [
+      { x: 10.25, y: 1 },
+      { x: 10.85, y: 1 },
+    ],
+    skillsEnabled: false,
+    targetRank: 0,
+  };
+}
+
+test('headless simulation rejects an already-aborted signal', async () => {
+  const controller = new AbortController();
+  controller.abort();
+
+  await assert.rejects(
+    () => simulateHeadlessRace(cancellableHeadlessRequest(), { signal: controller.signal }),
+    (error) => error instanceof HeadlessSimulationCancelledError
+  );
+});
+
+test('headless simulation cancels between advances and disposes its RaceSimulation', async () => {
+  const controller = new AbortController();
+  const originalDispose = RaceSimulation.prototype.dispose;
+  let disposeCalls = 0;
+  RaceSimulation.prototype.dispose = function () {
+    disposeCalls++;
+    return originalDispose.call(this);
+  };
+  const originalFetch = globalThis.fetch;
+  const originalLog = console.log;
+  globalThis.fetch = undefined;
+  console.log = () => {};
+  try {
+    const running = simulateHeadlessRace(cancellableHeadlessRequest(), { signal: controller.signal });
+    setTimeout(() => controller.abort(), 0);
+    await assert.rejects(running, (error) => error instanceof HeadlessSimulationCancelledError);
+    assert.equal(disposeCalls, 1);
+  } finally {
+    RaceSimulation.prototype.dispose = originalDispose;
+    globalThis.fetch = originalFetch;
+    console.log = originalLog;
+  }
+});
+
 test('public simulation client is repeatable and isolated from its input', async () => {
   const stage = {
     title: 'public simulation test',
@@ -1697,14 +1825,16 @@ test('fairness precompute reuses one ready candidate without creating draw event
 
 test('fairness start joins an in-flight precompute instead of starting a second search', async () => {
   let calls = 0;
+  let runnerSignal;
   let resolveRunner;
   let signalRunnerStarted;
   const runnerStarted = new Promise((resolve) => {
     signalRunnerStarted = resolve;
   });
   const { coordinator, stage } = await createUnbalancedSearchCoordinator(
-    ({ seed }) => {
+    ({ seed }, options) => {
       calls++;
+      runnerSignal = options.signal;
       return new Promise((resolve) => {
         resolveRunner = () => resolve([marbleForEntry(seed, ['entry-0', 'entry-1'])]);
         signalRunnerStarted();
@@ -1721,20 +1851,23 @@ test('fairness start joins an in-flight precompute instead of starting a second 
   const prepared = await start;
   await precompute;
   assert.equal(calls, 1);
+  assert.equal(runnerSignal.aborted, false);
   assert.equal(prepared.seed, 'in-flight-seed');
 });
 
 test('stale fairness precompute cannot overwrite a newer generation candidate', async () => {
   let calls = 0;
+  let oldSignal;
   let resolveOldRunner;
   let signalOldRunnerStarted;
   const oldRunnerStarted = new Promise((resolve) => {
     signalOldRunnerStarted = resolve;
   });
   const { coordinator, stage } = await createUnbalancedSearchCoordinator(
-    ({ seed }) => {
+    ({ seed }, options) => {
       calls++;
       if (calls === 1) {
+        oldSignal = options.signal;
         return new Promise((resolve) => {
           resolveOldRunner = () => resolve([marbleForEntry(seed, ['entry-0', 'entry-1'])]);
           signalOldRunnerStarted();
@@ -1752,6 +1885,7 @@ test('stale fairness precompute cannot overwrite a newer generation candidate', 
   await oldRunnerStarted;
 
   coordinator.setCurrentParticipantInputs(['A', 'B', 'C']);
+  assert.equal(oldSignal.aborted, true);
   await coordinator.getState();
   const newRequest = searchTestRequest(stage, ['A', 'B', 'C']);
   await coordinator.precompute(newRequest);
@@ -1763,6 +1897,40 @@ test('stale fairness precompute cannot overwrite a newer generation candidate', 
   const prepared = await coordinator.prepareDraw(newRequest, coordinator.beginStart());
   assert.equal(prepared.seed, 'new-seed');
   assert.equal(calls, 2);
+  const state = await coordinator.getState();
+  assert.equal(state.available, true);
+  assert.equal(state.error, null);
+  assert.equal(state.recentDraws.filter(({ status }) => status === 'failed').length, 0);
+});
+
+test('confirmed draw invalidation aborts a running fairness search', async () => {
+  let signal;
+  let resolveRunner;
+  let signalRunnerStarted;
+  const runnerStarted = new Promise((resolve) => {
+    signalRunnerStarted = resolve;
+  });
+  const { coordinator, stage } = await createUnbalancedSearchCoordinator(
+    ({ seed }, options) => {
+      signal = options.signal;
+      return new Promise((resolve) => {
+        resolveRunner = () => resolve([marbleForEntry(seed, ['entry-0', 'entry-1'])]);
+        signalRunnerStarted();
+      });
+    },
+    () => 'confirmed-invalidation-seed'
+  );
+  const request = searchTestRequest(stage, ['A', 'B']);
+  const pending = coordinator.precompute(request).catch((error) => error);
+  await runnerStarted;
+
+  const ordinary = await coordinator.prepareUnconstrainedDraw(searchTestRequest(stage, ['A', 'B'], 'ordinary'));
+  const aWinner = ordinary.event.entries.find(({ displayName }) => displayName === 'A').marbleIds;
+  await coordinator.confirmDraw(ordinary.drawId, aWinner, null);
+
+  assert.equal(signal.aborted, true);
+  resolveRunner();
+  assert.equal((await pending) instanceof Error, true);
 });
 
 test('strict-balance fast path skips speculative headless search', async () => {
@@ -1823,4 +1991,78 @@ test('start bypasses a pending fairness precompute debounce', async () => {
 
   assert.equal(calls, 1);
   assert.equal(prepared.seed, 'immediate-start-seed');
+});
+
+test('non-cancellation headless errors retain search retry semantics', async () => {
+  let calls = 0;
+  const { coordinator, stage } = await createUnbalancedSearchCoordinator(
+    async ({ seed }) => {
+      calls++;
+      if (calls === 1) throw new Error('transient simulation failure');
+      return [marbleForEntry(seed, ['entry-0', 'entry-1'])];
+    },
+    (() => {
+      const seeds = ['failed-seed', 'retry-seed'];
+      return () => seeds.shift();
+    })()
+  );
+
+  const prepared = await coordinator.prepareDraw(searchTestRequest(stage, ['A', 'B']), coordinator.beginStart());
+  assert.equal(calls, 2);
+  assert.equal(prepared.seed, 'retry-seed');
+});
+
+test('worker search keeps serial candidate ordering and cancels higher attempts', async () => {
+  let id = 0;
+  const seeds = ['attempt-0', 'attempt-1', 'attempt-2', 'attempt-3'];
+  const calls = [];
+  let cancelled = 0;
+  const workerPool = {
+    concurrency: 3,
+    run(request, options) {
+      calls.push({ request, options });
+      const delay = request.seed === 'attempt-0' ? 0 : request.seed === 'attempt-1' ? 20 : 100;
+      const winnerEntry = request.seed === 'attempt-0' ? 'entry-0' : 'entry-1';
+      return new Promise((resolve, reject) => {
+        let settled = false;
+        const timer = setTimeout(() => {
+          settled = true;
+          options.signal?.removeEventListener('abort', onAbort);
+          resolve([marbleForEntry(request.seed, ['entry-0', winnerEntry])]);
+        }, delay);
+        const onAbort = () => {
+          if (settled) return;
+          settled = true;
+          cancelled++;
+          clearTimeout(timer);
+          options.signal?.removeEventListener('abort', onAbort);
+          reject(new HeadlessSimulationCancelledError());
+        };
+        options.signal?.addEventListener('abort', onAbort, { once: true });
+      });
+    },
+  };
+  const coordinator = new FairnessCoordinator({
+    store: new InMemoryFairnessStore(),
+    workerPool,
+    createId: (prefix) => `${prefix}-${++id}`,
+    now: () => id,
+    createCandidateSeed: () => seeds.shift(),
+  });
+  coordinator.setCurrentParticipantInputs(['A', 'B']);
+  await coordinator.setEnabled(true);
+  const stage = searchTestStage();
+  const base = await coordinator.prepareUnconstrainedDraw(searchTestRequest(stage, ['A', 'B'], 'base'));
+  const aWinner = base.event.entries.find(({ displayName }) => displayName === 'A').marbleIds;
+  await coordinator.confirmDraw(base.drawId, aWinner, null);
+
+  const prepared = await coordinator.prepareDraw(searchTestRequest(stage, ['A', 'B']), coordinator.beginStart());
+  assert.equal(prepared.seed, 'attempt-1');
+  assert.equal(calls.length, 4);
+  assert.equal(
+    calls.every(({ options }) => options.stepLimit > 0),
+    true
+  );
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.ok(cancelled >= 1);
 });

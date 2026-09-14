@@ -91,16 +91,21 @@ export class RoundSession {
     return this.participantInputs.slice();
   }
 
-  setSkillsEnabled(enabled: boolean): void {
+  setSkillsEnabled(enabled: boolean): boolean {
+    if (this.simulation.getSkillsEnabled() === enabled) return false;
     this.simulation.setSkillsEnabled(enabled);
+    return true;
   }
 
   getSkillsEnabled(): boolean {
     return this.simulation.getSkillsEnabled();
   }
 
-  setWinnerRange(start: number, end: number): void {
-    this.winnerRange = clipWinnerRange(start, end, this.simulation.getCount());
+  setWinnerRange(start: number, end: number): boolean {
+    const nextRange = clipWinnerRange(start, end, this.simulation.getCount());
+    if (nextRange.start === this.winnerRange.start && nextRange.end === this.winnerRange.end) return false;
+    this.winnerRange = nextRange;
+    return true;
   }
 
   getWinnerRange(): { start: number; end: number } {
@@ -127,7 +132,12 @@ export class RoundSession {
     if (!this.isInitialized) return null;
 
     this.participantInputs = names.slice();
-    return this.rebuildParticipants();
+    return this.state === 'ready' ? this.rebuildMarbles() : this.rebuildParticipants();
+  }
+
+  rebuildMarblesForCurrentParticipants(): MarbleSpawnLayout | null {
+    if (!this.isInitialized || this.state !== 'ready') return null;
+    return this.rebuildMarbles();
   }
 
   setMap(stage: StageDef): MarbleSpawnLayout | null {
@@ -247,6 +257,23 @@ export class RoundSession {
     const setup = getSimulationParticipantSetup(this.participantInputs);
     if (!setup || setup.totalCount > MAX_MARBLES) return null;
 
+    const spawnLayout = getMarbleSpawnLayout(setup.totalCount, this.stage.spawn);
+    this.simulation.replaceMarbles(setup.participants, setup.totalCount, spawnLayout.positions);
+    this.seed = this.simulation.getSeed();
+    return spawnLayout;
+  }
+
+  private rebuildMarbles(): MarbleSpawnLayout | null {
+    if (!this.stage) return null;
+
+    const setup = getSimulationParticipantSetup(this.participantInputs);
+    if (!setup || setup.totalCount > MAX_MARBLES) return null;
+
+    this.simulation.resetTiming();
+    this.invalidateRound();
+    this.simulation.clearMarbles();
+    this.clearResults();
+    this.state = 'ready';
     const spawnLayout = getMarbleSpawnLayout(setup.totalCount, this.stage.spawn);
     this.simulation.replaceMarbles(setup.participants, setup.totalCount, spawnLayout.positions);
     this.seed = this.simulation.getSeed();

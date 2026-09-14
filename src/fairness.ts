@@ -737,125 +737,133 @@ function normalizeEvent(event: FairnessEvent | unknown): FairnessEvent {
   return event.version === LEGACY_FAIRNESS_DATA_VERSION ? migrateLegacyEvent(event) : (event as FairnessEvent);
 }
 
+function applyFairnessEventToProjection(projection: FairnessProjection, rawEvent: FairnessEvent | unknown): void {
+  const event = normalizeEvent(rawEvent);
+  switch (event.type) {
+    case 'epochStarted': {
+      projection.participants.forEach((participant) => {
+        participant.previousEffectiveBalance = 0;
+      });
+      const epoch: FairnessEpochProjection = {
+        id: event.epochId,
+        startedAt: event.timestamp,
+        balances: Object.create(null) as Record<string, number>,
+        wins: Object.create(null) as Record<string, number>,
+      };
+      projection.participants.forEach((participant) => {
+        if (participant.active) epoch.balances[participant.id] = 0;
+      });
+      projection.epochs.push(epoch);
+      projection.currentEpochId = epoch.id;
+      setCurrentEpochValues(projection);
+      break;
+    }
+    case 'participantDiscovered': {
+      if (getParticipant(projection, event.participantId)) break;
+      const epoch = getEpoch(projection, projection.currentEpochId);
+      const initialBalance = activeMinimum(projection, epoch);
+      projection.participants.push({
+        id: event.participantId,
+        displayName: event.displayName,
+        createdAt: event.timestamp,
+        active: event.active,
+        excluded: event.excluded,
+        actualWins: 0,
+        fairnessCountedWins: 0,
+        currentEpochWins: 0,
+        effectiveBalance: initialBalance,
+        previousEffectiveBalance: 0,
+        participationHistory: [{ timestamp: event.timestamp, active: event.active }],
+      });
+      if (epoch && event.active) epoch.balances[event.participantId] = initialBalance;
+      setCurrentEpochValues(projection);
+      break;
+    }
+    case 'participantRenamed': {
+      const participant = getParticipant(projection, event.participantId);
+      if (participant) participant.displayName = event.displayName;
+      break;
+    }
+    case 'participantParticipationChanged':
+    case 'participantInactive': {
+      const participant = getParticipant(projection, event.participantId);
+      if (!participant) break;
+      const nextActive = event.type === 'participantInactive' ? false : event.active;
+      const epoch = getEpoch(projection, projection.currentEpochId);
+      if (participant.active === nextActive) break;
+      if (!nextActive) {
+        participant.previousEffectiveBalance = getBalance(epoch, participant.id);
+        participant.active = false;
+      } else {
+        const minimum = activeMinimum(projection, epoch);
+        participant.active = true;
+        const rejoinBalance = Math.max(participant.previousEffectiveBalance, minimum);
+        participant.effectiveBalance = rejoinBalance;
+        if (epoch) epoch.balances[participant.id] = rejoinBalance;
+      }
+      participant.participationHistory.push({ timestamp: event.timestamp, active: nextActive });
+      setCurrentEpochValues(projection);
+      break;
+    }
+    case 'participantExclusionChanged': {
+      const participant = getParticipant(projection, event.participantId);
+      if (participant) participant.excluded = event.excluded;
+      break;
+    }
+    case 'drawPrepared':
+      if (!projection.draws.some((draw) => draw.id === event.drawId)) {
+        projection.draws.push({
+          id: event.drawId,
+          epochId: event.epochId,
+          status: 'prepared',
+          preparedAt: event.timestamp,
+          seed: event.seed,
+          mapIndex: event.mapIndex,
+          mapTitle: event.mapTitle,
+          rawParticipantInputs: [...event.rawParticipantInputs],
+          winnerRange: { ...event.winnerRange },
+          skillsEnabled: event.skillsEnabled,
+          fairnessEnabledAtDraw: event.fairnessEnabledAtDraw,
+          policy: { ...event.policy },
+          members: event.members.map((member) => ({ ...member })),
+          entries: event.entries.map((entry) => ({
+            ...entry,
+            memberIds: [...entry.memberIds],
+            marbleIds: [...entry.marbleIds],
+          })),
+          winners: [],
+        });
+      }
+      break;
+    case 'drawConfirmed':
+      applyConfirmedDraw(projection, event);
+      setCurrentEpochValues(projection);
+      break;
+    case 'drawFailed':
+    case 'drawCancelled': {
+      const draw = projection.draws.find((candidate) => candidate.id === event.drawId);
+      if (draw && draw.status === 'prepared') {
+        draw.status = event.type === 'drawFailed' ? 'failed' : 'cancelled';
+        draw.failureReason = event.reason;
+      }
+      break;
+    }
+    case 'drawVoided':
+      applyVoidedDraw(projection, event);
+      setCurrentEpochValues(projection);
+      break;
+  }
+}
+
+export function applyFairnessEvent(projection: FairnessProjection, event: FairnessEvent): FairnessProjection {
+  applyFairnessEventToProjection(projection, event);
+  setCurrentEpochValues(projection);
+  return projection;
+}
+
 export function projectFairnessEvents(events: readonly FairnessEvent[]): FairnessProjection {
   const projection = emptyProjection();
-  events.forEach((rawEvent) => {
-    const event = normalizeEvent(rawEvent);
-    switch (event.type) {
-      case 'epochStarted': {
-        projection.participants.forEach((participant) => {
-          participant.previousEffectiveBalance = 0;
-        });
-        const epoch: FairnessEpochProjection = {
-          id: event.epochId,
-          startedAt: event.timestamp,
-          balances: Object.create(null) as Record<string, number>,
-          wins: Object.create(null) as Record<string, number>,
-        };
-        projection.participants.forEach((participant) => {
-          if (participant.active) epoch.balances[participant.id] = 0;
-        });
-        projection.epochs.push(epoch);
-        projection.currentEpochId = epoch.id;
-        setCurrentEpochValues(projection);
-        break;
-      }
-      case 'participantDiscovered': {
-        if (getParticipant(projection, event.participantId)) break;
-        const epoch = getEpoch(projection, projection.currentEpochId);
-        const initialBalance = activeMinimum(projection, epoch);
-        projection.participants.push({
-          id: event.participantId,
-          displayName: event.displayName,
-          createdAt: event.timestamp,
-          active: event.active,
-          excluded: event.excluded,
-          actualWins: 0,
-          fairnessCountedWins: 0,
-          currentEpochWins: 0,
-          effectiveBalance: initialBalance,
-          previousEffectiveBalance: 0,
-          participationHistory: [{ timestamp: event.timestamp, active: event.active }],
-        });
-        if (epoch && event.active) epoch.balances[event.participantId] = initialBalance;
-        setCurrentEpochValues(projection);
-        break;
-      }
-      case 'participantRenamed': {
-        const participant = getParticipant(projection, event.participantId);
-        if (participant) participant.displayName = event.displayName;
-        break;
-      }
-      case 'participantParticipationChanged':
-      case 'participantInactive': {
-        const participant = getParticipant(projection, event.participantId);
-        if (!participant) break;
-        const nextActive = event.type === 'participantInactive' ? false : event.active;
-        const epoch = getEpoch(projection, projection.currentEpochId);
-        if (participant.active === nextActive) break;
-        if (!nextActive) {
-          participant.previousEffectiveBalance = getBalance(epoch, participant.id);
-          participant.active = false;
-        } else {
-          const minimum = activeMinimum(projection, epoch);
-          participant.active = true;
-          const rejoinBalance = Math.max(participant.previousEffectiveBalance, minimum);
-          participant.effectiveBalance = rejoinBalance;
-          if (epoch) epoch.balances[participant.id] = rejoinBalance;
-        }
-        participant.participationHistory.push({ timestamp: event.timestamp, active: nextActive });
-        setCurrentEpochValues(projection);
-        break;
-      }
-      case 'participantExclusionChanged': {
-        const participant = getParticipant(projection, event.participantId);
-        if (participant) participant.excluded = event.excluded;
-        break;
-      }
-      case 'drawPrepared':
-        if (!projection.draws.some((draw) => draw.id === event.drawId)) {
-          projection.draws.push({
-            id: event.drawId,
-            epochId: event.epochId,
-            status: 'prepared',
-            preparedAt: event.timestamp,
-            seed: event.seed,
-            mapIndex: event.mapIndex,
-            mapTitle: event.mapTitle,
-            rawParticipantInputs: [...event.rawParticipantInputs],
-            winnerRange: { ...event.winnerRange },
-            skillsEnabled: event.skillsEnabled,
-            fairnessEnabledAtDraw: event.fairnessEnabledAtDraw,
-            policy: { ...event.policy },
-            members: event.members.map((member) => ({ ...member })),
-            entries: event.entries.map((entry) => ({
-              ...entry,
-              memberIds: [...entry.memberIds],
-              marbleIds: [...entry.marbleIds],
-            })),
-            winners: [],
-          });
-        }
-        break;
-      case 'drawConfirmed':
-        applyConfirmedDraw(projection, event);
-        setCurrentEpochValues(projection);
-        break;
-      case 'drawFailed':
-      case 'drawCancelled': {
-        const draw = projection.draws.find((candidate) => candidate.id === event.drawId);
-        if (draw && draw.status === 'prepared') {
-          draw.status = event.type === 'drawFailed' ? 'failed' : 'cancelled';
-          draw.failureReason = event.reason;
-        }
-        break;
-      }
-      case 'drawVoided':
-        applyVoidedDraw(projection, event);
-        setCurrentEpochValues(projection);
-        break;
-    }
-  });
+  events.forEach((event) => applyFairnessEventToProjection(projection, event));
   setCurrentEpochValues(projection);
   return projection;
 }

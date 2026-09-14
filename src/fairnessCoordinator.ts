@@ -1,5 +1,6 @@
 import type { StageDef } from './data/maps';
 import {
+  applyFairnessEvent,
   canUseStrictBalanceEntryFastPath,
   createFairnessCandidateSeed,
   createFairnessExport,
@@ -23,8 +24,10 @@ import {
   validateFairnessExport,
 } from './fairness';
 import { type FairnessEventStore, IndexedDbFairnessStore } from './fairnessStore';
+import type { FairnessWorkerPoolLike } from './fairnessWorkerPool';
 import {
   DEFAULT_HEADLESS_STEP_LIMIT,
+  type HeadlessSimulationOptions,
   type HeadlessSimulationRequest,
   mapMarbleIdsToLabels,
   simulateHeadlessRace,
@@ -53,7 +56,12 @@ export type FairnessStartRequest = Readonly<{
 
 export type FairnessHeadlessSearchRequest = HeadlessSimulationRequest;
 
-export type FairnessHeadlessRunner = (request: FairnessHeadlessSearchRequest) => Promise<readonly number[]>;
+export type FairnessHeadlessRunnerOptions = Readonly<Pick<HeadlessSimulationOptions, 'signal'>>;
+
+export type FairnessHeadlessRunner = (
+  request: FairnessHeadlessSearchRequest,
+  options?: FairnessHeadlessRunnerOptions
+) => Promise<readonly number[]>;
 
 export type FairnessPreparedDraw = Readonly<{
   drawId: string;
@@ -74,6 +82,7 @@ export type FairnessConfirmationResult = Readonly<{
 export type FairnessCoordinatorOptions = Readonly<{
   store?: FairnessEventStore;
   headlessRunner?: FairnessHeadlessRunner;
+  workerPool?: FairnessWorkerPoolLike;
   now?: () => number;
   createId?: (prefix: string) => string;
   createCandidateSeed?: () => Seed;
@@ -114,8 +123,24 @@ type SearchCandidate = SearchResult & Readonly<{ key: string; generation: number
 type SearchWork = Readonly<{
   key: string;
   generation: number;
+  controller: AbortController;
   promise: Promise<SearchResult>;
 }>;
+
+function sameStrings(left: readonly string[], right: readonly string[]): boolean {
+  return left.length === right.length && left.every((value, index) => value === right[index]);
+}
+
+function sameSearchRequest(left: FairnessStartRequest, right: FairnessStartRequest): boolean {
+  return (
+    left.stage === right.stage &&
+    left.mapIndex === right.mapIndex &&
+    sameStrings(left.participantInputs, right.participantInputs) &&
+    left.winnerRange.start === right.winnerRange.start &&
+    left.winnerRange.end === right.winnerRange.end &&
+    left.skillsEnabled === right.skillsEnabled
+  );
+}
 
 const FAIRNESS_PRECOMPUTE_DEBOUNCE_MS = 150;
 
@@ -308,9 +333,10 @@ export function mapMarbleIdsToEntries(
 
 export async function runHeadlessRace(
   request: FairnessHeadlessSearchRequest,
-  stepLimit = DEFAULT_HEADLESS_STEP_LIMIT
+  stepLimit = DEFAULT_HEADLESS_STEP_LIMIT,
+  options: FairnessHeadlessRunnerOptions = {}
 ): Promise<readonly number[]> {
-  const result = await simulateHeadlessRace(request, { stepLimit });
+  const result = await simulateHeadlessRace(request, { stepLimit, signal: options.signal });
   return result.finishedMarbleIds;
 }
 
@@ -328,6 +354,8 @@ export class FairnessCoordinator {
   private readonly createId: (prefix: string) => string;
   private readonly createCandidateSeed: () => Seed;
   private readonly headlessStepLimit: number;
+  private readonly useWorkerPool: boolean;
+  private readonly configuredWorkerPool: FairnessWorkerPoolLike | null;
 
   private events: FairnessEvent[] = [];
   private projection: FairnessProjection = projectFairnessEvents([]);
@@ -345,12 +373,18 @@ export class FairnessCoordinator {
   private operationToken = 0;
   private searchGeneration = 0;
   private cachedCandidate: SearchCandidate | null = null;
+  private cachedContext: FairnessSearchContext | null = null;
   private inFlightSearch: SearchWork | null = null;
+  private workerPoolPromise: Promise<FairnessWorkerPoolLike | null> | null = null;
+  private workerPoolDisabled = false;
   private precomputeTimer: ReturnType<typeof setTimeout> | null = null;
 
   constructor(options: FairnessCoordinatorOptions = {}) {
     this.store = options.store ?? new IndexedDbFairnessStore();
-    this.headlessRunner = options.headlessRunner ?? ((request) => runHeadlessRace(request, options.headlessStepLimit));
+    this.configuredWorkerPool = options.workerPool ?? null;
+    this.useWorkerPool = this.configuredWorkerPool !== null || !options.headlessRunner;
+    this.headlessRunner =
+      options.headlessRunner ?? ((request, runnerOptions) => this.runProductionHeadless(request, runnerOptions));
     this.now = options.now ?? (() => Date.now());
     this.createId = options.createId ?? createFairnessId;
     this.createCandidateSeed = options.createCandidateSeed ?? createFairnessCandidateSeed;
@@ -414,20 +448,67 @@ export class FairnessCoordinator {
     this.precomputeTimer = null;
   }
 
+  private getWorkerPool(): Promise<FairnessWorkerPoolLike | null> {
+    if (this.configuredWorkerPool) return Promise.resolve(this.configuredWorkerPool);
+    if (!this.useWorkerPool || this.workerPoolDisabled) return Promise.resolve(null);
+    if (!this.workerPoolPromise) {
+      this.workerPoolPromise = import('./fairnessWorkerPool')
+        .then(({ FairnessWorkerPool }) => {
+          const workerPool = new FairnessWorkerPool();
+          return workerPool.supported ? workerPool : null;
+        })
+        .catch(() => {
+          this.workerPoolDisabled = true;
+          return null;
+        });
+    }
+    return this.workerPoolPromise;
+  }
+
+  private warmWorkerPool(): void {
+    void this.getWorkerPool()
+      .then((workerPool) => workerPool?.warmUp?.())
+      .catch(() => undefined);
+  }
+
+  private async runProductionHeadless(
+    request: FairnessHeadlessSearchRequest,
+    options: FairnessHeadlessRunnerOptions = {}
+  ): Promise<readonly number[]> {
+    const workerPool = await this.getWorkerPool();
+    if (!workerPool) return runHeadlessRace(request, this.headlessStepLimit, options);
+    try {
+      return await workerPool.run(request, { signal: options.signal, stepLimit: this.headlessStepLimit });
+    } catch (error) {
+      if (error instanceof Error && error.name === 'WorkerPoolUnavailableError') {
+        this.workerPoolDisabled = true;
+        return runHeadlessRace(request, this.headlessStepLimit, options);
+      }
+      throw error;
+    }
+  }
+
   private invalidateSearchState(): void {
+    const staleWork = this.inFlightSearch;
     this.searchGeneration += 1;
     this.cachedCandidate = null;
+    this.cachedContext = null;
     this.clearPrecomputeTimer();
+    staleWork?.controller.abort();
   }
 
   private assertSearchCurrent(generation: number): void {
     if (generation !== this.searchGeneration) throw new FairnessCancelledError();
   }
 
-  setCurrentParticipantInputs(inputs: readonly string[], suppressSync = false): void {
-    this.currentInputs = [...inputs];
-    if (!suppressSync) this.invalidateStart();
+  setCurrentParticipantInputs(inputs: readonly string[], suppressSync = false, skipInvalidation = false): void {
+    const nextInputs = [...inputs];
+    const changed = !sameStrings(this.currentInputs, nextInputs);
+    this.currentInputs = nextInputs;
+    if (!suppressSync && changed && !skipInvalidation) this.invalidateStart();
     if (!this.enabled || suppressSync) return;
+
+    if (!changed) return;
 
     const generation = this.searchGeneration;
 
@@ -445,6 +526,7 @@ export class FairnessCoordinator {
   }
 
   async setEnabled(enabled: boolean): Promise<void> {
+    if (enabled === this.enabled && this.available) return;
     if (!enabled) {
       this.invalidateSearchState();
       this.enabled = false;
@@ -460,6 +542,7 @@ export class FairnessCoordinator {
       this.enabled = true;
       const generation = this.searchGeneration;
       await this.syncCurrentParticipants(false, this.currentInputs, undefined, true, generation);
+      this.warmWorkerPool();
       writeLocalStorage(FAIRNESS_ENABLED_STORAGE_KEY, 'true');
     } catch (error) {
       if (error instanceof FairnessCancelledError) return;
@@ -496,8 +579,11 @@ export class FairnessCoordinator {
   }
 
   async setParticipantExcluded(participantId: string, excluded: boolean): Promise<void> {
-    this.invalidateStart();
     await this.ensureOperational();
+    const current = this.projection.participants.find((candidate) => candidate.id === participantId);
+    if (!current) throw new Error('Fairness participant was not found');
+    if (current.excluded === excluded) return;
+    this.invalidateStart();
     await this.enqueueMutation(async () => {
       await this.ensureEpoch();
       const participant = this.projection.participants.find((candidate) => candidate.id === participantId);
@@ -509,10 +595,13 @@ export class FairnessCoordinator {
   }
 
   async renameParticipant(participantId: string, displayName: string): Promise<void> {
-    this.invalidateStart();
     await this.ensureOperational();
     const trimmedName = displayName.trim();
     if (!trimmedName || trimmedName.length > 512) throw new Error('Fairness participant name is invalid');
+    const current = this.projection.participants.find((candidate) => candidate.id === participantId);
+    if (!current) throw new Error('Fairness participant was not found');
+    if (current.displayName === trimmedName) return;
+    this.invalidateStart();
     await this.enqueueMutation(async () => {
       await this.ensureEpoch();
       const participant = this.projection.participants.find((candidate) => candidate.id === participantId);
@@ -540,13 +629,16 @@ export class FairnessCoordinator {
   }
 
   async voidDraw(drawId: string): Promise<void> {
-    this.invalidateStart();
     await this.ensureLoaded();
     if (!this.available) throw new Error(this.error ?? DEFAULT_RECENT_ERROR);
+    const current = this.projection.draws.find((candidate) => candidate.id === drawId);
+    if (!current) throw new Error('Fairness draw was not found');
+    if (current.status === 'voided') return;
+    if (current.status !== 'confirmed') throw new Error('Only a confirmed fairness draw can be voided');
+    this.invalidateStart();
     await this.enqueueMutation(async () => {
       const draw = this.projection.draws.find((candidate) => candidate.id === drawId);
-      if (!draw) throw new Error('Fairness draw was not found');
-      if (draw.status === 'voided') return;
+      if (!draw || draw.status === 'voided') return;
       if (draw.status !== 'confirmed') throw new Error('Only a confirmed fairness draw can be voided');
       const base = createBaseEvent('drawVoided', this.now, this.createId);
       await this.appendEvent({ ...base, drawId, reason: 'Voided by user' });
@@ -996,6 +1088,14 @@ export class FairnessCoordinator {
     generation = this.searchGeneration
   ): Promise<FairnessSearchContext> {
     await this.ensureOperational();
+    if (
+      this.cachedContext &&
+      this.cachedContext.generation === generation &&
+      sameSearchRequest(this.cachedContext.request, request)
+    ) {
+      if (token !== undefined) this.assertCurrent(token);
+      return this.cachedContext;
+    }
     this.assertSearchCurrent(generation);
     if (token !== undefined) this.assertCurrent(token);
 
@@ -1048,7 +1148,7 @@ export class FairnessCoordinator {
       this.headlessStepLimit
     );
 
-    return {
+    const context = {
       request,
       syncedInputs,
       participants: setup.participants,
@@ -1061,6 +1161,8 @@ export class FairnessCoordinator {
       generation,
       mustSearch: !canUseStrictBalanceEntryFastPath(evaluation),
     };
+    this.cachedContext = context;
+    return context;
   }
 
   private createPreparedEvent(
@@ -1075,8 +1177,15 @@ export class FairnessCoordinator {
     const mapping = mapMarbleIdsToEntries(seed, mappingRows);
     const base = createBaseEvent('drawPrepared', this.now, this.createId);
     const memberIds = [...new Set(syncedInputs.reduce<string[]>((ids, input) => ids.concat(input.memberIds), []))];
+    const participantById = new Map(this.projection.participants.map((participant) => [participant.id, participant]));
+    const marbleIdsByEntryId = new Map<string, number[]>();
+    mapping.forEach((entryId, marbleId) => {
+      const marbleIds = marbleIdsByEntryId.get(entryId) ?? [];
+      marbleIds.push(marbleId);
+      marbleIdsByEntryId.set(entryId, marbleIds);
+    });
     const members: FairnessMemberSnapshot[] = memberIds.map((memberId) => {
-      const participant = this.projection.participants.find((candidate) => candidate.id === memberId);
+      const participant = participantById.get(memberId);
       if (!participant) throw new Error('Fairness participant mapping is unavailable');
       return {
         participantId: memberId,
@@ -1094,7 +1203,7 @@ export class FairnessCoordinator {
       memberIds: [...input.memberIds],
       weight: input.weight,
       count: input.count,
-      marbleIds: [...mapping].filter(([, entryId]) => entryId === input.entryId).map(([marbleId]) => marbleId),
+      marbleIds: marbleIdsByEntryId.get(input.entryId) ?? [],
     }));
 
     if (entries.reduce((total, entry) => total + entry.count, 0) !== totalCount) {
@@ -1133,12 +1242,17 @@ export class FairnessCoordinator {
       return this.inFlightSearch.promise;
     }
 
-    const promise = this.searchForWinner(context, token);
-    const work: SearchWork = { key: context.key, generation: context.generation, promise };
+    const controller = new AbortController();
+    const promise = this.searchForWinner(context, token, controller.signal);
+    const work: SearchWork = { key: context.key, generation: context.generation, controller, promise };
     this.inFlightSearch = work;
     void promise
       .then((result) => {
-        if (this.inFlightSearch === work && this.searchGeneration === context.generation) {
+        if (
+          this.inFlightSearch === work &&
+          this.searchGeneration === context.generation &&
+          !controller.signal.aborted
+        ) {
           this.cachedCandidate = { ...result, key: context.key, generation: context.generation };
         }
       })
@@ -1160,34 +1274,162 @@ export class FairnessCoordinator {
     }
   }
 
-  private async searchForWinner(context: FairnessSearchContext, token?: number): Promise<SearchResult> {
+  private async searchForWinner(
+    context: FairnessSearchContext,
+    token: number | undefined,
+    signal: AbortSignal
+  ): Promise<SearchResult> {
+    if (this.useWorkerPool) {
+      const workerPool = await this.getWorkerPool();
+      if (workerPool) return this.searchForWinnerParallel(context, token, signal, workerPool.concurrency);
+    }
+    return this.searchForWinnerSerial(context, token, signal);
+  }
+
+  private async searchForWinnerParallel(
+    context: FairnessSearchContext,
+    token: number | undefined,
+    signal: AbortSignal,
+    concurrency: number
+  ): Promise<SearchResult> {
+    if (context.budget <= 0) throw new Error('Fairness search has no valid budget');
+
+    const mappingByMarble = (seed: Seed) => mapMarbleIdsToEntries(seed, context.mappingRows);
+    const eligible = new Set(context.eligibleEntryIds);
+    const parallelism = Number.isSafeInteger(concurrency) && concurrency > 0 ? concurrency : 1;
+    const active = new Map<number, { controller: AbortController; promise: Promise<void> }>();
+    const completed = new Map<number, { seed: Seed; winnerMarbleIds?: readonly number[]; error?: unknown }>();
+    let nextAttempt = 0;
+    let nextCommit = 0;
+    let lastError: unknown;
+
+    const startAttempt = (): void => {
+      const attempt = nextAttempt++;
+      const controller = new AbortController();
+      const abortChild = () => controller.abort();
+      signal.addEventListener('abort', abortChild, { once: true });
+      const seed = this.createCandidateSeed();
+      const promise = Promise.resolve()
+        .then(() =>
+          this.headlessRunner(
+            {
+              seed,
+              stage: context.request.stage,
+              participants: context.participants,
+              totalCount: context.totalCount,
+              spawnPositions: context.spawnPositions,
+              skillsEnabled: context.request.skillsEnabled,
+              targetRank: context.request.winnerRange.end,
+            },
+            { signal: controller.signal }
+          )
+        )
+        .then((winnerMarbleIds) => {
+          completed.set(attempt, { seed, winnerMarbleIds });
+        })
+        .catch((error: unknown) => {
+          completed.set(attempt, { seed, error });
+        })
+        .then(
+          () => {
+            signal.removeEventListener('abort', abortChild);
+            active.delete(attempt);
+          },
+          () => {
+            signal.removeEventListener('abort', abortChild);
+            active.delete(attempt);
+          }
+        );
+      active.set(attempt, { controller, promise });
+    };
+
+    while (true) {
+      if (signal.aborted) throw new FairnessCancelledError();
+      this.assertSearchCurrent(context.generation);
+      if (token !== undefined) this.assertCurrent(token);
+
+      while (active.size < parallelism && nextAttempt < context.budget) startAttempt();
+      if (active.size === 0) break;
+      await Promise.race([...active.values()].map(({ promise }) => promise));
+
+      for (; nextCommit < nextAttempt; nextCommit++) {
+        const attempt = nextCommit;
+        const result = completed.get(attempt);
+        if (!result) break;
+        completed.delete(attempt);
+        if (result.error) {
+          if (signal.aborted || result.error instanceof FairnessCancelledError) {
+            throw new FairnessCancelledError();
+          }
+          lastError = result.error;
+          continue;
+        }
+
+        const winnerMarbleIds = result.winnerMarbleIds ?? [];
+        const mapping = mappingByMarble(result.seed);
+        const winnerEntryIds = winnerMarbleIds.map((marbleId) => mapping.get(marbleId));
+        const winnerId = winnerEntryIds[context.request.winnerRange.end];
+        if (winnerId && eligible.has(winnerId)) {
+          active.forEach(({ controller }, higherAttempt) => {
+            if (higherAttempt > attempt) controller.abort();
+          });
+          return {
+            seed: result.seed,
+            winnerMarbleIds: winnerMarbleIds.slice(),
+            winnerEntryIds: winnerEntryIds.filter((id): id is string => id !== undefined),
+          };
+        }
+      }
+
+      if (signal.aborted) throw new FairnessCancelledError();
+      await yieldToHost();
+    }
+
+    if (signal.aborted) throw new FairnessCancelledError();
+    this.assertSearchCurrent(context.generation);
+    if (token !== undefined) this.assertCurrent(token);
+    const detail = lastError instanceof Error ? `: ${lastError.message}` : '';
+    throw new Error(`Fairness could not find an eligible winner within ${context.budget} attempts${detail}`);
+  }
+
+  private async searchForWinnerSerial(
+    context: FairnessSearchContext,
+    token: number | undefined,
+    signal: AbortSignal
+  ): Promise<SearchResult> {
     if (context.budget <= 0) throw new Error('Fairness search has no valid budget');
 
     const mappingByMarble = (seed: Seed) => mapMarbleIdsToEntries(seed, context.mappingRows);
     const eligible = new Set(context.eligibleEntryIds);
     let lastError: unknown;
     for (let attempt = 0; attempt < context.budget; attempt++) {
+      if (signal.aborted) throw new FairnessCancelledError();
       this.assertSearchCurrent(context.generation);
       if (token !== undefined) this.assertCurrent(token);
       const seed = this.createCandidateSeed();
       let winnerMarbleIds: readonly number[];
       try {
-        winnerMarbleIds = await this.headlessRunner({
-          seed,
-          stage: context.request.stage,
-          participants: context.participants,
-          totalCount: context.totalCount,
-          spawnPositions: context.spawnPositions,
-          skillsEnabled: context.request.skillsEnabled,
-          targetRank: context.request.winnerRange.end,
-        });
+        winnerMarbleIds = await this.headlessRunner(
+          {
+            seed,
+            stage: context.request.stage,
+            participants: context.participants,
+            totalCount: context.totalCount,
+            spawnPositions: context.spawnPositions,
+            skillsEnabled: context.request.skillsEnabled,
+            targetRank: context.request.winnerRange.end,
+          },
+          { signal }
+        );
       } catch (error) {
-        if (error instanceof FairnessCancelledError) throw error;
+        if (signal.aborted || error instanceof FairnessCancelledError) throw new FairnessCancelledError();
         lastError = error;
         await yieldToHost();
+        if (signal.aborted) throw new FairnessCancelledError();
         continue;
       }
 
+      if (signal.aborted) throw new FairnessCancelledError();
       this.assertSearchCurrent(context.generation);
       if (token !== undefined) this.assertCurrent(token);
       const mapping = mappingByMarble(seed);
@@ -1201,8 +1443,10 @@ export class FairnessCoordinator {
         };
       }
       await yieldToHost();
+      if (signal.aborted) throw new FairnessCancelledError();
     }
 
+    if (signal.aborted) throw new FairnessCancelledError();
     this.assertSearchCurrent(context.generation);
     if (token !== undefined) this.assertCurrent(token);
     const detail = lastError instanceof Error ? `: ${lastError.message}` : '';
@@ -1250,7 +1494,7 @@ export class FairnessCoordinator {
       throw error;
     }
     this.events.push(clone(event));
-    this.projection = projectFairnessEvents(this.events);
+    this.projection = applyFairnessEvent(this.projection, event);
   }
 
   private markUnavailable(error: unknown): void {

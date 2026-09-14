@@ -19,7 +19,15 @@ export type HeadlessSimulationRequest = Readonly<{
 
 export type HeadlessSimulationOptions = Readonly<{
   stepLimit?: number;
+  signal?: AbortSignal;
 }>;
+
+export class HeadlessSimulationCancelledError extends Error {
+  constructor() {
+    super('Headless simulation was cancelled');
+    this.name = 'HeadlessSimulationCancelledError';
+  }
+}
 
 export type HeadlessSimulationResult = Readonly<{
   finishedMarbleIds: readonly number[];
@@ -32,6 +40,10 @@ function validateStepLimit(stepLimit: number): void {
   }
 }
 
+function throwIfAborted(signal: AbortSignal | undefined): void {
+  if (signal?.aborted) throw new HeadlessSimulationCancelledError();
+}
+
 /**
  * Run the authoritative RaceSimulation loop without any renderer or UI.
  * `stepLimit` limits host advances, preserving the existing fairness runner
@@ -42,20 +54,29 @@ export async function simulateHeadlessRace(
   options: HeadlessSimulationOptions = {}
 ): Promise<HeadlessSimulationResult> {
   const stepLimit = options.stepLimit ?? DEFAULT_HEADLESS_STEP_LIMIT;
+  const signal = options.signal;
   validateStepLimit(stepLimit);
+  throwIfAborted(signal);
 
   const simulation = new RaceSimulation(undefined, request.seed);
   try {
+    throwIfAborted(signal);
     await simulation.init();
+    throwIfAborted(signal);
     simulation.loadStage(request.stage);
+    throwIfAborted(signal);
     simulation.setSkillsEnabled(request.skillsEnabled);
+    throwIfAborted(signal);
     simulation.replaceMarbles(request.participants, request.totalCount, [...request.spawnPositions]);
+    throwIfAborted(signal);
     simulation.start();
+    throwIfAborted(signal);
 
     const finishedMarbleIds: number[] = [];
     let steps = 0;
     let advances = 0;
     while (finishedMarbleIds.length <= request.targetRank && advances < stepLimit) {
+      throwIfAborted(signal);
       simulation.advance(80, 1, 1, {
         onImpact() {},
         onFinish(marble) {
@@ -68,8 +89,10 @@ export async function simulateHeadlessRace(
           steps++;
         },
       });
+      throwIfAborted(signal);
       advances++;
       if (advances % 16 === 0) await yieldToHost();
+      if (advances % 16 === 0) throwIfAborted(signal);
     }
 
     if (finishedMarbleIds.length <= request.targetRank) {
