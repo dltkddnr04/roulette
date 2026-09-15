@@ -9,9 +9,18 @@ export interface IPhysics {
 
   clearMarbles(): void;
 
+  /** Remove at most `limit` marble bodies. Returns true when complete. */
+  clearMarblesBatch?(limit: number): boolean;
+
   resetWorld(): void;
 
   loadStage(stage: StageDef): void;
+
+  /** Begin a stage load that can be continued in bounded batches. */
+  beginStageLoad?(stage: StageDef): void;
+
+  /** Create at most `limit` stage fixture work units. Returns true when complete. */
+  loadStageEntityBatch?(limit: number): boolean;
 
   createMarble(id: number, x: number, y: number): void;
 

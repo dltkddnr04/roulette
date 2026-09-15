@@ -23,6 +23,8 @@ export type RoundFinish = {
 };
 
 export const MAX_MARBLES = 1000;
+export const MARBLE_CLEANUP_BATCH_SIZE = 64;
+export const STAGE_PREPARATION_BATCH_SIZE = 32;
 
 function clipWinnerRange(start: number, end: number, marbleCount: number): { start: number; end: number } {
   const last = Math.max(0, marbleCount - 1);
@@ -43,6 +45,11 @@ type AuthoritativeStandby = Readonly<{
   layout: MarbleSpawnLayout;
   count: number;
 }>;
+
+type DeferredSimulationCleanup = {
+  simulation: RaceSimulation;
+  disposeAfterClear: boolean;
+};
 
 export class RoundSession {
   private simulation: RaceSimulation;
@@ -66,7 +73,7 @@ export class RoundSession {
     skillsEnabled: boolean;
     participantInputs: readonly string[];
   } | null = null;
-  private deferredCleanup: RaceSimulation | null = null;
+  private deferredCleanup: DeferredSimulationCleanup[] = [];
   private deferredCleanupCancel: (() => void) | null = null;
 
   constructor(simulation = new RaceSimulation()) {
@@ -121,6 +128,7 @@ export class RoundSession {
 
   loadStage(stage: StageDef): void {
     this.discardAuthoritativeStandby();
+    if (this.hasDeferredCleanup(this.simulation) || this.simulation.getCount() > 0) this.clearCurrentMarbles();
     this.stage = stage;
     this.simulation.loadStage(stage);
   }
@@ -253,14 +261,22 @@ export class RoundSession {
           simulation.dispose();
           return null;
         }
-        simulation.loadStage(stage);
+        const stageComplete = await simulation.loadStageChunked(
+          stage,
+          STAGE_PREPARATION_BATCH_SIZE,
+          () => requestId === this.standbyRequestId && this.state !== 'running'
+        );
+        if (!stageComplete) {
+          simulation.dispose();
+          return null;
+        }
         simulation.setSkillsEnabled(skillsEnabled);
         // Keep stage/entity preparation and marble-body creation in separate
         // host tasks. A stale standby can then be retired before any marble
         // bodies are created, and a large standby build does not monopolize
         // the task that loaded the map.
         await yieldToHost();
-        if (requestId !== this.standbyRequestId || this.state === 'running') {
+        if (requestId !== this.standbyRequestId || (this.state !== 'ready' && this.state !== 'finished')) {
           simulation.dispose();
           return null;
         }
@@ -277,7 +293,7 @@ export class RoundSession {
           simulation.dispose();
           return null;
         }
-        if (requestId !== this.standbyRequestId || this.state === 'running') {
+        if (requestId !== this.standbyRequestId || (this.state !== 'ready' && this.state !== 'finished')) {
           simulation.dispose();
           return null;
         }
@@ -440,7 +456,7 @@ export class RoundSession {
   }
 
   advance(frameDelta: number, speed: number, fastForwardSpeed: number, callbacks: RoundStepCallbacks): number {
-    if (this.state === 'finished' || this.deferredCleanup === this.simulation) return 0;
+    if (this.state === 'finished' || this.hasDeferredCleanup(this.simulation)) return 0;
     const simulationCallbacks: SimulationStepCallbacks = {
       onImpact: callbacks.onImpact,
       onFinish: (marble) => {
@@ -550,7 +566,7 @@ export class RoundSession {
     // cleanup is pending, leave those bodies owned by the deferred cleanup so
     // Shuffle itself never pays their DestroyBody cost.
     if (chooseNewSeed) this.discardAuthoritativeStandby();
-    if (this.simulation.getCount() > 0 && this.deferredCleanup !== this.simulation) {
+    if (this.simulation.getCount() > 0 && !this.hasDeferredCleanup(this.simulation)) {
       this.simulation.clearMarbles();
     }
     this.simulation.resetTiming();
@@ -583,88 +599,98 @@ export class RoundSession {
 
   private deferMarbleCleanup(): void {
     const simulation = this.simulation;
-    if (this.deferredCleanup === simulation) return;
-    const previous = this.cancelDeferredCleanup();
-    previous?.dispose();
-    this.deferredCleanup = simulation;
-    const cleanup = () => {
-      if (this.deferredCleanup !== simulation) return;
-      this.deferredCleanup = null;
-      this.deferredCleanupCancel = null;
-      if (this.simulation === simulation) simulation.clearMarbles();
-      else simulation.dispose();
-    };
-    const idleScheduler = (
-      globalThis as typeof globalThis & {
-        requestIdleCallback?: (callback: () => void, options?: { timeout?: number }) => number;
-        cancelIdleCallback?: (handle: number) => void;
-        requestAnimationFrame?: (callback: () => void) => number;
-        cancelAnimationFrame?: (handle: number) => void;
-      }
-    ).requestIdleCallback;
-    if (typeof idleScheduler === 'function') {
-      const handle = idleScheduler(cleanup, { timeout: 1000 });
-      this.deferredCleanupCancel = () => {
-        globalThis.cancelIdleCallback?.(handle);
-      };
-      return;
-    }
-    const frameScheduler = (
-      globalThis as typeof globalThis & { requestAnimationFrame?: (callback: () => void) => number }
-    ).requestAnimationFrame;
-    if (typeof frameScheduler === 'function') {
-      const handle = frameScheduler(cleanup);
-      this.deferredCleanupCancel = () => {
-        globalThis.cancelAnimationFrame?.(handle);
-      };
-      return;
-    }
-    const timer = setTimeout(cleanup, 0);
-    this.deferredCleanupCancel = () => clearTimeout(timer);
+    if (this.hasDeferredCleanup(simulation)) return;
+    this.deferredCleanup.push({ simulation, disposeAfterClear: false });
+    this.scheduleDeferredCleanup();
   }
 
   private flushDeferredCleanup(): void {
-    const simulation = this.cancelDeferredCleanup();
-    if (!simulation) return;
-    if (this.simulation === simulation) simulation.clearMarbles();
-    else simulation.dispose();
+    const index = this.deferredCleanup.findIndex(({ simulation }) => simulation === this.simulation);
+    if (index < 0) return;
+    this.cancelDeferredCleanupSchedule();
+    const [cleanup] = this.deferredCleanup.splice(index, 1);
+    cleanup.simulation.clearMarbles();
+    this.scheduleDeferredCleanup();
   }
 
   private clearCurrentMarbles(): void {
-    const deferred = this.deferredCleanup === this.simulation;
+    const deferred = this.hasDeferredCleanup(this.simulation);
     this.flushDeferredCleanup();
     if (!deferred) this.simulation.clearMarbles();
   }
 
-  private cancelDeferredCleanup(): RaceSimulation | null {
-    const simulation = this.deferredCleanup;
-    if (!simulation) return null;
-    this.deferredCleanup = null;
+  private cancelDeferredCleanupSchedule(): void {
+    if (!this.deferredCleanupCancel) return;
     this.deferredCleanupCancel?.();
     this.deferredCleanupCancel = null;
-    return simulation;
   }
 
   private retireSimulation(simulation: RaceSimulation): void {
     if (simulation === this.simulation) return;
-    // A finished simulation may already be owned by the deferred-cleanup
-    // scheduler. Transfer that ownership before scheduling disposal so one
-    // world cannot be disposed by two callbacks after standby adoption.
-    this.cancelDeferredCleanupIf(simulation);
-    const dispose = () => simulation.dispose();
-    const idleScheduler = (
-      globalThis as typeof globalThis & {
-        requestIdleCallback?: (callback: () => void) => unknown;
-      }
-    ).requestIdleCallback;
-    if (typeof idleScheduler === 'function') idleScheduler(dispose);
-    else if (typeof setTimeout === 'function') setTimeout(dispose, 0);
-    else dispose();
+    const existing = this.deferredCleanup.find(({ simulation: candidate }) => candidate === simulation);
+    if (existing) {
+      existing.disposeAfterClear = true;
+      return;
+    }
+    this.deferredCleanup.push({ simulation, disposeAfterClear: true });
+    this.scheduleDeferredCleanup();
   }
 
-  private cancelDeferredCleanupIf(simulation: RaceSimulation): void {
-    if (this.deferredCleanup !== simulation) return;
-    this.cancelDeferredCleanup();
+  private hasDeferredCleanup(simulation: RaceSimulation): boolean {
+    return this.deferredCleanup.some(({ simulation: candidate }) => candidate === simulation);
+  }
+
+  private scheduleDeferredCleanup(): void {
+    if (this.deferredCleanupCancel || this.deferredCleanup.length === 0) return;
+    this.deferredCleanupCancel = this.scheduleLowPriority(() => {
+      this.deferredCleanupCancel = null;
+      this.runDeferredCleanupBatch();
+    });
+  }
+
+  private runDeferredCleanupBatch(): void {
+    const cleanup = this.deferredCleanup[0];
+    if (!cleanup) return;
+
+    const complete = cleanup.simulation.clearMarblesBatch(MARBLE_CLEANUP_BATCH_SIZE);
+    if (!complete) {
+      this.scheduleDeferredCleanup();
+      return;
+    }
+
+    this.deferredCleanup.shift();
+    if (cleanup.disposeAfterClear || cleanup.simulation !== this.simulation) cleanup.simulation.dispose();
+    this.scheduleDeferredCleanup();
+  }
+
+  /**
+   * Run one low-priority slice after a paint opportunity when rAF is the only
+   * browser scheduling primitive available. The callback itself never does
+   * cleanup directly from the rAF turn.
+   */
+  private scheduleLowPriority(callback: () => void): () => void {
+    const scope = globalThis as typeof globalThis & {
+      requestIdleCallback?: (callback: () => void, options?: { timeout?: number }) => number;
+      cancelIdleCallback?: (handle: number) => void;
+      requestAnimationFrame?: (callback: () => void) => number;
+      cancelAnimationFrame?: (handle: number) => void;
+    };
+    if (typeof scope.requestIdleCallback === 'function') {
+      const handle = scope.requestIdleCallback(callback, { timeout: 1000 });
+      return () => scope.cancelIdleCallback?.(handle);
+    }
+    if (typeof scope.requestAnimationFrame === 'function') {
+      let timer: ReturnType<typeof setTimeout> | null = null;
+      const frame = scope.requestAnimationFrame(() => {
+        timer = setTimeout(callback, 0);
+      });
+      return () => {
+        scope.cancelAnimationFrame?.(frame);
+        if (timer !== null) clearTimeout(timer);
+      };
+    }
+    const timer = setTimeout(callback, 0);
+    return () => clearTimeout(timer);
   }
 }
 

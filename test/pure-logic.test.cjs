@@ -2481,6 +2481,128 @@ function marbleForEntry(seed, entryIds) {
   return Array.from(mapping.entries()).find(([, participantId]) => participantId === entryIds[entryIds.length - 1])[0];
 }
 
+function deferred() {
+  let resolve;
+  let reject;
+  const promise = new Promise((promiseResolve, promiseReject) => {
+    resolve = promiseResolve;
+    reject = promiseReject;
+  });
+  return { promise, resolve, reject };
+}
+
+function createReadyControlledWorkerPool() {
+  let readyConcurrency = 1;
+  const readinessWaiters = new Set();
+  const attemptGates = new Map();
+  const attemptStarted = new Map();
+  const attemptCancelled = new Map();
+  const calls = [];
+  const completionOrder = [];
+
+  const getGate = (gates, seed) => {
+    let gate = gates.get(seed);
+    if (!gate) {
+      gate = deferred();
+      gates.set(seed, gate);
+    }
+    return gate;
+  };
+
+  const settleReadinessWaiter = (waiter, error = null) => {
+    if (!readinessWaiters.delete(waiter)) return;
+    waiter.removeAbortListener?.();
+    waiter.removeAbortListener = null;
+    if (error) waiter.gate.reject(error);
+    else waiter.gate.resolve();
+  };
+
+  const pool = {
+    concurrency: 3,
+    get readyConcurrency() {
+      return readyConcurrency;
+    },
+    get waiterCount() {
+      return readinessWaiters.size;
+    },
+    get waiterMinimums() {
+      return [...readinessWaiters].map(({ minimum }) => minimum);
+    },
+    calls,
+    completionOrder,
+    waitForReadyConcurrency(minimum, signal) {
+      if (signal?.aborted) return Promise.reject(new HeadlessSimulationCancelledError());
+      if (readyConcurrency >= minimum) return Promise.resolve();
+
+      const waiter = {
+        minimum,
+        gate: deferred(),
+        removeAbortListener: null,
+      };
+      readinessWaiters.add(waiter);
+      if (signal) {
+        const onAbort = () => settleReadinessWaiter(waiter, new HeadlessSimulationCancelledError());
+        signal.addEventListener('abort', onAbort, { once: true });
+        waiter.removeAbortListener = () => signal.removeEventListener('abort', onAbort);
+        if (signal.aborted) onAbort();
+      }
+      if (readyConcurrency >= minimum) settleReadinessWaiter(waiter);
+      return waiter.gate.promise;
+    },
+    setReadyConcurrency(nextReadyConcurrency) {
+      readyConcurrency = nextReadyConcurrency;
+      [...readinessWaiters].forEach((waiter) => {
+        if (readyConcurrency >= waiter.minimum) settleReadinessWaiter(waiter);
+      });
+    },
+    waitForAttempt(seed) {
+      return getGate(attemptStarted, seed).promise;
+    },
+    waitForCancellation(seed) {
+      return getGate(attemptCancelled, seed).promise;
+    },
+    resolveAttempt(seed, winnerMarbleIds) {
+      const gate = attemptGates.get(seed);
+      if (!gate) throw new Error(`Attempt ${seed} has not started`);
+      completionOrder.push(seed);
+      gate.resolve(winnerMarbleIds);
+    },
+    run(request, options) {
+      const { seed } = request;
+      const gate = deferred();
+      attemptGates.set(seed, gate);
+      calls.push({ request, options });
+      getGate(attemptStarted, seed).resolve();
+
+      let settled = false;
+      const cancelled = getGate(attemptCancelled, seed);
+      const onAbort = () => {
+        if (settled) return;
+        settled = true;
+        options.signal?.removeEventListener('abort', onAbort);
+        cancelled.resolve();
+        gate.reject(new HeadlessSimulationCancelledError());
+      };
+      options.signal?.addEventListener('abort', onAbort, { once: true });
+      if (options.signal?.aborted) onAbort();
+
+      return gate.promise.then(
+        (result) => {
+          settled = true;
+          options.signal?.removeEventListener('abort', onAbort);
+          return result;
+        },
+        (error) => {
+          settled = true;
+          options.signal?.removeEventListener('abort', onAbort);
+          throw error;
+        }
+      );
+    },
+  };
+  return pool;
+}
+
 async function createUnbalancedSearchCoordinator(headlessRunner, createCandidateSeed, workerPool) {
   let id = 0;
   const store = new InMemoryFairnessStore();
@@ -3004,6 +3126,101 @@ test('parallel fairness search keeps the speculative window bounded', async () =
   assert.equal(calls.length, 6);
   assert.deepEqual(calls.slice(0, 3), ['bounded-0', 'bounded-1', 'bounded-2']);
   assert.deepEqual(calls.slice(3), ['bounded-3', 'bounded-4', 'bounded-5']);
+});
+
+test('parallel fairness search grows only with ready workers and commits lower attempts first', async () => {
+  const seeds = ['ready-0', 'ready-1', 'ready-2'];
+  const workerPool = createReadyControlledWorkerPool();
+  const { coordinator, stage } = await createUnbalancedSearchCoordinator(undefined, () => seeds.shift(), workerPool);
+  const pending = coordinator.prepareDraw(searchTestRequest(stage, ['A', 'B']), coordinator.beginStart());
+  const assertWindow = (nextCommit) => {
+    const nextAttempt = workerPool.calls.length;
+    assert.ok(nextAttempt - nextCommit <= workerPool.readyConcurrency);
+  };
+
+  await workerPool.waitForAttempt('ready-0');
+  assert.equal(workerPool.readyConcurrency, 1);
+  assert.deepEqual(
+    workerPool.calls.map(({ request }, index) => ({ index, seed: request.seed })),
+    [{ index: 0, seed: 'ready-0' }]
+  );
+  assert.equal(workerPool.waiterCount, 1);
+  assert.deepEqual(workerPool.waiterMinimums, [2]);
+  // No result has committed at this gate, so nextCommit is still zero.
+  assertWindow(0);
+
+  workerPool.setReadyConcurrency(2);
+  await workerPool.waitForAttempt('ready-1');
+  assert.equal(workerPool.readyConcurrency, 2);
+  assert.deepEqual(
+    workerPool.calls.map(({ request }, index) => ({ index, seed: request.seed })),
+    [
+      { index: 0, seed: 'ready-0' },
+      { index: 1, seed: 'ready-1' },
+    ]
+  );
+  assert.equal(workerPool.waiterCount, 1);
+  assert.deepEqual(workerPool.waiterMinimums, [3]);
+  assertWindow(0);
+
+  workerPool.setReadyConcurrency(3);
+  await workerPool.waitForAttempt('ready-2');
+  assert.equal(workerPool.readyConcurrency, 3);
+  assert.deepEqual(
+    workerPool.calls.map(({ request }, index) => ({ index, seed: request.seed })),
+    [
+      { index: 0, seed: 'ready-0' },
+      { index: 1, seed: 'ready-1' },
+      { index: 2, seed: 'ready-2' },
+    ]
+  );
+  assert.equal(workerPool.waiterCount, 0);
+  assert.deepEqual(workerPool.waiterMinimums, []);
+  assertWindow(0);
+
+  // Attempt 1 is eligible and completes before the lower-index attempt 0.
+  // Attempt 2 is also eligible in principle, but must be cancelled once 1
+  // becomes the serial-equivalent winner after attempt 0 is committed.
+  workerPool.resolveAttempt('ready-1', [marbleForEntry('ready-1', ['entry-0', 'entry-1'])]);
+  workerPool.resolveAttempt('ready-0', [marbleForEntry('ready-0', ['entry-0'])]);
+
+  const prepared = await pending;
+  assert.equal(prepared.seed, 'ready-1');
+  await workerPool.waitForCancellation('ready-2');
+  assertWindow(2);
+  assert.deepEqual(workerPool.completionOrder, ['ready-1', 'ready-0']);
+  assert.deepEqual(
+    workerPool.calls.map(({ request }) => request.seed),
+    ['ready-0', 'ready-1', 'ready-2']
+  );
+  assert.equal(workerPool.calls[2].options.signal.aborted, true);
+});
+
+test('parallel fairness search aborts a pending readiness wait as cancellation', async () => {
+  const workerPool = createReadyControlledWorkerPool();
+  const { coordinator, stage } = await createUnbalancedSearchCoordinator(undefined, () => 'ready-abort-0', workerPool);
+  const pending = coordinator
+    .prepareDraw(searchTestRequest(stage, ['A', 'B']), coordinator.beginStart())
+    .catch((error) => error);
+
+  await workerPool.waitForAttempt('ready-abort-0');
+  assert.equal(workerPool.waiterCount, 1);
+  assert.deepEqual(workerPool.waiterMinimums, [2]);
+  assert.deepEqual(
+    workerPool.calls.map(({ request }) => request.seed),
+    ['ready-abort-0']
+  );
+
+  coordinator.invalidateStart();
+  const error = await pending;
+  await workerPool.waitForCancellation('ready-abort-0');
+
+  assert.ok(error instanceof Error);
+  assert.match(error.message, /cancel/i);
+  assert.equal(error instanceof WorkerPoolUnavailableError, false);
+  assert.notEqual(error.name, 'WorkerPoolUnavailableError');
+  assert.equal(workerPool.waiterCount, 0);
+  assert.deepEqual(workerPool.waiterMinimums, []);
 });
 
 test('worker infrastructure failure falls back to one serial main-thread search', async () => {

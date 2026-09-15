@@ -179,6 +179,47 @@ export class RaceSimulation {
     this.resetInterpolationSnapshots();
   }
 
+  /**
+   * Load a stage through the optional physics preparation primitives. The
+   * synchronous loadStage() API remains the authoritative compatibility path;
+   * standby callers use this version to yield between bounded fixture batches.
+   */
+  async loadStageChunked(
+    stage: StageDef,
+    batchSize = 32,
+    shouldContinue: () => boolean = () => true
+  ): Promise<boolean> {
+    if (!shouldContinue()) return false;
+    this.stage = stage;
+    const beginStageLoad = this.physics.beginStageLoad;
+    const loadStageEntityBatch = this.physics.loadStageEntityBatch;
+    if (!beginStageLoad || !loadStageEntityBatch) {
+      this.physics.loadStage(stage);
+      if (!shouldContinue()) return false;
+      this.resetInterpolationSnapshots();
+      return true;
+    }
+
+    beginStageLoad.call(this.physics, stage);
+    if (!shouldContinue()) return false;
+    await yieldToHost();
+    if (!shouldContinue()) return false;
+
+    const effectiveBatchSize = Math.max(1, Math.floor(batchSize));
+    let complete = false;
+    while (!complete) {
+      if (!shouldContinue()) return false;
+      complete = loadStageEntityBatch.call(this.physics, effectiveBatchSize);
+      if (complete) break;
+      if (!shouldContinue()) return false;
+      await yieldToHost();
+    }
+
+    if (!shouldContinue()) return false;
+    this.resetInterpolationSnapshots();
+    return shouldContinue();
+  }
+
   replaceMarbles(
     participants: readonly MarbleParticipant[],
     totalCount: number,
@@ -243,6 +284,22 @@ export class RaceSimulation {
     this.marbles = [];
     this.previousMarbleTransforms.clear();
     this.currentMarbleTransforms.clear();
+  }
+
+  /** Remove one bounded batch of marble bodies, retaining atomic compatibility. */
+  clearMarblesBatch(limit: number): boolean {
+    const clearMarblesBatch = this.physics.clearMarblesBatch;
+    if (!clearMarblesBatch) {
+      this.clearMarbles();
+      return true;
+    }
+    const complete = clearMarblesBatch.call(this.physics, limit);
+    if (complete) {
+      this.marbles = [];
+      this.previousMarbleTransforms.clear();
+      this.currentMarbleTransforms.clear();
+    }
+    return complete;
   }
 
   resetTiming(): void {

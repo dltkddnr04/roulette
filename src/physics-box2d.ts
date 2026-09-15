@@ -8,6 +8,20 @@ import type { RandomSource } from './utils/random';
 
 type Box2DModule = typeof Box2D & EmscriptenModule;
 
+type PendingStageEntity = {
+  entity: MapEntity;
+  body: Box2D.b2Body;
+  fixtureDef: Box2D.b2FixtureDef;
+  nextPolylineSegment: number;
+  fixtureCreated: boolean;
+};
+
+type StageLoadState = {
+  entities: readonly MapEntity[];
+  entityIndex: number;
+  pendingEntity: PendingStageEntity | null;
+};
+
 let box2dModulePromise: Promise<Box2DModule> | null = null;
 
 function loadBox2D(): Promise<Box2DModule> {
@@ -27,11 +41,15 @@ export class Box2dPhysics implements IPhysics {
   private worldDestroyed = false;
 
   private marbleMap: { [id: number]: Box2D.b2Body } = {};
+  private marbleCleanupIds: number[] | null = null;
+  private marbleCleanupIndex = 0;
   private entities: {
     body: Box2D.b2Body;
     renderState: MapEntityRenderState;
     destroyOnContact: boolean;
   }[] = [];
+
+  private stageLoadState: StageLoadState | null = null;
 
   private deleteCandidates: Box2D.b2Body[] = [];
 
@@ -45,13 +63,46 @@ export class Box2dPhysics implements IPhysics {
   }
 
   clearMarbles(): void {
-    Object.values(this.marbleMap).forEach((body) => {
+    this.beginClearMarbles();
+    while (!this.clearMarblesBatch(Number.POSITIVE_INFINITY)) {
+      // The unbounded compatibility API intentionally keeps its historical
+      // synchronous behavior. Deferred callers use clearMarblesBatch().
+    }
+  }
+
+  clearMarblesBatch(limit: number): boolean {
+    this.beginClearMarbles();
+    const batchSize = Number.isFinite(limit) ? Math.max(1, Math.floor(limit)) : Number.MAX_SAFE_INTEGER;
+    const ids = this.marbleCleanupIds!;
+    let removed = 0;
+    while (this.marbleCleanupIndex < ids.length && removed < batchSize) {
+      const id = ids[this.marbleCleanupIndex++];
+      const body = this.marbleMap[id];
+      if (!body) continue;
       this.world.DestroyBody(body);
-    });
-    this.marbleMap = {};
+      delete this.marbleMap[id];
+      removed++;
+    }
+
+    if (this.marbleCleanupIndex >= ids.length) {
+      this.marbleCleanupIds = null;
+      this.marbleCleanupIndex = 0;
+      this.marbleMap = {};
+      return true;
+    }
+    return false;
+  }
+
+  private beginClearMarbles(): void {
+    if (this.marbleCleanupIds) return;
+    this.marbleCleanupIds = Object.keys(this.marbleMap).map(Number);
+    this.marbleCleanupIndex = 0;
   }
 
   resetWorld(): void {
+    this.stageLoadState = null;
+    this.marbleCleanupIds = null;
+    this.marbleCleanupIndex = 0;
     this.marbleMap = {};
     this.entities = [];
     this.deleteCandidates = [];
@@ -67,6 +118,9 @@ export class Box2dPhysics implements IPhysics {
   }
 
   dispose(): void {
+    this.stageLoadState = null;
+    this.marbleCleanupIds = null;
+    this.marbleCleanupIndex = 0;
     this.marbleMap = {};
     this.entities = [];
     this.deleteCandidates = [];
@@ -77,73 +131,135 @@ export class Box2dPhysics implements IPhysics {
   }
 
   loadStage(stage: StageDef): void {
-    this.resetWorld();
-    this.createEntities(stage.entities);
+    this.beginStageLoad(stage);
+    while (!this.loadStageEntityBatch(Number.POSITIVE_INFINITY)) {
+      // The unbounded compatibility API intentionally keeps its historical
+      // synchronous behavior. Standby preparation uses bounded batches.
+    }
   }
 
-  private createEntities(entities?: MapEntity[]) {
-    if (!entities) return;
+  beginStageLoad(stage: StageDef): void {
+    this.resetWorld();
+    this.stageLoadState = {
+      entities: stage.entities ?? [],
+      entityIndex: 0,
+      pendingEntity: null,
+    };
+  }
 
+  loadStageEntityBatch(limit: number): boolean {
+    const state = this.stageLoadState;
+    if (!state) return true;
+
+    const batchSize = Number.isFinite(limit) ? Math.max(1, Math.floor(limit)) : Number.MAX_SAFE_INTEGER;
+    let work = 0;
+    while (state.entityIndex < state.entities.length && work < batchSize) {
+      if (!state.pendingEntity) state.pendingEntity = this.beginStageEntity(state.entities[state.entityIndex]);
+      const pending = state.pendingEntity;
+
+      if (pending.entity.shape.type === 'polyline') {
+        const lastSegment = pending.entity.shape.points.length - 1;
+        if (pending.nextPolylineSegment < lastSegment) {
+          this.createPolylineFixture(pending);
+          pending.nextPolylineSegment++;
+          work++;
+        }
+        if (pending.nextPolylineSegment >= lastSegment) this.finishStageEntity(state, pending);
+        continue;
+      }
+
+      if (!pending.fixtureCreated) {
+        this.createSingleFixture(pending);
+        pending.fixtureCreated = true;
+        work++;
+      }
+      this.finishStageEntity(state, pending);
+    }
+
+    if (state.entityIndex >= state.entities.length && !state.pendingEntity) {
+      this.stageLoadState = null;
+      return true;
+    }
+    return false;
+  }
+
+  private beginStageEntity(entity: MapEntity): PendingStageEntity {
     const bodyTypes = {
       static: this.Box2D.b2_staticBody,
       kinematic: this.Box2D.b2_kinematicBody,
     } as const;
 
-    entities.forEach((entity) => {
-      const bodyDef = new this.Box2D.b2BodyDef();
-      bodyDef.set_type(bodyTypes[entity.type]);
-      const body = this.world.CreateBody(bodyDef);
+    const bodyDef = new this.Box2D.b2BodyDef();
+    bodyDef.set_type(bodyTypes[entity.type]);
+    const body = this.world.CreateBody(bodyDef);
+    const fixtureDef = new this.Box2D.b2FixtureDef();
+    fixtureDef.set_restitution(entity.props.restitution);
+    return {
+      entity,
+      body,
+      fixtureDef,
+      nextPolylineSegment: 0,
+      fixtureCreated: false,
+    };
+  }
 
-      const fixtureDef = new this.Box2D.b2FixtureDef();
-      fixtureDef.set_restitution(entity.props.restitution);
-
-      let shape;
-      switch (entity.shape.type) {
-        case 'box':
-          shape = new this.Box2D.b2PolygonShape();
-          shape.SetAsBox(entity.shape.halfWidth, entity.shape.halfHeight, 0, entity.shape.rotation);
-          fixtureDef.set_shape(shape);
-          body.CreateFixture(fixtureDef);
-          break;
-        case 'polyline':
-          for (let i = 0; i < entity.shape.points.length - 1; i++) {
-            const p1 = entity.shape.points[i];
-            const p2 = entity.shape.points[i + 1];
-            const v1 = new this.Box2D.b2Vec2(p1[0], p1[1]);
-            const v2 = new this.Box2D.b2Vec2(p2[0], p2[1]);
-            const edge = new this.Box2D.b2EdgeShape();
-            edge.SetTwoSided(v1, v2);
-            fixtureDef.set_shape(edge);
-            body.CreateFixture(fixtureDef);
-          }
-          break;
-        case 'circle':
-          shape = new this.Box2D.b2CircleShape();
-          shape.set_m_radius(entity.shape.radius);
-          fixtureDef.set_shape(shape);
-          body.CreateFixture(fixtureDef);
-          break;
+  private createSingleFixture(pending: PendingStageEntity): void {
+    const { entity, body, fixtureDef } = pending;
+    switch (entity.shape.type) {
+      case 'box': {
+        const shape = new this.Box2D.b2PolygonShape();
+        shape.SetAsBox(entity.shape.halfWidth, entity.shape.halfHeight, 0, entity.shape.rotation);
+        fixtureDef.set_shape(shape);
+        body.CreateFixture(fixtureDef);
+        break;
       }
-
-      if (entity.props.angularVelocity !== undefined) {
-        body.SetAngularVelocity(entity.props.angularVelocity);
+      case 'circle': {
+        const shape = new this.Box2D.b2CircleShape();
+        shape.set_m_radius(entity.shape.radius);
+        fixtureDef.set_shape(shape);
+        body.CreateFixture(fixtureDef);
+        break;
       }
-      body.SetTransform(new this.Box2D.b2Vec2(entity.position.x, entity.position.y), 0);
-      this.entities.push({
-        body,
-        renderState: {
-          id: this.entities.length,
-          x: entity.position.x,
-          y: entity.position.y,
-          angle: 0,
-          shape: entity.shape,
-        },
-        destroyOnContact: entity.props.destroyOnContact ?? false,
-      });
+    }
+  }
+
+  private createPolylineFixture(pending: PendingStageEntity): void {
+    if (pending.entity.shape.type !== 'polyline') return;
+    const { points } = pending.entity.shape;
+    const index = pending.nextPolylineSegment;
+    const p1 = points[index];
+    const p2 = points[index + 1];
+    const v1 = new this.Box2D.b2Vec2(p1[0], p1[1]);
+    const v2 = new this.Box2D.b2Vec2(p2[0], p2[1]);
+    const edge = new this.Box2D.b2EdgeShape();
+    edge.SetTwoSided(v1, v2);
+    pending.fixtureDef.set_shape(edge);
+    pending.body.CreateFixture(pending.fixtureDef);
+  }
+
+  private finishStageEntity(state: StageLoadState, pending: PendingStageEntity): void {
+    const { entity, body } = pending;
+    if (entity.props.angularVelocity !== undefined) body.SetAngularVelocity(entity.props.angularVelocity);
+    body.SetTransform(new this.Box2D.b2Vec2(entity.position.x, entity.position.y), 0);
+    this.entities.push({
+      body,
+      renderState: {
+        id: this.entities.length,
+        x: entity.position.x,
+        y: entity.position.y,
+        angle: 0,
+        shape: entity.shape,
+      },
+      destroyOnContact: entity.props.destroyOnContact ?? false,
     });
+    state.entityIndex++;
+    state.pendingEntity = null;
   }
 
   clearEntities(): void {
+    const pending = this.stageLoadState?.pendingEntity;
+    if (pending) this.world.DestroyBody(pending.body);
+    this.stageLoadState = null;
     this.deleteCandidates.forEach((body) => {
       this.world.DestroyBody(body);
     });
