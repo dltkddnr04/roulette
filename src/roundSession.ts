@@ -59,6 +59,7 @@ export class RoundSession {
   private seed: Seed;
   private winners: MarblePresentationState[] = [];
   private result: MarblePresentationState[] | null = null;
+  private resultFinalized = false;
   private winnerRange = { start: 0, end: 0 };
   private roundId = 0;
   private configuredCount = 0;
@@ -456,7 +457,7 @@ export class RoundSession {
   }
 
   advance(frameDelta: number, speed: number, fastForwardSpeed: number, callbacks: RoundStepCallbacks): number {
-    if (this.state === 'finished' || this.hasDeferredCleanup(this.simulation)) return 0;
+    if (this.state === 'initializing' || this.hasDeferredCleanup(this.simulation)) return 0;
     const simulationCallbacks: SimulationStepCallbacks = {
       onImpact: callbacks.onImpact,
       onFinish: (marble) => {
@@ -465,7 +466,11 @@ export class RoundSession {
       },
       afterStep: callbacks.afterStep,
       onStepComplete: callbacks.onStepComplete,
-      shouldContinue: () => this.state === 'running',
+      // A finalized result changes presentation state, not whether the
+      // current visible world is still live. Ready previews retain their
+      // historical one-step-per-frame behavior; running and result-finalized
+      // rounds may consume the whole physics budget.
+      shouldContinue: () => this.state === 'running' || (this.state === 'finished' && this.resultFinalized),
     };
     return this.simulation.advance(frameDelta, speed, fastForwardSpeed, simulationCallbacks);
   }
@@ -481,11 +486,11 @@ export class RoundSession {
 
     const earlyWinning = early && this.isWinningRank(this.winners.length);
     this.result = ranked.slice(start, end + 1);
+    this.resultFinalized = true;
     this.state = 'finished';
-    // Keep the result as immutable presentation state and retire the live
-    // physics bodies outside the finish frame. The next ready preview can be
-    // rendered immediately while the old world is waiting for an idle slice.
-    this.deferMarbleCleanup();
+    // Result finalization is a presentation milestone, not the end of the
+    // visible race. Keep the current world alive until the next user action
+    // actually retires it.
     this.previewMarbles = [];
     return {
       result: this.result.slice(),
@@ -511,9 +516,6 @@ export class RoundSession {
   }
 
   getRenderStates(alpha: number): RaceRenderState {
-    if (this.state === 'finished') {
-      return { marbles: [], entities: this.simulation.getEntityRenderStates(alpha) };
-    }
     const renderStates = this.simulation.getRenderStates(alpha);
     if (this.state === 'ready' && this.previewMarbles.length > 0) {
       return { ...renderStates, marbles: this.previewMarbles };
@@ -566,8 +568,12 @@ export class RoundSession {
     // cleanup is pending, leave those bodies owned by the deferred cleanup so
     // Shuffle itself never pays their DestroyBody cost.
     if (chooseNewSeed) this.discardAuthoritativeStandby();
+    // Leaving a live result for a new preview must not pay the synchronous
+    // DestroyBody cost. Keep ownership with the current simulation until its
+    // deferred, chunked cleanup finishes; it remains the stage preview world
+    // after the marble bodies are gone.
     if (this.simulation.getCount() > 0 && !this.hasDeferredCleanup(this.simulation)) {
-      this.simulation.clearMarbles();
+      this.deferMarbleCleanup();
     }
     this.simulation.resetTiming();
     this.invalidateRound();
@@ -595,6 +601,7 @@ export class RoundSession {
   private clearResults(): void {
     this.winners = [];
     this.result = null;
+    this.resultFinalized = false;
   }
 
   private deferMarbleCleanup(): void {

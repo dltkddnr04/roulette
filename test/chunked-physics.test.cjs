@@ -244,6 +244,7 @@ test('deferred finish cleanup destroys marble bodies in bounded batches', async 
   assert.equal(beforeCleanup.cleanupBatchCalls, 0);
   assert.equal(beforeCleanup.maxCleanupBatch, 0);
   assert.equal(session.getResult().length, 1);
+  session.setParticipants(['A*1000']);
 
   await waitForTask();
   const firstBatch = physics.counters();
@@ -270,7 +271,7 @@ test('deferred finish cleanup destroys marble bodies in bounded batches', async 
     },
     onStepComplete() {},
   });
-  assert.equal(physics.counters().stepCalls, stepsAfterFinish);
+  assert.ok(physics.counters().stepCalls > stepsAfterFinish);
 });
 
 test('cancelled deferred cleanup cannot touch a newly prepared current simulation', async () => {

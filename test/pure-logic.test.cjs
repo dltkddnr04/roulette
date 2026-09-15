@@ -2417,18 +2417,25 @@ test('chunked authoritative marble preparation is equivalent to one-shot prepara
   assert.deepEqual(chunked.getRenderStates(0), oneShot.getRenderStates(0));
 });
 
-test('finish result is available before deferred marble cleanup and finished sessions do not keep stepping', async () => {
+test('finish result stays live until the next round action retires the simulation', async () => {
   const stage = searchTestStage();
+  let firstStep = true;
+  let presentationUpdates = 0;
+  let presentationUpdatesAtFinish = 0;
   const physics = createMemoryPhysics((positions) => {
+    const first = positions.values().next().value;
+    if (firstStep && first) first.y = 100;
+    firstStep = false;
     positions.forEach((position) => {
-      position.y = 100;
+      if (position.y < 100) position.y += 1;
     });
   });
   const session = new RoundSession(new RaceSimulation(physics, 'finish-cleanup-seed'));
   await session.init();
   session.loadStage(stage);
   session.markReady();
-  session.setParticipants(['A']);
+  session.setParticipants(['A', 'B']);
+  session.setWinnerRange(0, 0);
   const generation = session.prepareStart();
   assert.notEqual(generation, null);
   assert.equal(session.activate(generation), true);
@@ -2437,27 +2444,48 @@ test('finish result is available before deferred marble cleanup and finished ses
     onImpact() {},
     onFinish() {},
     afterStep() {
-      finish = session.checkFinish();
+      const candidate = session.checkFinish();
+      if (candidate) {
+        finish = candidate;
+        presentationUpdatesAtFinish = presentationUpdates;
+      }
       return 1;
     },
-    onStepComplete() {},
+    onStepComplete() {
+      presentationUpdates++;
+    },
   });
   const clearCallsBeforeFinish = physics.counters().clearMarblesCalls;
   assert.ok(finish);
+  assert.ok(presentationUpdates > presentationUpdatesAtFinish);
   assert.equal(physics.counters().clearMarblesCalls, clearCallsBeforeFinish);
   assert.deepEqual(session.getResult(), finish.result);
+  assert.equal(session.getRenderStates(0).marbles.length, 1);
 
   const stepsAfterFinish = physics.counters().stepCalls;
+  const presentationUpdatesAfterFinish = presentationUpdates;
+  const remainingBefore = session.getRenderStates(0).marbles[0].position;
   session.advance(80, 1, 1, {
     onImpact() {},
     onFinish() {},
     afterStep() {
       return 1;
     },
-    onStepComplete() {},
+    onStepComplete() {
+      presentationUpdates++;
+    },
   });
-  assert.equal(physics.counters().stepCalls, stepsAfterFinish);
+  assert.ok(physics.counters().stepCalls > stepsAfterFinish);
+  assert.ok(presentationUpdates > presentationUpdatesAfterFinish);
+  assert.notEqual(session.getRenderStates(0).marbles[0].position.y, remainingBefore.y);
+  assert.equal(session.getRenderStates(0).marbles.length, 1);
+  assert.equal(session.checkFinish(), null);
 
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.equal(physics.counters().clearMarblesCalls, clearCallsBeforeFinish);
+
+  session.setParticipants(['A', 'B']);
+  assert.equal(physics.counters().clearMarblesCalls, clearCallsBeforeFinish);
   await new Promise((resolve) => setTimeout(resolve, 0));
   assert.equal(physics.counters().clearMarblesCalls, clearCallsBeforeFinish + 1);
 });
