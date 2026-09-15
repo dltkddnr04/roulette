@@ -38,7 +38,8 @@ const { parseName, shuffle } = loadTypeScriptModule('src/utils/utils.ts');
 const { normalizeParticipantNames } = loadTypeScriptModule('src/utils/participants.ts');
 const { getMarbleSpawnLayout } = loadTypeScriptModule('src/utils/marbleSpawn.ts');
 const { Marble } = loadTypeScriptModule('src/marble.ts');
-const { getStepBudget, preservePhysicsDebt, RaceSimulation } = loadTypeScriptModule('src/raceSimulation.ts');
+const { createMarblePreviewStates, getStepBudget, preservePhysicsDebt, RaceSimulation } =
+  loadTypeScriptModule('src/raceSimulation.ts');
 const { HeadlessSimulationCancelledError, simulateHeadlessRace } = loadTypeScriptModule('src/headlessSimulation.ts');
 const { RoundSession } = loadTypeScriptModule('src/roundSession.ts');
 const { validateReplayDescriptor } = loadTypeScriptModule('src/replay.ts');
@@ -352,13 +353,82 @@ test('RoundSession owns round lifecycle and participant rebuild state', async ()
   session.reset();
   assert.equal(session.roundState, 'ready');
   assert.equal(session.getCount(), 0);
-  assert.equal(loadStageCalls, 2);
+  assert.equal(loadStageCalls, 3);
 
   const rebuilt = session.setMap(replacementStage);
   assert.equal(rebuilt.positions.length, 5);
   assert.equal(session.getCount(), 5);
   assert.equal(session.currentStage, replacementStage);
-  assert.equal(loadStageCalls, 3);
+  assert.equal(loadStageCalls, 4);
+});
+
+test('ready Shuffle uses render-only marble previews and preserves authoritative ordering', async () => {
+  const makePhysics = () => {
+    const positions = new Map();
+    let createMarbleCalls = 0;
+    let clearMarblesCalls = 0;
+    return {
+      init: async () => {},
+      loadStage() {},
+      clearMarbles() {
+        clearMarblesCalls++;
+        positions.clear();
+      },
+      createMarble(id, x, y) {
+        createMarbleCalls++;
+        positions.set(id, { x, y, angle: 0 });
+      },
+      getMarblePosition(id) {
+        return positions.get(id);
+      },
+      shakeMarble() {},
+      impact() {},
+      removeMarble(id) {
+        positions.delete(id);
+      },
+      start() {},
+      step() {},
+      getEntityRenderStates() {
+        return [];
+      },
+      counters: () => ({ createMarbleCalls, clearMarblesCalls }),
+    };
+  };
+  const stage = {
+    finish: { y: 100 },
+    camera: { zoomTriggerY: 90 },
+    spawn: {
+      origin: { x: 10.25, y: 1 },
+      maxColumns: 10,
+      columnSpacing: 0.6,
+      rowSpacing: 1,
+      maxUnshiftedRows: 5,
+    },
+    entities: [],
+  };
+  const participants = [
+    { name: 'A', weight: 1.1, count: 2 },
+    { name: 'B', weight: 0.1, count: 1 },
+  ];
+  const seed = 'preview-only-seed';
+  const spawn = getMarbleSpawnLayout(3, stage.spawn);
+  const physics = makePhysics();
+  const session = new RoundSession(new RaceSimulation(physics, seed));
+  await session.init();
+  session.loadStage(stage);
+  session.markReady();
+
+  session.setParticipants(['A/4*2', 'B']);
+  assert.deepEqual(physics.counters(), { createMarbleCalls: 0, clearMarblesCalls: 0 });
+  const preview = session.getRenderStates(0).marbles;
+  assert.deepEqual(preview, createMarblePreviewStates(participants, 3, spawn.positions, seed));
+
+  session.setParticipants(['A/4*2', 'B']);
+  assert.deepEqual(physics.counters(), { createMarbleCalls: 0, clearMarblesCalls: 0 });
+
+  const generation = session.prepareStart();
+  assert.notEqual(generation, null);
+  assert.deepEqual(physics.counters(), { createMarbleCalls: 3, clearMarblesCalls: 1 });
 });
 
 test('presentation-side Math.random calls cannot consume the simulation stream', () => {
@@ -945,10 +1015,16 @@ test('Fairness worker warm-up waits for runtime initialization and classifies in
     });
     await new Promise((resolve) => setTimeout(resolve, 0));
     assert.equal(warmUpSettled, false);
-    assert.equal(FakeWorker.instances.length, pool.concurrency);
-    FakeWorker.instances.forEach((worker) => worker.emit({ type: 'ready' }));
+    assert.equal(FakeWorker.instances.length, 1);
+    FakeWorker.instances[0].emit({ type: 'ready' });
     await warmUp;
     assert.equal(warmUpSettled, true);
+
+    for (let index = 0; index < 4 && FakeWorker.instances.length < pool.concurrency; index++) {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    assert.equal(FakeWorker.instances.length, pool.concurrency);
+    FakeWorker.instances.slice(1).forEach((worker) => worker.emit({ type: 'ready' }));
 
     const run = pool.run(request, { stepLimit: 1 });
     await new Promise((resolve) => setTimeout(resolve, 0));
@@ -993,6 +1069,88 @@ test('Fairness worker warm-up waits for runtime initialization and classifies in
     );
   } finally {
     globalThis.Worker = originalWorker;
+  }
+});
+
+test('Fairness worker plan protocol sends the physical setup once and seeds per job', async () => {
+  const originalWorker = globalThis.Worker;
+  const originalNavigator = globalThis.navigator;
+  class PlanWorker {
+    static instances = [];
+
+    constructor() {
+      this.onmessage = null;
+      this.onerror = null;
+      this.messages = [];
+      PlanWorker.instances.push(this);
+    }
+
+    postMessage(message) {
+      this.messages.push(message);
+    }
+
+    emit(data) {
+      this.onmessage?.({ data });
+    }
+
+    terminate() {}
+  }
+
+  Object.defineProperty(globalThis, 'Worker', { configurable: true, value: PlanWorker });
+  Object.defineProperty(globalThis, 'navigator', { configurable: true, value: { hardwareConcurrency: 1 } });
+  try {
+    const pool = new FairnessWorkerPool();
+    const warmUp = pool.warmUp();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    const worker = PlanWorker.instances[0];
+    worker.emit({ type: 'ready' });
+    await warmUp;
+
+    const plan = {
+      planId: 'plan-protocol-test',
+      generation: 4,
+      stage: searchTestStage(),
+      participants: [{ name: 'A', weight: 1, count: 1 }],
+      totalCount: 1,
+      spawnPositions: [{ x: 10.25, y: 1 }],
+      skillsEnabled: false,
+      targetRank: 0,
+    };
+    const configured = pool.configurePlan(plan);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    const configureMessage = worker.messages.find(({ type }) => type === 'configurePlan');
+    assert.ok(configureMessage);
+    assert.deepEqual(configureMessage.requestWithoutSeed, {
+      stage: plan.stage,
+      participants: plan.participants,
+      totalCount: plan.totalCount,
+      spawnPositions: plan.spawnPositions,
+      skillsEnabled: plan.skillsEnabled,
+      targetRank: plan.targetRank,
+    });
+    worker.emit({ type: 'planReady', planId: plan.planId });
+    assert.equal(await configured, plan.planId);
+
+    const run = pool.runPlan(plan.planId, 'candidate-seed', { stepLimit: 1, attemptIndex: 7 });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    const runMessage = worker.messages.find(({ type }) => type === 'run');
+    assert.deepEqual(runMessage, {
+      type: 'run',
+      jobId: runMessage.jobId,
+      planId: plan.planId,
+      seed: 'candidate-seed',
+      stepLimit: 1,
+      attemptIndex: 7,
+    });
+    assert.equal(Object.hasOwn(runMessage, 'request'), false);
+    worker.emit({ type: 'result', jobId: runMessage.jobId, finishedMarbleIds: [0] });
+    assert.deepEqual(await run, [0]);
+    assert.equal(worker.messages.filter(({ type }) => type === 'configurePlan').length, 1);
+    assert.equal(worker.messages.filter(({ type }) => type === 'run').length, 1);
+  } finally {
+    Object.defineProperty(globalThis, 'Worker', { configurable: true, value: originalWorker });
+    if (originalNavigator === undefined) delete globalThis.navigator;
+    else Object.defineProperty(globalThis, 'navigator', { configurable: true, value: originalNavigator });
   }
 });
 
@@ -2127,8 +2285,9 @@ function marbleForEntry(seed, entryIds) {
 
 async function createUnbalancedSearchCoordinator(headlessRunner, createCandidateSeed, workerPool) {
   let id = 0;
+  const store = new InMemoryFairnessStore();
   const coordinator = new FairnessCoordinator({
-    store: new InMemoryFairnessStore(),
+    store,
     createId: (prefix) => `${prefix}-${++id}`,
     now: () => id,
     createCandidateSeed,
@@ -2141,7 +2300,7 @@ async function createUnbalancedSearchCoordinator(headlessRunner, createCandidate
   const base = await coordinator.prepareUnconstrainedDraw(searchTestRequest(stage, ['A', 'B'], 'base'));
   const winner = base.event.entries.find(({ displayName }) => displayName === 'A').marbleIds;
   assert.equal((await coordinator.confirmDraw(base.drawId, winner, null)).confirmed, true);
-  return { coordinator, stage };
+  return { coordinator, stage, store };
 }
 
 test('fairness precompute reuses one ready candidate without creating draw events', async () => {
@@ -2340,6 +2499,42 @@ test('strict-balance fast path skips speculative headless search', async () => {
   assert.equal((await coordinator.getState()).recentDraws.length, 0);
 });
 
+test('strict precompute caches its prepared draft and rebuilds it for a new seed', async () => {
+  let draftCalls = 0;
+  const originalCreatePreparedDrawDraft = FairnessCoordinator.prototype.createPreparedDrawDraft;
+  FairnessCoordinator.prototype.createPreparedDrawDraft = function (...args) {
+    draftCalls++;
+    return originalCreatePreparedDrawDraft.apply(this, args);
+  };
+
+  try {
+    const coordinator = new FairnessCoordinator({ store: new InMemoryFairnessStore() });
+    coordinator.setCurrentParticipantInputs(['A', 'B']);
+    await coordinator.setEnabled(true);
+    const stage = searchTestStage();
+    const request = searchTestRequest(stage, ['A', 'B'], 'first-seed');
+
+    await coordinator.precompute(request);
+    assert.equal(draftCalls, 1);
+    assert.equal((await coordinator.getState()).recentDraws.length, 0);
+
+    const prepared = await coordinator.prepareDraw(request, coordinator.beginStart());
+    assert.equal(draftCalls, 1);
+    assert.equal(prepared.event.seed, 'first-seed');
+
+    const rebuilt = await coordinator.prepareDraw({ ...request, currentSeed: 'second-seed' }, coordinator.beginStart());
+    assert.equal(draftCalls, 2);
+    assert.equal(rebuilt.event.seed, 'second-seed');
+
+    coordinator.invalidatePrecompute();
+    const afterInvalidation = await coordinator.prepareDraw(request, coordinator.beginStart());
+    assert.equal(draftCalls, 3);
+    assert.equal(afterInvalidation.event.seed, 'first-seed');
+  } finally {
+    FairnessCoordinator.prototype.createPreparedDrawDraft = originalCreatePreparedDrawDraft;
+  }
+});
+
 test('confirmed fairness balance changes invalidate a ready candidate', async () => {
   let calls = 0;
   const seeds = ['first-candidate', 'second-candidate'];
@@ -2401,32 +2596,65 @@ test('non-cancellation headless errors retain search retry semantics', async () 
 });
 
 test('rapid exclusion requests resolve to the last requested state', async () => {
-  const { coordinator } = await createUnbalancedSearchCoordinator(
+  const { coordinator, store } = await createUnbalancedSearchCoordinator(
     async ({ seed }) => [marbleForEntry(seed, ['entry-0', 'entry-1'])],
     () => 'unused-exclusion-seed'
   );
   const participant = (await coordinator.getState()).participants.find(({ displayName }) => displayName === 'A');
   const request = (excluded) => coordinator.setParticipantExcluded(participant.id, excluded);
 
-  await Promise.all([request(true), request(false)]);
+  const originalEnsureOperational = FairnessCoordinator.prototype.ensureOperational;
+  let ensureOperationalCalls = 0;
+  FairnessCoordinator.prototype.ensureOperational = async function () {
+    const delay = ensureOperationalCalls++ === 0 ? 30 : 0;
+    await new Promise((resolve) => setTimeout(resolve, delay));
+    return originalEnsureOperational.call(this);
+  };
+  try {
+    await Promise.all([request(true), request(false)]);
+  } finally {
+    FairnessCoordinator.prototype.ensureOperational = originalEnsureOperational;
+  }
   assert.equal((await coordinator.getState()).participants.find(({ id }) => id === participant.id).excluded, false);
+  const firstReplay = new FairnessCoordinator({ store });
+  assert.equal((await firstReplay.getState()).participants.find(({ id }) => id === participant.id).excluded, false);
 
   await Promise.all([request(false), request(true), request(false), request(true)]);
   assert.equal((await coordinator.getState()).participants.find(({ id }) => id === participant.id).excluded, true);
+  const exclusionEvents = (await coordinator.exportData()).events.filter(
+    ({ type }) => type === 'participantExclusionChanged'
+  );
+  assert.deepEqual(
+    exclusionEvents.map(({ excluded }) => excluded),
+    [true, false, true, false, true]
+  );
+  const finalReplay = new FairnessCoordinator({ store });
+  assert.equal((await finalReplay.getState()).participants.find(({ id }) => id === participant.id).excluded, true);
 });
 
 test('rapid participant renames persist the final requested name', async () => {
-  const { coordinator } = await createUnbalancedSearchCoordinator(
+  const { coordinator, store } = await createUnbalancedSearchCoordinator(
     async ({ seed }) => [marbleForEntry(seed, ['entry-0', 'entry-1'])],
     () => 'unused-rename-seed'
   );
   const participant = (await coordinator.getState()).participants.find(({ displayName }) => displayName === 'A');
 
-  await Promise.all([
-    coordinator.renameParticipant(participant.id, 'A'),
-    coordinator.renameParticipant(participant.id, 'B'),
-    coordinator.renameParticipant(participant.id, 'C'),
-  ]);
+  const originalEnsureOperational = FairnessCoordinator.prototype.ensureOperational;
+  let ensureOperationalCalls = 0;
+  FairnessCoordinator.prototype.ensureOperational = async function () {
+    const delay = ensureOperationalCalls++ === 0 ? 30 : 0;
+    await new Promise((resolve) => setTimeout(resolve, delay));
+    return originalEnsureOperational.call(this);
+  };
+  try {
+    await Promise.all([
+      coordinator.renameParticipant(participant.id, 'A'),
+      coordinator.renameParticipant(participant.id, 'B'),
+      coordinator.renameParticipant(participant.id, 'C'),
+    ]);
+  } finally {
+    FairnessCoordinator.prototype.ensureOperational = originalEnsureOperational;
+  }
 
   const state = await coordinator.getState();
   assert.equal(state.participants.find(({ id }) => id === participant.id).displayName, 'C');
@@ -2435,6 +2663,13 @@ test('rapid participant renames persist the final requested name', async () => {
     projectFairnessEvents(exported.events).participants.find(({ id }) => id === participant.id).displayName,
     'C'
   );
+  const renameEvents = exported.events.filter(({ type }) => type === 'participantRenamed');
+  assert.deepEqual(
+    renameEvents.map(({ displayName }) => displayName),
+    ['B', 'C']
+  );
+  const replay = new FairnessCoordinator({ store });
+  assert.equal((await replay.getState()).participants.find(({ id }) => id === participant.id).displayName, 'C');
 });
 
 test('worker search keeps serial candidate ordering and cancels higher attempts', async () => {

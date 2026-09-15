@@ -24,7 +24,7 @@ import {
   validateFairnessExport,
 } from './fairness';
 import { type FairnessEventStore, IndexedDbFairnessStore } from './fairnessStore';
-import type { FairnessWorkerPoolLike } from './fairnessWorkerPool';
+import type { FairnessWorkerPlan, FairnessWorkerPoolLike } from './fairnessWorkerPool';
 import {
   DEFAULT_HEADLESS_STEP_LIMIT,
   HeadlessSimulationCancelledError,
@@ -63,6 +63,12 @@ export type FairnessHeadlessRunner = (
   request: FairnessHeadlessSearchRequest,
   options?: FairnessHeadlessRunnerOptions
 ) => Promise<readonly number[]>;
+
+export type FairnessPrecomputedPlan = Readonly<{
+  key: string;
+  generation: number;
+  seed: Seed;
+}>;
 
 export type FairnessPreparedDraw = Readonly<{
   drawId: string;
@@ -105,6 +111,17 @@ type SearchResult = Readonly<{
   winnerEntryIds: readonly string[];
 }>;
 
+type PreparedDrawDraft = Readonly<
+  Omit<FairnessDrawPreparedEvent, 'version' | 'eventId' | 'timestamp' | 'type' | 'drawId'>
+>;
+
+type PreparedDrawDraftCache = Readonly<{
+  key: string;
+  generation: number;
+  seed: Seed;
+  draft: PreparedDrawDraft;
+}>;
+
 type FairnessSearchContext = Readonly<{
   request: FairnessStartRequest;
   syncedInputs: readonly SyncedEntry[];
@@ -115,11 +132,17 @@ type FairnessSearchContext = Readonly<{
   eligibleEntryIds: readonly string[];
   budget: number;
   key: string;
+  planId: string;
   generation: number;
   mustSearch: boolean;
 }>;
 
-type SearchCandidate = SearchResult & Readonly<{ key: string; generation: number }>;
+type SearchCandidate = SearchResult &
+  Readonly<{
+    key: string;
+    generation: number;
+    draft: PreparedDrawDraft;
+  }>;
 
 type CompletedSearchAttempt = Readonly<{
   seed: Seed;
@@ -131,7 +154,7 @@ type SearchWork = Readonly<{
   key: string;
   generation: number;
   controller: AbortController;
-  promise: Promise<SearchResult>;
+  promise: Promise<SearchCandidate>;
 }>;
 
 function sameStrings(left: readonly string[], right: readonly string[]): boolean {
@@ -395,11 +418,13 @@ export class FairnessCoordinator {
   private operationToken = 0;
   private searchGeneration = 0;
   private cachedCandidate: SearchCandidate | null = null;
+  private cachedPreparedDraft: PreparedDrawDraftCache | null = null;
   private cachedContext: FairnessSearchContext | null = null;
   private inFlightSearch: SearchWork | null = null;
   private workerPoolPromise: Promise<FairnessWorkerPoolLike | null> | null = null;
   private workerPoolDisabled = false;
   private precomputeTimer: ReturnType<typeof setTimeout> | null = null;
+  private precomputeTimerResolve: ((plan: FairnessPrecomputedPlan | null) => void) | null = null;
 
   constructor(options: FairnessCoordinatorOptions = {}) {
     this.store = options.store ?? new IndexedDbFairnessStore();
@@ -425,6 +450,12 @@ export class FairnessCoordinator {
     return this.mode;
   }
 
+  /** Start non-blocking worker/runtime warm-up after the app is ready. */
+  initializeBackgroundResources(): void {
+    if (!this.enabled) return;
+    this.warmWorkerPool();
+  }
+
   beginStart(): number {
     this.operationToken += 1;
     return this.operationToken;
@@ -444,31 +475,47 @@ export class FairnessCoordinator {
     this.invalidateSearchState();
   }
 
-  schedulePrecompute(request: FairnessStartRequest, delay = FAIRNESS_PRECOMPUTE_DEBOUNCE_MS): void {
-    if (!this.enabled) return;
+  schedulePrecompute(
+    request: FairnessStartRequest,
+    delay = FAIRNESS_PRECOMPUTE_DEBOUNCE_MS
+  ): Promise<FairnessPrecomputedPlan | null> {
+    if (!this.enabled) return Promise.resolve(null);
     this.clearPrecomputeTimer();
     if (delay <= 0) {
-      void this.precompute(request).catch(() => undefined);
-      return;
+      return this.precompute(request).catch(() => null);
     }
 
-    this.precomputeTimer = setTimeout(() => {
-      this.precomputeTimer = null;
-      void this.precompute(request).catch(() => undefined);
-    }, delay);
+    return new Promise((resolve) => {
+      this.precomputeTimerResolve = resolve;
+      this.precomputeTimer = setTimeout(() => {
+        this.precomputeTimer = null;
+        this.precomputeTimerResolve = null;
+        void this.precompute(request).then(resolve, () => resolve(null));
+      }, delay);
+    });
   }
 
-  async precompute(request: FairnessStartRequest): Promise<void> {
+  async precompute(request: FairnessStartRequest): Promise<FairnessPrecomputedPlan | null> {
     const generation = this.searchGeneration;
     const context = await this.createSearchContext(request, undefined, generation);
-    if (!context.mustSearch) return;
-    await this.ensureSearch(context);
+    // A context may finish building after another policy mutation invalidated
+    // its generation. Never hand that stale context back to the UI, including
+    // the strict-balance path where no headless search is awaited.
+    this.assertSearchCurrent(generation);
+    if (!context.mustSearch) {
+      this.getOrCreatePreparedDrawDraft(context, request.currentSeed);
+      return { key: context.key, generation, seed: request.currentSeed };
+    }
+    const candidate = await this.ensureSearch(context);
+    return { key: candidate.key, generation: candidate.generation, seed: candidate.seed };
   }
 
   private clearPrecomputeTimer(): void {
     if (this.precomputeTimer === null) return;
     clearTimeout(this.precomputeTimer);
     this.precomputeTimer = null;
+    this.precomputeTimerResolve?.(null);
+    this.precomputeTimerResolve = null;
   }
 
   private getWorkerPool(): Promise<FairnessWorkerPoolLike | null> {
@@ -515,11 +562,18 @@ export class FairnessCoordinator {
 
   private invalidateSearchState(): void {
     const staleWork = this.inFlightSearch;
+    const stalePlanId = `fairness-plan-${this.searchGeneration}`;
     this.searchGeneration += 1;
     this.cachedCandidate = null;
+    this.cachedPreparedDraft = null;
     this.cachedContext = null;
     this.clearPrecomputeTimer();
     staleWork?.controller.abort();
+    if (this.configuredWorkerPool) {
+      this.configuredWorkerPool.dropPlan?.(stalePlanId);
+    } else {
+      void this.workerPoolPromise?.then((workerPool) => workerPool?.dropPlan?.(stalePlanId));
+    }
   }
 
   private assertSearchCurrent(generation: number): void {
@@ -604,20 +658,14 @@ export class FairnessCoordinator {
   }
 
   async setParticipantExcluded(participantId: string, excluded: boolean): Promise<void> {
-    const current = this.projection.participants.find((candidate) => candidate.id === participantId);
-    const hasPending = this.pendingExclusionRequests.has(participantId);
-    if (
-      (hasPending ? this.pendingExclusionRequests.get(participantId) : current?.excluded) === excluded &&
-      (hasPending || current !== undefined)
-    ) {
-      return;
-    }
     this.pendingExclusionRequests.set(participantId, excluded);
     this.invalidateStart();
     try {
-      await this.ensureOperational();
       await this.enqueueMutation(async () => {
-        const participant = this.projection.participants.find((candidate) => candidate.id === participantId);
+        let participant = this.projection.participants.find((candidate) => candidate.id === participantId);
+        if (participant?.excluded === excluded) return;
+        await this.ensureOperational();
+        participant = this.projection.participants.find((candidate) => candidate.id === participantId);
         if (!participant) throw new Error('Fairness participant was not found');
         if (participant.excluded === excluded) return;
         await this.ensureEpoch();
@@ -634,20 +682,14 @@ export class FairnessCoordinator {
   async renameParticipant(participantId: string, displayName: string): Promise<void> {
     const trimmedName = displayName.trim();
     if (!trimmedName || trimmedName.length > 512) throw new Error('Fairness participant name is invalid');
-    const current = this.projection.participants.find((candidate) => candidate.id === participantId);
-    const hasPending = this.pendingRenameRequests.has(participantId);
-    if (
-      (hasPending ? this.pendingRenameRequests.get(participantId) : current?.displayName) === trimmedName &&
-      (hasPending || current !== undefined)
-    ) {
-      return;
-    }
     this.pendingRenameRequests.set(participantId, trimmedName);
     this.invalidateStart();
     try {
-      await this.ensureOperational();
       await this.enqueueMutation(async () => {
-        const participant = this.projection.participants.find((candidate) => candidate.id === participantId);
+        let participant = this.projection.participants.find((candidate) => candidate.id === participantId);
+        if (participant?.displayName === trimmedName) return;
+        await this.ensureOperational();
+        participant = this.projection.participants.find((candidate) => candidate.id === participantId);
         if (!participant) throw new Error('Fairness participant was not found');
         if (participant.displayName === trimmedName) return;
         await this.ensureEpoch();
@@ -765,10 +807,26 @@ export class FairnessCoordinator {
         const winningEntry = syncedInputs.find((entry) => entry.entryId === expectedWinnerEntryIds?.[0]);
         expectedWinnerParticipantIds = winningEntry?.memberIds.length === 1 ? [winningEntry.memberIds[0]] : null;
         expectedWinnerMarbleIds = [searchResult.winnerMarbleIds[request.winnerRange.end]];
+
+        const event = this.createPreparedEventFromDraft(drawId, searchResult.draft);
+        preparedEvent = event;
+        await this.enqueueMutation(async () => {
+          this.assertCurrent(token);
+          await this.appendEvent(event);
+        });
+        return {
+          drawId: event.drawId,
+          seed,
+          event: clone(event),
+          expectedWinnerEntryIds,
+          expectedWinnerParticipantIds,
+          expectedWinnerMarbleIds,
+          operationToken: token,
+        };
       }
 
       this.assertCurrent(token);
-      const event = this.createPreparedEvent(request, seed, syncedInputs, mappingRows, totalCount, drawId, true);
+      const event = this.createPreparedEventFromDraft(drawId, this.getOrCreatePreparedDrawDraft(context, seed));
       preparedEvent = event;
       await this.enqueueMutation(async () => {
         this.assertCurrent(token);
@@ -1211,6 +1269,7 @@ export class FairnessCoordinator {
       eligibleEntryIds: evaluation.eligibleEntryIds,
       budget,
       key,
+      planId: `fairness-plan-${generation}`,
       generation,
       mustSearch: !canUseStrictBalanceEntryFastPath(evaluation),
     };
@@ -1218,18 +1277,24 @@ export class FairnessCoordinator {
     return context;
   }
 
-  private createPreparedEvent(
+  private createPreparedDrawDraft(
     request: FairnessStartRequest,
     seed: Seed,
     syncedInputs: readonly SyncedEntry[],
     mappingRows: readonly Readonly<{ entryId: string; count: number }>[],
     totalCount: number,
-    drawId: string,
     fairnessEnabledAtDraw: boolean
-  ): FairnessDrawPreparedEvent {
+  ): PreparedDrawDraft {
     const mapping = mapMarbleIdsToEntries(seed, mappingRows);
-    const base = createBaseEvent('drawPrepared', this.now, this.createId);
-    const memberIds = [...new Set(syncedInputs.reduce<string[]>((ids, input) => ids.concat(input.memberIds), []))];
+    const memberIds: string[] = [];
+    const seenMemberIds = new Set<string>();
+    syncedInputs.forEach((input) => {
+      input.memberIds.forEach((memberId) => {
+        if (seenMemberIds.has(memberId)) return;
+        seenMemberIds.add(memberId);
+        memberIds.push(memberId);
+      });
+    });
     const participantById = new Map(this.projection.participants.map((participant) => [participant.id, participant]));
     const marbleIdsByEntryId = new Map<string, number[]>();
     mapping.forEach((entryId, marbleId) => {
@@ -1264,8 +1329,6 @@ export class FairnessCoordinator {
     }
 
     return {
-      ...base,
-      drawId,
       epochId: this.projection.currentEpochId ?? this.createId('epoch'),
       seed,
       mapIndex: request.mapIndex,
@@ -1283,7 +1346,47 @@ export class FairnessCoordinator {
     };
   }
 
-  private ensureSearch(context: FairnessSearchContext, token?: number): Promise<SearchResult> {
+  private createPreparedEventFromDraft(drawId: string, draft: PreparedDrawDraft): FairnessDrawPreparedEvent {
+    return {
+      ...createBaseEvent('drawPrepared', this.now, this.createId),
+      ...draft,
+      drawId,
+    };
+  }
+
+  private getOrCreatePreparedDrawDraft(context: FairnessSearchContext, seed: Seed): PreparedDrawDraft {
+    const cached = this.cachedPreparedDraft;
+    if (cached && cached.key === context.key && cached.generation === context.generation && cached.seed === seed) {
+      return cached.draft;
+    }
+    const draft = this.createPreparedDrawDraft(
+      context.request,
+      seed,
+      context.syncedInputs,
+      context.mappingRows,
+      context.totalCount,
+      true
+    );
+    this.cachedPreparedDraft = { key: context.key, generation: context.generation, seed, draft };
+    return draft;
+  }
+
+  private createPreparedEvent(
+    request: FairnessStartRequest,
+    seed: Seed,
+    syncedInputs: readonly SyncedEntry[],
+    mappingRows: readonly Readonly<{ entryId: string; count: number }>[],
+    totalCount: number,
+    drawId: string,
+    fairnessEnabledAtDraw: boolean
+  ): FairnessDrawPreparedEvent {
+    return this.createPreparedEventFromDraft(
+      drawId,
+      this.createPreparedDrawDraft(request, seed, syncedInputs, mappingRows, totalCount, fairnessEnabledAtDraw)
+    );
+  }
+
+  private ensureSearch(context: FairnessSearchContext, token?: number): Promise<SearchCandidate> {
     this.assertSearchCurrent(context.generation);
     if (token !== undefined) this.assertCurrent(token);
 
@@ -1296,7 +1399,19 @@ export class FairnessCoordinator {
     }
 
     const controller = new AbortController();
-    const promise = this.searchForWinner(context, token, controller.signal);
+    const promise = this.searchForWinner(context, token, controller.signal).then((result) => ({
+      ...result,
+      key: context.key,
+      generation: context.generation,
+      draft: this.createPreparedDrawDraft(
+        context.request,
+        result.seed,
+        context.syncedInputs,
+        context.mappingRows,
+        context.totalCount,
+        true
+      ),
+    }));
     const work: SearchWork = { key: context.key, generation: context.generation, controller, promise };
     this.inFlightSearch = work;
     void promise
@@ -1306,7 +1421,7 @@ export class FairnessCoordinator {
           this.searchGeneration === context.generation &&
           !controller.signal.aborted
         ) {
-          this.cachedCandidate = { ...result, key: context.key, generation: context.generation };
+          this.cachedCandidate = result;
         }
       })
       .catch(() => undefined)
@@ -1376,6 +1491,27 @@ export class FairnessCoordinator {
   ): Promise<SearchResult> {
     if (context.budget <= 0) throw new Error('Fairness search has no valid budget');
 
+    let planId: string | null = null;
+    if (workerPool.configurePlan && workerPool.runPlan) {
+      try {
+        planId = await workerPool.configurePlan({
+          planId: context.planId,
+          generation: context.generation,
+          stage: context.request.stage,
+          participants: context.participants,
+          totalCount: context.totalCount,
+          spawnPositions: context.spawnPositions,
+          skillsEnabled: context.request.skillsEnabled,
+          targetRank: context.request.winnerRange.end,
+        } satisfies FairnessWorkerPlan);
+        if (signal.aborted) throw new FairnessCancelledError();
+      } catch (error) {
+        if (signal.aborted || isCancellationError(error)) throw new FairnessCancelledError();
+        this.workerPoolDisabled = true;
+        return this.searchForWinnerSerial(context, token, signal);
+      }
+    }
+
     const eligible = new Set(context.eligibleEntryIds);
     const parallelism =
       Number.isSafeInteger(workerPool.concurrency) && workerPool.concurrency > 0 ? workerPool.concurrency : 1;
@@ -1397,12 +1533,19 @@ export class FairnessCoordinator {
         active.delete(attempt);
       };
       const promise = Promise.resolve()
-        .then(() =>
-          workerPool.run(this.createHeadlessRequest(context, seed), {
+        .then(() => {
+          if (planId !== null && workerPool.runPlan) {
+            return workerPool.runPlan(planId, seed, {
+              signal: controller.signal,
+              stepLimit: this.headlessStepLimit,
+              attemptIndex: attempt,
+            });
+          }
+          return workerPool.run(this.createHeadlessRequest(context, seed), {
             signal: controller.signal,
             stepLimit: this.headlessStepLimit,
-          })
-        )
+          });
+        })
         .then((winnerMarbleIds) => {
           completed.set(attempt, { seed, winnerMarbleIds });
         })

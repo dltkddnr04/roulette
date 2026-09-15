@@ -121,7 +121,7 @@ export function App({ roulette }: { roulette: Roulette }) {
   }, [roulette]);
 
   const applyWinnerSetting = useCallback(
-    (nextType: WinnerType = winnerType, edited?: EditedRange) => {
+    (nextType: WinnerType = winnerType, edited?: EditedRange, fairnessPrecomputeDelay?: number) => {
       let start: number;
       let end: number;
       switch (nextType) {
@@ -144,7 +144,7 @@ export function App({ roulette }: { roulette: Roulette }) {
           break;
       }
 
-      if (!roulette.setWinnerRange(start - 1, end - 1)) {
+      if (!roulette.setWinnerRange(start - 1, end - 1, fairnessPrecomputeDelay)) {
         const currentRange = roulette.getWinnerRange();
         setWinnerType('custom');
         setRank(String(currentRange.start + 1));
@@ -162,11 +162,13 @@ export function App({ roulette }: { roulette: Roulette }) {
   );
 
   const getReady = useCallback(
-    (value: string) => {
+    (value: string, fairnessPrecomputeDelay = 150) => {
       const participantNames = getParticipantNames(value);
-      roulette.setMarbles(participantNames);
-      writeLocalStorage(NAMES_STORAGE_KEY, participantNames.join(','));
-      applyWinnerSetting();
+      roulette.batchFairnessUpdates(() => {
+        roulette.setMarbles(participantNames, fairnessPrecomputeDelay);
+        writeLocalStorage(NAMES_STORAGE_KEY, participantNames.join(','));
+        applyWinnerSetting(undefined, undefined, fairnessPrecomputeDelay);
+      });
       void refreshFairness();
     },
     [applyWinnerSetting, refreshFairness, roulette]
@@ -369,7 +371,8 @@ export function App({ roulette }: { roulette: Roulette }) {
 
   const maps = roulette.getMaps();
   const onStart = () => {
-    if (!ready || roulette.roundState !== 'ready' || roulette.getCount() === 0) return;
+    if (!ready || (roulette.roundState !== 'ready' && roulette.roundState !== 'finished') || roulette.getCount() === 0)
+      return;
     setSettingsHidden(true);
     void Promise.resolve(roulette.start()).catch((error) => {
       showToast(error instanceof Error ? error.message : 'The roulette could not start');
@@ -463,7 +466,7 @@ export function App({ roulette }: { roulette: Roulette }) {
             }
           }}
           onShuffle={() => {
-            if (ready) getReady(names);
+            if (ready) getReady(names, 0);
           }}
           onStart={onStart}
         />

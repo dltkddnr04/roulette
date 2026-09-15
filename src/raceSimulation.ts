@@ -1,3 +1,4 @@
+import { MARBLE_RENDER_DIAMETER } from './data/constants';
 import type { StageDef } from './data/maps';
 import type { IPhysics } from './IPhysics';
 import { Marble } from './marble';
@@ -30,6 +31,47 @@ export type RaceRenderState = {
   marbles: MarbleRenderState[];
   entities: MapEntityRenderState[];
 };
+
+/**
+ * Build the ready-screen marble representation without touching physics.
+ *
+ * The order and random-value consumption intentionally mirror
+ * `replaceMarbles()`. This keeps Shuffle's visible layout deterministic for a
+ * seed while allowing the authoritative Box2D bodies to be created only when
+ * a round is actually prepared.
+ */
+export function createMarblePreviewStates(
+  participants: readonly MarbleParticipant[],
+  totalCount: number,
+  spawnPositions: readonly VectorLike[],
+  seed: Seed
+): MarbleRenderState[] {
+  const randomSource = createSeededRandom(seed);
+  const orders = shuffle(
+    Array.from({ length: totalCount }, (_, index) => index),
+    randomSource
+  );
+  const states: MarbleRenderState[] = [];
+
+  participants.forEach((participant) => {
+    for (let index = 0; index < participant.count; index++) {
+      const order = orders.pop() ?? 0;
+      const maxCoolTime = 1000 + (1 - participant.weight) * 4000;
+      states.push({
+        id: order,
+        name: participant.name || `M${order}`,
+        hue: (360 / totalCount) * order,
+        size: MARBLE_RENDER_DIAMETER,
+        impact: 0,
+        coolTime: maxCoolTime * randomSource.next(),
+        maxCoolTime,
+        position: { ...spawnPositions[order], angle: 0 },
+      });
+    }
+  });
+
+  return states;
+}
 
 export function getStepBudget(updateInterval: number, timeScale: number): number {
   return updateInterval / timeScale;
@@ -98,6 +140,16 @@ export class RaceSimulation {
     this.hasExplicitSeed = false;
   }
 
+  /**
+   * Reserve the seed that the next rebuild should use. Random-seed mode keeps
+   * its existing behavior by choosing one seed per logical rebuild, while an
+   * explicit seed remains unchanged.
+   */
+  prepareSeedForRebuild(): Seed {
+    if (!this.hasExplicitSeed) this.seed = createRandomSeed();
+    return this.seed;
+  }
+
   useRandomSeed(): void {
     this.setRandomSeedMode();
   }
@@ -120,11 +172,15 @@ export class RaceSimulation {
     this.resetInterpolationSnapshots();
   }
 
-  replaceMarbles(participants: readonly MarbleParticipant[], totalCount: number, spawnPositions: VectorLike[]): void {
-    this.clearMarbles();
-    if (!this.hasExplicitSeed) {
-      this.seed = createRandomSeed();
-    }
+  replaceMarbles(
+    participants: readonly MarbleParticipant[],
+    totalCount: number,
+    spawnPositions: readonly VectorLike[],
+    seed: Seed = this.prepareSeedForRebuild(),
+    clearExisting = true
+  ): void {
+    if (clearExisting) this.clearMarbles();
+    this.seed = seed;
     this.randomSource.reset(this.seed);
 
     const orders = shuffle(
