@@ -27,8 +27,10 @@ export type FairnessWorkerPoolPlanRunOptions = Readonly<{
 
 export type FairnessWorkerPoolLike = Readonly<{
   concurrency: number;
+  readonly readyConcurrency?: number;
   run: (request: HeadlessSimulationRequest, options: FairnessWorkerPoolRunOptions) => Promise<readonly number[]>;
   warmUp?: () => Promise<void>;
+  waitForReadyConcurrency?: (minimum: number, signal?: AbortSignal) => Promise<void>;
   configurePlan?: (plan: FairnessWorkerPlan) => Promise<string>;
   runPlan?: (planId: string, seed: Seed, options: FairnessWorkerPoolPlanRunOptions) => Promise<readonly number[]>;
   dropPlan?: (planId: string) => void;
@@ -102,6 +104,14 @@ type PendingPlanConfiguration = {
   reject: (error: unknown) => void;
 };
 
+type ReadyConcurrencyWaiter = {
+  minimum: number;
+  resolve: () => void;
+  reject: (error: unknown) => void;
+  removeAbortListener: (() => void) | null;
+  settled: boolean;
+};
+
 type WorkerSlot = {
   worker: Worker;
   ready: boolean;
@@ -160,6 +170,7 @@ export class FairnessWorkerPool {
   readonly concurrency: number;
   private readonly slots: WorkerSlot[] = [];
   private readonly pending: Job[] = [];
+  private readonly readyConcurrencyWaiters: ReadyConcurrencyWaiter[] = [];
   private readonly plans = new Map<string, RegisteredPlan>();
   private nextJobId = 0;
   private nextPlanVersion = 0;
@@ -174,8 +185,50 @@ export class FairnessWorkerPool {
     this.concurrency = workerCount();
   }
 
+  get readyConcurrency(): number {
+    return this.slots.reduce((count, slot) => count + (slot.ready && slot.alive ? 1 : 0), 0);
+  }
+
   async warmUp(): Promise<void> {
     await this.ensureReady();
+  }
+
+  waitForReadyConcurrency(minimum: number, signal?: AbortSignal): Promise<void> {
+    if (this.failure) return Promise.reject(this.failure);
+    if (signal?.aborted) return Promise.reject(new HeadlessSimulationCancelledError());
+    if (!Number.isSafeInteger(minimum) || minimum < 0) {
+      return Promise.reject(new Error('Fairness ready concurrency minimum must be a non-negative safe integer'));
+    }
+    if (minimum === 0 || this.readyConcurrency >= minimum) return Promise.resolve();
+    if (minimum > this.concurrency) {
+      return Promise.reject(new WorkerPoolUnavailableError('Requested fairness worker concurrency is unavailable'));
+    }
+
+    let waiter!: ReadyConcurrencyWaiter;
+    const promise = new Promise<void>((resolve, reject) => {
+      waiter = {
+        minimum,
+        resolve,
+        reject,
+        removeAbortListener: null,
+        settled: false,
+      };
+      this.readyConcurrencyWaiters.push(waiter);
+      if (signal) {
+        const onAbort = () => this.settleReadyConcurrencyWaiter(waiter, new HeadlessSimulationCancelledError());
+        signal.addEventListener('abort', onAbort, { once: true });
+        waiter.removeAbortListener = () => signal.removeEventListener('abort', onAbort);
+      }
+    });
+
+    // Re-check after registration so a synchronous readiness transition cannot
+    // leave a waiter behind. Starting readiness after registration also lets
+    // an unsupported pool reject this waiter through failPool().
+    this.notifyReadyConcurrencyWaiters();
+    void this.ensureReady().catch((error: unknown) => {
+      if (!this.failure) this.failPool(error);
+    });
+    return promise;
   }
 
   async configurePlan(plan: FairnessWorkerPlan): Promise<string> {
@@ -322,7 +375,6 @@ export class FairnessWorkerPool {
     });
 
     this.createWorkerSlot();
-    if (!this.failure) this.scheduleAdditionalWorker();
     return this.readyPromise;
   }
 
@@ -372,13 +424,14 @@ export class FairnessWorkerPool {
 
   private scheduleAdditionalWorker(): void {
     if (this.failure || this.workerSpawnScheduled || this.slots.length >= this.concurrency) return;
+    if (this.slots.some((slot) => !slot.alive || !slot.ready)) return;
     this.workerSpawnScheduled = true;
 
     const spawn = () => {
       this.workerSpawnScheduled = false;
       if (this.failure || this.slots.length >= this.concurrency) return;
+      if (this.slots.some((slot) => !slot.alive || !slot.ready)) return;
       this.createWorkerSlot();
-      if (!this.failure) this.scheduleAdditionalWorker();
     };
 
     const idleScheduler = (globalThis as unknown as { requestIdleCallback?: (callback: () => void) => unknown })
@@ -596,6 +649,8 @@ export class FairnessWorkerPool {
       }
       if (this.plans.size > 0) void this.startPlanSync(slot).catch(() => undefined);
       else slot.plansSynchronized = true;
+      this.notifyReadyConcurrencyWaiters();
+      this.scheduleAdditionalWorker();
       this.pump();
       return;
     }
@@ -604,6 +659,13 @@ export class FairnessWorkerPool {
       return;
     }
     if (message.type === 'fatal') {
+      const staleJob = message.jobId ? (slot.job?.id === message.jobId ? slot.job : null) : null;
+      if (staleJob?.signal?.aborted) {
+        this.releaseJob(slot, staleJob);
+        this.finishJob(staleJob, new HeadlessSimulationCancelledError());
+        this.pump();
+        return;
+      }
       this.handleWorkerFailure(slot, new WorkerPoolUnavailableError(message.message));
       return;
     }
@@ -650,12 +712,36 @@ export class FairnessWorkerPool {
     this.failPool(error);
   }
 
+  private settleReadyConcurrencyWaiter(waiter: ReadyConcurrencyWaiter, error: unknown | null): void {
+    if (waiter.settled) return;
+    waiter.settled = true;
+    const index = this.readyConcurrencyWaiters.indexOf(waiter);
+    if (index >= 0) this.readyConcurrencyWaiters.splice(index, 1);
+    waiter.removeAbortListener?.();
+    waiter.removeAbortListener = null;
+    if (error === null) waiter.resolve();
+    else waiter.reject(error);
+  }
+
+  private notifyReadyConcurrencyWaiters(): void {
+    if (this.readyConcurrencyWaiters.length === 0) return;
+    const readyConcurrency = this.readyConcurrency;
+    [...this.readyConcurrencyWaiters].forEach((waiter) => {
+      if (readyConcurrency >= waiter.minimum) this.settleReadyConcurrencyWaiter(waiter, null);
+    });
+  }
+
+  private rejectReadyConcurrencyWaiters(error: unknown): void {
+    [...this.readyConcurrencyWaiters].forEach((waiter) => this.settleReadyConcurrencyWaiter(waiter, error));
+  }
+
   private failPool(error: unknown): WorkerPoolUnavailableError {
     if (this.failure) return this.failure;
     this.failure = error instanceof WorkerPoolUnavailableError ? error : new WorkerPoolUnavailableError();
     this.rejectReady?.(this.failure);
     this.resolveReady = null;
     this.rejectReady = null;
+    this.rejectReadyConcurrencyWaiters(this.failure);
 
     this.slots.forEach((currentSlot) => {
       currentSlot.alive = false;

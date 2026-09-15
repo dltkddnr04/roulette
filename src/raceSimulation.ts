@@ -25,6 +25,8 @@ export type SimulationStepCallbacks = {
   onFinish: (marble: MarblePresentationState) => void;
   afterStep: () => number;
   onStepComplete: () => void;
+  /** Optional owner-level stop hook for lifecycle transitions during a step. */
+  shouldContinue?: () => boolean;
 };
 
 export type RaceRenderState = {
@@ -57,13 +59,18 @@ export function createMarblePreviewStates(
     for (let index = 0; index < participant.count; index++) {
       const order = orders.pop() ?? 0;
       const maxCoolTime = 1000 + (1 - participant.weight) * 4000;
+      const coolTimeRandom = randomSource.next();
+      // Marble construction consumes one additional value when
+      // Box2dPhysics.createMarble() generates the fixture density. Keep the
+      // preview stream aligned even though the density itself is not rendered.
+      randomSource.next();
       states.push({
         id: order,
         name: participant.name || `M${order}`,
         hue: (360 / totalCount) * order,
         size: MARBLE_RENDER_DIAMETER,
         impact: 0,
-        coolTime: maxCoolTime * randomSource.next(),
+        coolTime: maxCoolTime * coolTimeRandom,
         maxCoolTime,
         position: { ...spawnPositions[order], angle: 0 },
       });
@@ -183,29 +190,52 @@ export class RaceSimulation {
     this.seed = seed;
     this.randomSource.reset(this.seed);
 
-    const orders = shuffle(
-      Array(totalCount)
-        .fill(0)
-        .map((_, i) => i),
-      this.randomSource
-    );
+    const orders = this.createMarbleOrders(totalCount);
     participants.forEach((participant) => {
       for (let i = 0; i < participant.count; i++) {
-        const order = orders.pop() || 0;
-        this.marbles.push(
-          new Marble(
-            this.physics,
-            order,
-            totalCount,
-            spawnPositions[order],
-            this.randomSource,
-            participant.name,
-            participant.weight
-          )
-        );
+        this.createMarble(participant, orders.pop() || 0, totalCount, spawnPositions);
       }
     });
     this.resetInterpolationSnapshots();
+  }
+
+  /**
+   * Create the same authoritative marble state as replaceMarbles(), yielding
+   * between bounded batches so a standby preparation cannot monopolize a
+   * browser task. The random stream and creation order are intentionally
+   * identical to the one-shot path.
+   */
+  async replaceMarblesChunked(
+    participants: readonly MarbleParticipant[],
+    totalCount: number,
+    spawnPositions: readonly VectorLike[],
+    seed: Seed = this.prepareSeedForRebuild(),
+    clearExisting = true,
+    batchSize = 64,
+    shouldContinue: () => boolean = () => true
+  ): Promise<boolean> {
+    if (!shouldContinue()) return false;
+    if (clearExisting) this.clearMarbles();
+    this.seed = seed;
+    this.randomSource.reset(this.seed);
+
+    const orders = this.createMarbleOrders(totalCount);
+    const effectiveBatchSize = Math.max(1, Math.floor(batchSize));
+    let createdSinceYield = 0;
+    for (const participant of participants) {
+      for (let i = 0; i < participant.count; i++) {
+        if (!shouldContinue()) return false;
+        this.createMarble(participant, orders.pop() || 0, totalCount, spawnPositions);
+        createdSinceYield++;
+        if (createdSinceYield < effectiveBatchSize) continue;
+        if (!shouldContinue()) return false;
+        createdSinceYield = 0;
+        await yieldToHost();
+        if (!shouldContinue()) return false;
+      }
+    }
+    this.resetInterpolationSnapshots();
+    return shouldContinue();
   }
 
   clearMarbles(): void {
@@ -268,6 +298,10 @@ export class RaceSimulation {
     };
   }
 
+  getEntityRenderStates(alpha: number): MapEntityRenderState[] {
+    return this.getInterpolatedEntities(alpha);
+  }
+
   advance(frameDelta: number, speed: number, fastForwardSpeed: number, callbacks: SimulationStepCallbacks): number {
     this.elapsed += frameDelta * speed * fastForwardSpeed;
 
@@ -295,6 +329,7 @@ export class RaceSimulation {
       accumulatedTime -= stepBudget;
       physicsSteps++;
       callbacks.onStepComplete();
+      if (callbacks.shouldContinue && !callbacks.shouldContinue()) break;
     }
 
     const stepBudget = getStepBudget(FIXED_PHYSICS_INTERVAL, this.timeScale);
@@ -365,4 +400,39 @@ export class RaceSimulation {
       };
     });
   }
+
+  private createMarbleOrders(totalCount: number): number[] {
+    return shuffle(
+      Array(totalCount)
+        .fill(0)
+        .map((_, i) => i),
+      this.randomSource
+    );
+  }
+
+  private createMarble(
+    participant: MarbleParticipant,
+    order: number,
+    totalCount: number,
+    spawnPositions: readonly VectorLike[]
+  ): void {
+    this.marbles.push(
+      new Marble(
+        this.physics,
+        order,
+        totalCount,
+        spawnPositions[order],
+        this.randomSource,
+        participant.name,
+        participant.weight
+      )
+    );
+  }
+}
+
+async function yieldToHost(): Promise<void> {
+  await new Promise<void>((resolve) => {
+    if (typeof setTimeout === 'function') setTimeout(resolve, 0);
+    else resolve();
+  });
 }

@@ -74,6 +74,14 @@ function postCancelled(jobId: string): void {
 }
 
 function runJob(message: Extract<WorkerMessage, { type: 'run' }>): void {
+  // A dropPlan/cancel race is a normal stale-generation lifecycle. Honor a
+  // queued cancellation before validating the plan so it cannot be promoted
+  // to a pool-wide protocol failure.
+  if (cancelledBeforeStart.delete(message.jobId)) {
+    postCancelled(message.jobId);
+    return;
+  }
+
   let request: HeadlessSimulationRequest;
   if ('planId' in message) {
     const requestWithoutSeed = plans.get(message.planId);
@@ -90,11 +98,6 @@ function runJob(message: Extract<WorkerMessage, { type: 'run' }>): void {
     request = { ...requestWithoutSeed, seed: message.seed };
   } else {
     request = message.request;
-  }
-
-  if (cancelledBeforeStart.delete(message.jobId)) {
-    postCancelled(message.jobId);
-    return;
   }
 
   const controller = new AbortController();

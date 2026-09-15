@@ -70,7 +70,7 @@ export class Roulette extends EventTarget {
   } | null = null;
   private _fairnessStartPromise: Promise<void> | null = null;
   private _standbyRequestToken = 0;
-  private _standbyScheduleTimer: ReturnType<typeof setTimeout> | null = null;
+  private _standbyScheduleCancel: (() => void) | null = null;
   private _scheduledStandby: { token: number; seed: Seed } | null = null;
   private _standbyPreparation: {
     token: number;
@@ -288,6 +288,7 @@ export class Roulette extends EventTarget {
       winnerRange: this._roundSession.getWinnerRange(),
       skillsEnabled: this._roundSession.getSkillsEnabled(),
       currentSeed: this._roundSession.getSeed(),
+      nextRoundSeed: this._roundSession.getNextRoundSeed(),
     } as const;
     const token = this._standbyRequestToken;
     void this._fairnessCoordinator.schedulePrecompute(request, delay).then((plan) => {
@@ -297,13 +298,10 @@ export class Roulette extends EventTarget {
   }
 
   private _scheduleAuthoritativeStandby(plan: FairnessPrecomputedPlan, token: number): void {
-    if (this._standbyScheduleTimer !== null) {
-      clearTimeout(this._standbyScheduleTimer);
-      this._standbyScheduleTimer = null;
-    }
+    this._cancelScheduledStandby();
     this._scheduledStandby = { token, seed: plan.seed };
     const prepare = () => {
-      this._standbyScheduleTimer = null;
+      this._standbyScheduleCancel = null;
       if (token !== this._standbyRequestToken) return;
       if (this._scheduledStandby?.token !== token || this._scheduledStandby.seed !== plan.seed) return;
       this._scheduledStandby = null;
@@ -317,7 +315,7 @@ export class Roulette extends EventTarget {
         }
       );
     };
-    this._standbyScheduleTimer = setTimeout(prepare, 0);
+    this._standbyScheduleCancel = this._scheduleStandbyPreparation(prepare);
   }
 
   private _beginStandbyPreparation(seed: Seed, token: number): Promise<unknown> {
@@ -330,10 +328,7 @@ export class Roulette extends EventTarget {
 
   private _startScheduledStandby(seed: Seed, token: number): void {
     if (this._scheduledStandby?.token !== token || this._scheduledStandby.seed !== seed) return;
-    if (this._standbyScheduleTimer !== null) {
-      clearTimeout(this._standbyScheduleTimer);
-      this._standbyScheduleTimer = null;
-    }
+    this._cancelScheduledStandby();
     this._scheduledStandby = null;
     const promise = this._beginStandbyPreparation(seed, token);
     void promise.then(
@@ -348,13 +343,45 @@ export class Roulette extends EventTarget {
 
   private _invalidateStandby(): void {
     this._standbyRequestToken++;
-    if (this._standbyScheduleTimer !== null) {
-      clearTimeout(this._standbyScheduleTimer);
-      this._standbyScheduleTimer = null;
-    }
+    this._cancelScheduledStandby();
     this._scheduledStandby = null;
     this._standbyPreparation = null;
     this._roundSession.discardAuthoritativeStandby();
+  }
+
+  private _cancelScheduledStandby(): void {
+    this._standbyScheduleCancel?.();
+    this._standbyScheduleCancel = null;
+  }
+
+  /**
+   * Keep the synchronous Shuffle/paint path free of authoritative Box2D
+   * preparation. requestIdleCallback is preferred; the frame fallback waits
+   * until after a paint, and the timer fallback yields to a later task.
+   */
+  private _scheduleStandbyPreparation(callback: () => void): () => void {
+    const scope = globalThis as typeof globalThis & {
+      requestIdleCallback?: (callback: () => void, options?: { timeout?: number }) => number;
+      cancelIdleCallback?: (handle: number) => void;
+      requestAnimationFrame?: (callback: () => void) => number;
+      cancelAnimationFrame?: (handle: number) => void;
+    };
+    if (typeof scope.requestIdleCallback === 'function') {
+      const handle = scope.requestIdleCallback(callback, { timeout: 1000 });
+      return () => scope.cancelIdleCallback?.(handle);
+    }
+    if (typeof scope.requestAnimationFrame === 'function') {
+      let timer: ReturnType<typeof setTimeout> | null = null;
+      const frame = scope.requestAnimationFrame(() => {
+        timer = setTimeout(callback, 0);
+      });
+      return () => {
+        scope.cancelAnimationFrame?.(frame);
+        if (timer !== null) clearTimeout(timer);
+      };
+    }
+    const timer = setTimeout(callback, 16);
+    return () => clearTimeout(timer);
   }
 
   private _cancelActiveFairnessDraw(reason: string, cancelNormalDraw = true): void {
@@ -747,6 +774,7 @@ export class Roulette extends EventTarget {
       winnerRange,
       skillsEnabled: this._roundSession.getSkillsEnabled(),
       currentSeed: this._roundSession.getSeed(),
+      nextRoundSeed: this._roundSession.getNextRoundSeed(),
     } as const;
     const restoreRandomSeedMode = this._roundSession.getSeedMode() === 'random';
 

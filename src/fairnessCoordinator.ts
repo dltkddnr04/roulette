@@ -53,6 +53,8 @@ export type FairnessStartRequest = Readonly<{
   winnerRange: Readonly<{ start: number; end: number }>;
   skillsEnabled: boolean;
   currentSeed: Seed;
+  /** Seed reserved for the next logical round; excluded from policy identity. */
+  nextRoundSeed?: Seed;
 }>;
 
 export type FairnessHeadlessSearchRequest = HeadlessSimulationRequest;
@@ -170,6 +172,10 @@ function sameSearchRequest(left: FairnessStartRequest, right: FairnessStartReque
     left.winnerRange.end === right.winnerRange.end &&
     left.skillsEnabled === right.skillsEnabled
   );
+}
+
+function getRequestedRoundSeed(request: FairnessStartRequest): Seed {
+  return request.nextRoundSeed ?? request.currentSeed;
 }
 
 const FAIRNESS_PRECOMPUTE_DEBOUNCE_MS = 150;
@@ -503,8 +509,9 @@ export class FairnessCoordinator {
     // the strict-balance path where no headless search is awaited.
     this.assertSearchCurrent(generation);
     if (!context.mustSearch) {
-      this.getOrCreatePreparedDrawDraft(context, request.currentSeed);
-      return { key: context.key, generation, seed: request.currentSeed };
+      const seed = getRequestedRoundSeed(request);
+      this.getOrCreatePreparedDrawDraft(context, seed);
+      return { key: context.key, generation, seed };
     }
     const candidate = await this.ensureSearch(context);
     return { key: candidate.key, generation: candidate.generation, seed: candidate.seed };
@@ -791,7 +798,7 @@ export class FairnessCoordinator {
     this.clearPrecomputeTimer();
     const context = await this.createSearchContext(request, token);
     const { syncedInputs, mappingRows, totalCount } = context;
-    let seed = request.currentSeed;
+    let seed = getRequestedRoundSeed(request);
     let expectedWinnerEntryIds: readonly string[] | null = null;
     let expectedWinnerParticipantIds: readonly string[] | null = null;
     let expectedWinnerMarbleIds: readonly number[] | null = null;
@@ -845,15 +852,7 @@ export class FairnessCoordinator {
       if (error instanceof FairnessCancelledError) throw error;
       if (!preparedEvent) {
         try {
-          preparedEvent = this.createPreparedEvent(
-            request,
-            request.currentSeed,
-            syncedInputs,
-            mappingRows,
-            totalCount,
-            drawId,
-            true
-          );
+          preparedEvent = this.createPreparedEvent(request, seed, syncedInputs, mappingRows, totalCount, drawId, true);
         } catch {
           // A storage or cancellation failure should not mask the original
           // search error or prevent the legacy race path from continuing.
@@ -1513,14 +1512,21 @@ export class FairnessCoordinator {
     }
 
     const eligible = new Set(context.eligibleEntryIds);
-    const parallelism =
+    const maxParallelism =
       Number.isSafeInteger(workerPool.concurrency) && workerPool.concurrency > 0 ? workerPool.concurrency : 1;
+    const getReadyParallelism = (): number => {
+      const ready = workerPool.readyConcurrency;
+      if (typeof ready !== 'number' || !Number.isSafeInteger(ready)) return maxParallelism;
+      return Math.max(1, Math.min(maxParallelism, ready));
+    };
     const active = new Map<number, { seed: Seed; controller: AbortController; promise: Promise<void> }>();
     const completed = new Map<number, CompletedSearchAttempt>();
     let nextAttempt = 0;
     let nextCommit = 0;
     let lastError: unknown;
     let workerFailure: unknown | null = null;
+    let readyWaitTarget = 0;
+    let readyWait: Promise<void> | null = null;
 
     const startAttempt = (): void => {
       const attempt = nextAttempt++;
@@ -1582,6 +1588,29 @@ export class FairnessCoordinator {
       );
     };
 
+    const waitForAdditionalReadyWorker = (): Promise<void> | null => {
+      const parallelism = getReadyParallelism();
+      if (parallelism >= maxParallelism || !workerPool.waitForReadyConcurrency) return null;
+      const target = parallelism + 1;
+      if (readyWait && readyWaitTarget === target) return readyWait;
+
+      readyWaitTarget = target;
+      readyWait = workerPool.waitForReadyConcurrency(target, signal).then(
+        () => {
+          readyWait = null;
+          readyWaitTarget = 0;
+        },
+        (error: unknown) => {
+          readyWait = null;
+          readyWaitTarget = 0;
+          if (signal.aborted || isCancellationError(error)) return;
+          if (isWorkerPoolUnavailableError(error)) workerFailure = error;
+          else workerFailure = error instanceof Error ? error : new Error('Fairness worker readiness failed');
+        }
+      );
+      return readyWait;
+    };
+
     const commitCompleted = (): SearchResult | null => {
       while (nextCommit < nextAttempt) {
         const attempt = nextCommit;
@@ -1622,6 +1651,7 @@ export class FairnessCoordinator {
       if (completedCandidate) return completedCandidate;
       if (workerFailure !== null) return fallbackToSerial();
 
+      const parallelism = getReadyParallelism();
       while (nextAttempt - nextCommit < parallelism && nextAttempt < context.budget) startAttempt();
       if (workerFailure !== null) return fallbackToSerial();
 
@@ -1633,7 +1663,10 @@ export class FairnessCoordinator {
         await yieldToHost();
         continue;
       }
-      await Promise.race([...active.values()].map(({ promise }) => promise));
+      const readiness = waitForAdditionalReadyWorker();
+      const waits = [...active.values()].map(({ promise }) => promise);
+      if (readiness) waits.push(readiness);
+      await Promise.race(waits);
       if (workerFailure !== null) return fallbackToSerial();
       if (signal.aborted) throw new FairnessCancelledError();
       await yieldToHost();

@@ -8,7 +8,7 @@ import {
 import type { MarblePresentationState, MarbleRenderState } from './types/MarbleRenderState.type';
 import { getMarbleSpawnLayout, type MarbleSpawnLayout } from './utils/marbleSpawn';
 import { getSimulationParticipantSetup } from './utils/participants';
-import type { Seed } from './utils/random';
+import { createRandomSeed, type Seed } from './utils/random';
 
 export type RoundState = 'initializing' | 'ready' | 'running' | 'finished';
 
@@ -56,6 +56,7 @@ export class RoundSession {
   private roundId = 0;
   private configuredCount = 0;
   private previewMarbles: MarbleRenderState[] = [];
+  private reservedNextRoundSeed: Seed | null = null;
   private authoritativeStandby: AuthoritativeStandby | null = null;
   private standbyRequestId = 0;
   private standbyPromise: Promise<MarbleSpawnLayout | null> | null = null;
@@ -65,6 +66,8 @@ export class RoundSession {
     skillsEnabled: boolean;
     participantInputs: readonly string[];
   } | null = null;
+  private deferredCleanup: RaceSimulation | null = null;
+  private deferredCleanupCancel: (() => void) | null = null;
 
   constructor(simulation = new RaceSimulation()) {
     this.simulation = simulation;
@@ -91,6 +94,19 @@ export class RoundSession {
     return this.seed;
   }
 
+  /**
+   * Return the physical seed reserved for the next logical round without
+   * changing the seed of the completed/current round. Random mode reserves a
+   * fresh seed only after a round has finished; a ready preview reuses its
+   * already visible seed until the user explicitly shuffles again.
+   */
+  getNextRoundSeed(): Seed {
+    if (this.getSeedMode() === 'explicit') return this.seed;
+    if (this.reservedNextRoundSeed !== null) return this.reservedNextRoundSeed;
+    this.reservedNextRoundSeed = this.state === 'finished' ? createRandomSeed() : this.seed;
+    return this.reservedNextRoundSeed;
+  }
+
   getSeedMode(): 'random' | 'explicit' {
     return this.simulation.getSeedMode();
   }
@@ -111,6 +127,7 @@ export class RoundSession {
 
   setSeed(seed: Seed): void {
     this.discardAuthoritativeStandby();
+    this.reservedNextRoundSeed = null;
     this.seed = seed;
     this.simulation.setSeed(seed);
     if (this.state === 'ready' && this.stage) this.rebuildPreview(false);
@@ -118,6 +135,7 @@ export class RoundSession {
 
   setRandomSeedMode(): void {
     this.discardAuthoritativeStandby();
+    this.reservedNextRoundSeed = null;
     this.simulation.setRandomSeedMode();
   }
 
@@ -237,7 +255,28 @@ export class RoundSession {
         }
         simulation.loadStage(stage);
         simulation.setSkillsEnabled(skillsEnabled);
-        simulation.replaceMarbles(setup.participants, setup.totalCount, spawnLayout.positions, seed, false);
+        // Keep stage/entity preparation and marble-body creation in separate
+        // host tasks. A stale standby can then be retired before any marble
+        // bodies are created, and a large standby build does not monopolize
+        // the task that loaded the map.
+        await yieldToHost();
+        if (requestId !== this.standbyRequestId || this.state === 'running') {
+          simulation.dispose();
+          return null;
+        }
+        const complete = await simulation.replaceMarblesChunked(
+          setup.participants,
+          setup.totalCount,
+          spawnLayout.positions,
+          seed,
+          false,
+          64,
+          () => requestId === this.standbyRequestId && this.state !== 'running'
+        );
+        if (!complete) {
+          simulation.dispose();
+          return null;
+        }
         if (requestId !== this.standbyRequestId || this.state === 'running') {
           simulation.dispose();
           return null;
@@ -302,6 +341,7 @@ export class RoundSession {
     this.simulation = standby.simulation;
     this.authoritativeStandby = null;
     this.standbyRequestId++;
+    this.reservedNextRoundSeed = null;
     this.previewMarbles = [];
     this.clearResults();
     this.configuredCount = standby.count;
@@ -330,7 +370,7 @@ export class RoundSession {
       // A map change still needs a full stage/world reset, but a ready-screen
       // preview must not leave authoritative marble bodies behind. The next
       // Start will create those bodies from this canonical stage as needed.
-      this.simulation.clearMarbles();
+      this.clearCurrentMarbles();
       this.simulation.loadStage(stage);
       return this.rebuildPreview(true);
     }
@@ -341,9 +381,10 @@ export class RoundSession {
     if (!this.isInitialized) return;
 
     this.discardAuthoritativeStandby();
+    this.clearCurrentMarbles();
+    this.reservedNextRoundSeed = null;
     this.simulation.resetTiming();
     this.invalidateRound();
-    this.simulation.clearMarbles();
     this.previewMarbles = [];
     this.configuredCount = 0;
     this.clearResults();
@@ -357,8 +398,9 @@ export class RoundSession {
     if (!this.isInitialized) return;
 
     this.discardAuthoritativeStandby();
+    this.clearCurrentMarbles();
+    this.reservedNextRoundSeed = null;
     this.invalidateRound();
-    this.simulation.clearMarbles();
     this.previewMarbles = [];
     this.configuredCount = 0;
     this.clearResults();
@@ -370,11 +412,15 @@ export class RoundSession {
       if (!this.rebuildParticipants()) return null;
     }
     if (this.state !== 'ready') return null;
-    if (this.simulation.getCount() === 0 && this.configuredCount > 0) {
+    // Ready-state marbles are normally synthetic preview state. A finished
+    // round can still have its old bodies waiting for deferred cleanup, so a
+    // direct (non-Fairness) Start must never activate those old bodies.
+    if (this.previewMarbles.length > 0 || (this.simulation.getCount() === 0 && this.configuredCount > 0)) {
       if (!this.rebuildParticipants()) return null;
     }
     if (this.simulation.getCount() === 0) return null;
 
+    this.reservedNextRoundSeed = null;
     this.simulation.resetInterpolationSnapshots();
     this.state = 'running';
     this.roundId++;
@@ -394,6 +440,7 @@ export class RoundSession {
   }
 
   advance(frameDelta: number, speed: number, fastForwardSpeed: number, callbacks: RoundStepCallbacks): number {
+    if (this.state === 'finished' || this.deferredCleanup === this.simulation) return 0;
     const simulationCallbacks: SimulationStepCallbacks = {
       onImpact: callbacks.onImpact,
       onFinish: (marble) => {
@@ -402,6 +449,7 @@ export class RoundSession {
       },
       afterStep: callbacks.afterStep,
       onStepComplete: callbacks.onStepComplete,
+      shouldContinue: () => this.state === 'running',
     };
     return this.simulation.advance(frameDelta, speed, fastForwardSpeed, simulationCallbacks);
   }
@@ -418,10 +466,10 @@ export class RoundSession {
     const earlyWinning = early && this.isWinningRank(this.winners.length);
     this.result = ranked.slice(start, end + 1);
     this.state = 'finished';
-    // The finished result is retained in presentation state, so the
-    // authoritative bodies can be released before the next Shuffle click.
-    // This keeps the ready-screen path free of Box2D destruction work.
-    this.simulation.clearMarbles();
+    // Keep the result as immutable presentation state and retire the live
+    // physics bodies outside the finish frame. The next ready preview can be
+    // rendered immediately while the old world is waiting for an idle slice.
+    this.deferMarbleCleanup();
     this.previewMarbles = [];
     return {
       result: this.result.slice(),
@@ -447,6 +495,9 @@ export class RoundSession {
   }
 
   getRenderStates(alpha: number): RaceRenderState {
+    if (this.state === 'finished') {
+      return { marbles: [], entities: this.simulation.getEntityRenderStates(alpha) };
+    }
     const renderStates = this.simulation.getRenderStates(alpha);
     if (this.state === 'ready' && this.previewMarbles.length > 0) {
       return { ...renderStates, marbles: this.previewMarbles };
@@ -463,6 +514,8 @@ export class RoundSession {
   }
 
   private rebuildParticipants(): MarbleSpawnLayout | null {
+    const randomMode = this.simulation.getSeedMode() === 'random';
+    const reservedSeed = this.reservedNextRoundSeed;
     this.reset();
     if (!this.stage) return null;
 
@@ -475,7 +528,8 @@ export class RoundSession {
 
     const spawnLayout = getMarbleSpawnLayout(setup.totalCount, this.stage.spawn);
     this.configuredCount = setup.totalCount;
-    this.seed = this.simulation.prepareSeedForRebuild();
+    this.seed = randomMode && reservedSeed !== null ? reservedSeed : this.simulation.prepareSeedForRebuild();
+    this.reservedNextRoundSeed = null;
     this.simulation.replaceMarbles(setup.participants, setup.totalCount, spawnLayout.positions, this.seed, false);
     this.previewMarbles = [];
     this.seed = this.simulation.getSeed();
@@ -492,16 +546,22 @@ export class RoundSession {
       return null;
     }
 
-    // The normal ready path already has no authoritative bodies. Keep this
-    // guard for callers that leave a prepared authoritative round in the
-    // ready state, so a later preview rebuild can never keep stale bodies.
-    if (this.simulation.getCount() > 0) this.simulation.clearMarbles();
+    // The normal ready path already has no authoritative bodies. If a finish
+    // cleanup is pending, leave those bodies owned by the deferred cleanup so
+    // Shuffle itself never pays their DestroyBody cost.
+    if (chooseNewSeed) this.discardAuthoritativeStandby();
+    if (this.simulation.getCount() > 0 && this.deferredCleanup !== this.simulation) {
+      this.simulation.clearMarbles();
+    }
     this.simulation.resetTiming();
     this.invalidateRound();
     this.clearResults();
     this.state = 'ready';
     this.configuredCount = setup.totalCount;
-    if (chooseNewSeed) this.seed = this.simulation.prepareSeedForRebuild();
+    if (chooseNewSeed) {
+      this.seed = this.simulation.prepareSeedForRebuild();
+      if (this.simulation.getSeedMode() === 'random') this.reservedNextRoundSeed = this.seed;
+    }
     const spawnLayout = getMarbleSpawnLayout(setup.totalCount, this.stage.spawn);
     this.previewMarbles = createMarblePreviewStates(
       setup.participants,
@@ -521,8 +581,76 @@ export class RoundSession {
     this.result = null;
   }
 
+  private deferMarbleCleanup(): void {
+    const simulation = this.simulation;
+    if (this.deferredCleanup === simulation) return;
+    const previous = this.cancelDeferredCleanup();
+    previous?.dispose();
+    this.deferredCleanup = simulation;
+    const cleanup = () => {
+      if (this.deferredCleanup !== simulation) return;
+      this.deferredCleanup = null;
+      this.deferredCleanupCancel = null;
+      if (this.simulation === simulation) simulation.clearMarbles();
+      else simulation.dispose();
+    };
+    const idleScheduler = (
+      globalThis as typeof globalThis & {
+        requestIdleCallback?: (callback: () => void, options?: { timeout?: number }) => number;
+        cancelIdleCallback?: (handle: number) => void;
+        requestAnimationFrame?: (callback: () => void) => number;
+        cancelAnimationFrame?: (handle: number) => void;
+      }
+    ).requestIdleCallback;
+    if (typeof idleScheduler === 'function') {
+      const handle = idleScheduler(cleanup, { timeout: 1000 });
+      this.deferredCleanupCancel = () => {
+        globalThis.cancelIdleCallback?.(handle);
+      };
+      return;
+    }
+    const frameScheduler = (
+      globalThis as typeof globalThis & { requestAnimationFrame?: (callback: () => void) => number }
+    ).requestAnimationFrame;
+    if (typeof frameScheduler === 'function') {
+      const handle = frameScheduler(cleanup);
+      this.deferredCleanupCancel = () => {
+        globalThis.cancelAnimationFrame?.(handle);
+      };
+      return;
+    }
+    const timer = setTimeout(cleanup, 0);
+    this.deferredCleanupCancel = () => clearTimeout(timer);
+  }
+
+  private flushDeferredCleanup(): void {
+    const simulation = this.cancelDeferredCleanup();
+    if (!simulation) return;
+    if (this.simulation === simulation) simulation.clearMarbles();
+    else simulation.dispose();
+  }
+
+  private clearCurrentMarbles(): void {
+    const deferred = this.deferredCleanup === this.simulation;
+    this.flushDeferredCleanup();
+    if (!deferred) this.simulation.clearMarbles();
+  }
+
+  private cancelDeferredCleanup(): RaceSimulation | null {
+    const simulation = this.deferredCleanup;
+    if (!simulation) return null;
+    this.deferredCleanup = null;
+    this.deferredCleanupCancel?.();
+    this.deferredCleanupCancel = null;
+    return simulation;
+  }
+
   private retireSimulation(simulation: RaceSimulation): void {
     if (simulation === this.simulation) return;
+    // A finished simulation may already be owned by the deferred-cleanup
+    // scheduler. Transfer that ownership before scheduling disposal so one
+    // world cannot be disposed by two callbacks after standby adoption.
+    this.cancelDeferredCleanupIf(simulation);
     const dispose = () => simulation.dispose();
     const idleScheduler = (
       globalThis as typeof globalThis & {
@@ -533,4 +661,15 @@ export class RoundSession {
     else if (typeof setTimeout === 'function') setTimeout(dispose, 0);
     else dispose();
   }
+
+  private cancelDeferredCleanupIf(simulation: RaceSimulation): void {
+    if (this.deferredCleanup !== simulation) return;
+    this.cancelDeferredCleanup();
+  }
+}
+
+function yieldToHost(): Promise<void> {
+  return new Promise((resolve) => {
+    setTimeout(resolve, 0);
+  });
 }
