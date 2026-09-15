@@ -140,6 +140,15 @@ export class RoundSession {
     return this.rebuildMarbles();
   }
 
+  /**
+   * Recreate the complete authoritative round state from the stage's initial
+   * physics state. Fairness predictions start from this same state.
+   */
+  rebuildAuthoritativeRoundForCurrentParticipants(): MarbleSpawnLayout | null {
+    if (!this.isInitialized || this.state !== 'ready') return null;
+    return this.rebuildParticipants();
+  }
+
   setMap(stage: StageDef): MarbleSpawnLayout | null {
     if (!this.isInitialized) return null;
 

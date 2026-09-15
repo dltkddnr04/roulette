@@ -640,7 +640,7 @@ export class Roulette extends EventTarget {
     this._invalidateRecording();
     this._presentationEffects.clear();
     this._roundSession.setSeed(prepared.seed);
-    const spawnLayout = this._roundSession.rebuildMarblesForCurrentParticipants();
+    const spawnLayout = this._roundSession.rebuildAuthoritativeRoundForCurrentParticipants();
     if (!spawnLayout) {
       await this._fairnessCoordinator.cancelDraw(prepared.drawId, 'Fairness could not rebuild the round');
       this._emitMessage('Fairness could not rebuild the round');
@@ -924,7 +924,7 @@ export class Roulette extends EventTarget {
       this._applyingReplay,
       !this._applyingReplay && participantsChanged
     );
-    if (participantsChanged) this._scheduleFairnessPrecompute();
+    this._scheduleFairnessPrecompute();
     if (!spawnLayout) return;
 
     // 카메라를 구슬 생성 위치 중앙으로 이동 + 줌인
