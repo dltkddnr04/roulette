@@ -715,6 +715,14 @@ export class FairnessCoordinator {
     return runHeadlessRace(request, this.headlessStepLimit, options);
   }
 
+  private scheduleReadyReservationDiscard(reservation: FairnessReservationRecord): void {
+    const discardReadyReservation = this.store.discardReadyReservation;
+    if (!discardReadyReservation) return;
+    void discardReadyReservation
+      .call(this.store, reservation.reservationId, getReservationIdentity(reservation))
+      .catch(() => undefined);
+  }
+
   private invalidateSearchState(): void {
     const staleWork = this.inFlightSearch;
     const stalePlanId = `fairness-plan-${this.searchGeneration}`;
@@ -726,12 +734,7 @@ export class FairnessCoordinator {
     const staleReservations = [...this.durableReservations.values()];
     this.durableReservations.clear();
     staleWork?.controller.abort();
-    const removeReservation = this.store.removeReservation;
-    if (removeReservation) {
-      staleReservations.forEach((reservation) => {
-        void removeReservation.call(this.store, reservation.reservationId).catch(() => undefined);
-      });
-    }
+    staleReservations.forEach((reservation) => this.scheduleReadyReservationDiscard(reservation));
     if (this.configuredWorkerPool) {
       this.configuredWorkerPool.dropPlan?.(stalePlanId);
     } else {
@@ -1368,12 +1371,10 @@ export class FairnessCoordinator {
           }
           this.applyAlreadyPersistedEvents(recovery.preparedEvent ? [recovery.preparedEvent, terminalEvent] : [terminalEvent]);
         }
-        const removeReservation = this.store.removeReservation;
-        if (removeReservation) {
-          orphanReservationIds.forEach((reservationId) => {
-            void removeReservation.call(this.store, reservationId).catch(() => undefined);
-          });
-        }
+        orphanReservationIds.forEach((reservationId) => {
+          const reservation = reservations.find((candidate) => candidate.reservationId === reservationId);
+          if (reservation) this.scheduleReadyReservationDiscard(reservation);
+        });
         this.available = true;
         this.error = null;
       } catch (error) {
@@ -1801,6 +1802,41 @@ export class FairnessCoordinator {
     );
   }
 
+  private async cancelClaimedReservationBeforeStart(
+    context: FairnessSearchContext,
+    reservation: DurableFairnessReservation
+  ): Promise<void> {
+    const preparedEvent = this.createPreparedEventFromDraft(reservation.drawId, reservation.draft);
+    const terminalEvent: FairnessDrawCancelledEvent = {
+      ...createBaseEvent('drawCancelled', this.now, this.createId),
+      drawId: reservation.drawId,
+      reason: 'Fairness draw was cancelled before start',
+    };
+    try {
+      const finalizeReservation = this.store.finalizeReservation;
+      const recoverClaimedReservation = this.store.recoverClaimedReservation;
+      if (finalizeReservation) {
+        await finalizeReservation.call(this.store, reservation.reservationId, preparedEvent, terminalEvent);
+      } else if (recoverClaimedReservation) {
+        await recoverClaimedReservation.call(this.store, reservation.reservationId, preparedEvent, terminalEvent);
+      } else {
+        throw new Error('Fairness reservation cancellation is unavailable');
+      }
+    } catch (error) {
+      this.markUnavailable(error);
+      throw error;
+    }
+    await this.enqueueMutation(async () => {
+      this.applyAlreadyPersistedEvents([preparedEvent, terminalEvent]);
+    });
+    this.recordDiagnostic('reservation.cancelled-before-start', {
+      generation: context.generation,
+      key: context.key,
+      seed: reservation.seed,
+      reservationId: reservation.reservationId,
+    });
+  }
+
   private claimCachedPreparedDraw(
     cachedReservation: { context: FairnessSearchContext; reservation: DurableFairnessReservation },
     token: number,
@@ -1816,7 +1852,7 @@ export class FairnessCoordinator {
       claimReservation.call(this.store, reservation.reservationId, getReservationIdentity(reservation))
     );
     return claim.then(
-      (status) => {
+      async (status) => {
         if (status !== 'claimed') {
           this.durableReservations.delete(reservation.reservationId);
           this.recordDiagnostic('reservation.claim-conflict', {
@@ -1829,9 +1865,15 @@ export class FairnessCoordinator {
           throw new FairnessCancelledError();
         }
         this.durableReservations.delete(reservation.reservationId);
-        this.assertSearchCurrent(context.generation);
-        this.assertCurrent(token);
-        return this.materializeCachedPreparedDraw(cachedReservation, token, includeEvent);
+        try {
+          this.assertSearchCurrent(context.generation);
+          this.assertCurrent(token);
+          return this.materializeCachedPreparedDraw(cachedReservation, token, includeEvent);
+        } catch (error) {
+          if (!isCancellationError(error)) throw error;
+          await this.cancelClaimedReservationBeforeStart(context, reservation);
+          throw error;
+        }
       },
       (error: unknown) => {
         if (isCancellationError(error)) throw error;
@@ -1859,7 +1901,7 @@ export class FairnessCoordinator {
     result: Pick<SearchCandidate, 'seed' | 'winnerMarbleIds' | 'winnerEntryIds' | 'draft'>
   ): Promise<DurableFairnessReservation | null> {
     const reserve = this.store.reserve;
-    if (!reserve || !this.store.removeReservation) return null;
+    if (!reserve || !this.store.discardReadyReservation) return null;
     this.assertSearchCurrent(context.generation);
 
     const requestedSeed = getRequestedRoundSeed(context.request);
@@ -1877,14 +1919,11 @@ export class FairnessCoordinator {
     // Shuffle), remove the older same-policy reservation instead of leaving
     // two physical rounds eligible for a later claim.
     if (!context.mustSearch) {
-      const removeReservation = this.store.removeReservation;
       [...this.durableReservations.values()]
         .filter((candidate) => candidate.key === context.key && candidate.seed !== result.seed)
         .forEach((candidate) => {
           this.durableReservations.delete(candidate.reservationId);
-          if (removeReservation) {
-            void removeReservation.call(this.store, candidate.reservationId).catch(() => undefined);
-          }
+          this.scheduleReadyReservationDiscard(candidate);
         });
     }
 
@@ -1905,15 +1944,12 @@ export class FairnessCoordinator {
       seed: result.seed,
       reservationId: reservation.reservationId,
     });
-    const removeReservation = this.store.removeReservation;
     const write = reserve.call(this.store, reservation).then(
       () => {
         try {
           this.assertSearchCurrent(context.generation);
         } catch (error) {
-          if (removeReservation) {
-            void removeReservation.call(this.store, reservation.reservationId).catch(() => undefined);
-          }
+          this.scheduleReadyReservationDiscard(reservation);
           throw error;
         }
         this.durableReservations.set(reservation.reservationId, reservation);

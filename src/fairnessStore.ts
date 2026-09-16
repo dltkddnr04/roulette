@@ -41,6 +41,8 @@ export type FairnessReservationIdentity = Readonly<{
 
 export type FairnessReservationClaimResult = 'claimed' | 'already-claimed' | 'missing' | 'mismatch';
 
+export type FairnessReservationDiscardResult = 'discarded' | 'claimed' | 'missing' | 'mismatch';
+
 export type FairnessReservationTerminalEvent =
   | FairnessDrawConfirmedEvent
   | FairnessDrawFailedEvent
@@ -58,6 +60,10 @@ export interface FairnessEventStore {
     reservationId: string,
     expected: FairnessReservationIdentity
   ): Promise<FairnessReservationClaimResult>;
+  discardReadyReservation?(
+    reservationId: string,
+    expected: FairnessReservationIdentity
+  ): Promise<FairnessReservationDiscardResult>;
   finalizeReservation?(
     reservationId: string,
     preparedEvent: FairnessDrawPreparedEvent,
@@ -264,6 +270,69 @@ export class IndexedDbFairnessStore implements FairnessEventStore {
 
   async removeReservation(reservationId: string): Promise<void> {
     await this.request<undefined>('readwrite', (store) => store.delete(reservationId), RESERVATION_STORE_NAME);
+  }
+
+  async discardReadyReservation(
+    reservationId: string,
+    expected: FairnessReservationIdentity
+  ): Promise<FairnessReservationDiscardResult> {
+    const database = await this.open();
+    return new Promise<FairnessReservationDiscardResult>((resolve, reject) => {
+      let transaction: IDBTransaction;
+      let result: FairnessReservationDiscardResult = 'missing';
+      let settled = false;
+      const resolveOnce = (value: FairnessReservationDiscardResult): void => {
+        if (settled) return;
+        settled = true;
+        resolve(value);
+      };
+      const rejectOnce = (error: unknown): void => {
+        if (settled) return;
+        settled = true;
+        reject(error);
+      };
+
+      try {
+        transaction = database.transaction(RESERVATION_STORE_NAME, 'readwrite');
+        const store = transaction.objectStore(RESERVATION_STORE_NAME);
+        const request = store.get(reservationId);
+        request.onsuccess = () => {
+          try {
+            if (!request.result) {
+              result = 'missing';
+              return;
+            }
+            const reservation = validateReservation(request.result);
+            if (!sameReservationIdentity(reservation, expected)) {
+              result = 'mismatch';
+              return;
+            }
+            if (reservation.state === 'claimed') {
+              result = 'claimed';
+              return;
+            }
+            store.delete(reservationId);
+            result = 'discarded';
+          } catch (error) {
+            rejectOnce(error);
+            try {
+              transaction.abort();
+            } catch {
+              // The transaction may already be aborting.
+            }
+          }
+        };
+        request.onerror = () =>
+          rejectOnce(request.error ?? new Error('Fairness reservation discard failed'));
+        transaction.oncomplete = () => resolveOnce(result);
+        transaction.onerror = () =>
+          rejectOnce(transaction.error ?? new Error('Fairness reservation discard transaction failed'));
+        transaction.onabort = () =>
+          rejectOnce(transaction.error ?? new Error('Fairness reservation discard transaction aborted'));
+      } catch (error) {
+        rejectOnce(error);
+      }
+    });
   }
 
   async claimReservation(
@@ -525,6 +594,19 @@ export class InMemoryFairnessStore implements FairnessEventStore {
 
   async removeReservation(reservationId: string): Promise<void> {
     this.reservations.delete(reservationId);
+  }
+
+  async discardReadyReservation(
+    reservationId: string,
+    expected: FairnessReservationIdentity
+  ): Promise<FairnessReservationDiscardResult> {
+    const stored = this.reservations.get(reservationId);
+    if (!stored) return 'missing';
+    const reservation = validateReservation(stored);
+    if (!sameReservationIdentity(reservation, expected)) return 'mismatch';
+    if (reservation.state === 'claimed') return 'claimed';
+    this.reservations.delete(reservationId);
+    return 'discarded';
   }
 
   async claimReservation(
