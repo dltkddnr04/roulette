@@ -902,9 +902,12 @@ export class Roulette extends EventTarget {
     } as const;
     const restoreRandomSeedMode = this._roundSession.getSeedMode() === 'random';
 
-    let prepared;
+    let prepared: FairnessPreparedDraw;
     try {
-      prepared = await this._fairnessCoordinator.prepareDraw(request, operationToken, { includeEvent: false });
+      prepared = this._fairnessCoordinator.tryPrepareDrawFromCache(request, operationToken, { includeEvent: false });
+      if (!prepared) {
+        prepared = await this._fairnessCoordinator.prepareDraw(request, operationToken, { includeEvent: false });
+      }
       this._fairnessCoordinator.recordDiagnostic('start.prepare.ready', {
         operationToken,
         drawId: prepared.drawId,

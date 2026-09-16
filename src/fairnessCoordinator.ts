@@ -628,6 +628,22 @@ export class FairnessCoordinator {
     this.precomputeTimerResolve = null;
   }
 
+  /**
+   * Claim a fully cached reservation without crossing an async boundary. The
+   * caller still falls back to prepareDraw when the cache is not complete.
+   */
+  tryPrepareDrawFromCache(
+    request: FairnessStartRequest,
+    token: number,
+    options: FairnessPrepareDrawOptions = {}
+  ): FairnessPreparedDraw | null {
+    this.clearPrecomputeTimer();
+    const cachedReservation = this.findCachedPreparedReservation(request, token);
+    if (!cachedReservation) return null;
+    this.recordDiagnostic('start.prepare.begin', { token, synchronous: true });
+    return this.materializeCachedPreparedDraw(cachedReservation, token, options.includeEvent !== false);
+  }
+
   private getWorkerPool(): Promise<FairnessWorkerPoolLike | null> {
     if (!this.useWorkerPool || this.workerPoolDisabled) return Promise.resolve(null);
     if (this.configuredWorkerPool) return Promise.resolve(this.configuredWorkerPool);
@@ -909,13 +925,30 @@ export class FairnessCoordinator {
     });
   }
 
-  async prepareDraw(
+  prepareDraw(
     request: FairnessStartRequest,
     token: number,
     options: FairnessPrepareDrawOptions = {}
   ): Promise<FairnessPreparedDraw> {
     this.clearPrecomputeTimer();
     this.recordDiagnostic('start.prepare.begin', { token });
+    const includeEvent = options.includeEvent !== false;
+    try {
+      const cachedReservation = this.findCachedPreparedReservation(request, token);
+      if (cachedReservation) {
+        return Promise.resolve(this.materializeCachedPreparedDraw(cachedReservation, token, includeEvent));
+      }
+    } catch (error) {
+      return Promise.reject(error);
+    }
+    return this.prepareDrawSlow(request, token, options);
+  }
+
+  private async prepareDrawSlow(
+    request: FairnessStartRequest,
+    token: number,
+    options: FairnessPrepareDrawOptions
+  ): Promise<FairnessPreparedDraw> {
     const includeEvent = options.includeEvent !== false;
     const context = await this.createSearchContext(request, token);
     const { syncedInputs, mappingRows, totalCount } = context;
@@ -1620,6 +1653,37 @@ export class FairnessCoordinator {
       return reservation;
     }
     return null;
+  }
+
+  private findCachedPreparedReservation(
+    request: FairnessStartRequest,
+    token: number
+  ): { context: FairnessSearchContext; reservation: DurableFairnessReservation } | null {
+    if (!this.loaded || !this.available || !this.enabled) return null;
+    const context = this.cachedContext;
+    if (
+      !context ||
+      context.generation !== this.searchGeneration ||
+      !sameSearchRequest(context.request, request)
+    ) {
+      return null;
+    }
+    this.assertCurrent(token);
+    const reservation = this.findDurableReservation(context, getRequestedRoundSeed(request));
+    return reservation ? { context, reservation } : null;
+  }
+
+  private materializeCachedPreparedDraw(
+    cachedReservation: { context: FairnessSearchContext; reservation: DurableFairnessReservation },
+    token: number,
+    includeEvent: boolean
+  ): FairnessPreparedDraw {
+    return this.materializePreparedDraw(
+      cachedReservation.context,
+      cachedReservation.reservation,
+      token,
+      includeEvent
+    );
   }
 
   private createPrecomputedPlan(
