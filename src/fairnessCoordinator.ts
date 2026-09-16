@@ -581,18 +581,14 @@ export class FairnessCoordinator {
     const requestedSeed = getRequestedRoundSeed(request);
     const existingReservation = this.findDurableReservation(context, requestedSeed);
     if (existingReservation) {
+      const plan = this.createPrecomputedPlan(context, requestedSeed, existingReservation);
       this.recordDiagnostic('precompute.reservation-hit', {
         generation,
         key: context.key,
-        seed: existingReservation.seed,
-        reservationId: existingReservation.reservationId,
+        seed: plan.seed,
+        reservationId: plan.reservationId,
       });
-      return {
-        key: context.key,
-        generation,
-        seed: existingReservation.seed,
-        reservationId: existingReservation.reservationId,
-      };
+      return plan;
     }
     if (!context.mustSearch) {
       const seed = requestedSeed;
@@ -603,33 +599,25 @@ export class FairnessCoordinator {
         winnerEntryIds: [],
         draft,
       });
+      const plan = this.createPrecomputedPlan(context, seed, reservation);
       this.recordDiagnostic('precompute.ready', {
         generation,
         key: context.key,
-        seed,
-        reservationId: reservation?.reservationId,
+        seed: plan.seed,
+        reservationId: plan.reservationId,
       });
-      return {
-        key: context.key,
-        generation,
-        seed,
-        ...(reservation ? { reservationId: reservation.reservationId } : {}),
-      };
+      return plan;
     }
     const candidate = await this.ensureSearch(context);
     const reservation = await this.ensureDurableReservation(context, candidate);
+    const plan = this.createPrecomputedPlan(context, candidate.seed, reservation);
     this.recordDiagnostic('precompute.ready', {
       generation,
       key: context.key,
-      seed: candidate.seed,
-      reservationId: reservation?.reservationId,
+      seed: plan.seed,
+      reservationId: plan.reservationId,
     });
-    return {
-      key: candidate.key,
-      generation: candidate.generation,
-      seed: candidate.seed,
-      ...(reservation ? { reservationId: reservation.reservationId } : {}),
-    };
+    return plan;
   }
 
   private clearPrecomputeTimer(): void {
@@ -1632,6 +1620,19 @@ export class FairnessCoordinator {
       return reservation;
     }
     return null;
+  }
+
+  private createPrecomputedPlan(
+    context: Pick<FairnessSearchContext, 'key' | 'generation'>,
+    fallbackSeed: Seed,
+    reservation: DurableFairnessReservation | null
+  ): FairnessPrecomputedPlan {
+    return {
+      key: context.key,
+      generation: context.generation,
+      seed: reservation?.seed ?? fallbackSeed,
+      ...(reservation ? { reservationId: reservation.reservationId } : {}),
+    };
   }
 
   private async ensureDurableReservation(
