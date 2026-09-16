@@ -9,6 +9,7 @@ import {
   evaluateStrictBalanceEntries,
   FAIRNESS_DATA_VERSION,
   FAIRNESS_SIMULATION_RULESET_VERSION,
+  type FairnessDrawCancelledEvent,
   type FairnessDrawEntrySnapshot,
   type FairnessDrawPreparedEvent,
   type FairnessEvent,
@@ -25,7 +26,13 @@ import {
   validateFairnessEvent,
   validateFairnessExport,
 } from './fairness';
-import { type FairnessEventStore, type FairnessReservationRecord, IndexedDbFairnessStore } from './fairnessStore';
+import {
+  type FairnessEventStore,
+  type FairnessReservationIdentity,
+  type FairnessReservationRecord,
+  type FairnessReservationTerminalEvent,
+  IndexedDbFairnessStore,
+} from './fairnessStore';
 import type { FairnessWorkerPlan, FairnessWorkerPoolLike } from './fairnessWorkerPool';
 import {
   DEFAULT_HEADLESS_STEP_LIMIT,
@@ -175,6 +182,11 @@ type ClaimedFairnessReservation = {
   persisted: boolean;
 };
 
+type RecoveryReservation = Readonly<{
+  reservation: DurableFairnessReservation;
+  preparedEvent: FairnessDrawPreparedEvent | null;
+}>;
+
 type CompletedSearchAttempt = Readonly<{
   seed: Seed;
   winnerMarbleIds?: readonly number[];
@@ -205,6 +217,16 @@ function sameSearchRequest(left: FairnessStartRequest, right: FairnessStartReque
 
 function getRequestedRoundSeed(request: FairnessStartRequest): Seed {
   return request.nextRoundSeed ?? request.currentSeed;
+}
+
+function getReservationIdentity(reservation: FairnessReservationRecord): FairnessReservationIdentity {
+  return {
+    reservationId: reservation.reservationId,
+    drawId: reservation.drawId,
+    key: reservation.key,
+    seed: reservation.seed,
+    rulesetVersion: reservation.rulesetVersion,
+  };
 }
 
 const FAIRNESS_PRECOMPUTE_DEBOUNCE_MS = 150;
@@ -629,19 +651,20 @@ export class FairnessCoordinator {
   }
 
   /**
-   * Claim a fully cached reservation without crossing an async boundary. The
-   * caller still falls back to prepareDraw when the cache is not complete.
+   * Look up a fully cached reservation synchronously, then persist its compact
+   * ready-to-claimed transition before materializing the draw. The caller
+   * still falls back to prepareDraw when the cache is not complete.
    */
   tryPrepareDrawFromCache(
     request: FairnessStartRequest,
     token: number,
     options: FairnessPrepareDrawOptions = {}
-  ): FairnessPreparedDraw | null {
+  ): Promise<FairnessPreparedDraw | null> {
     this.clearPrecomputeTimer();
     const cachedReservation = this.findCachedPreparedReservation(request, token);
-    if (!cachedReservation) return null;
+    if (!cachedReservation) return Promise.resolve(null);
     this.recordDiagnostic('start.prepare.begin', { token, synchronous: true });
-    return this.materializeCachedPreparedDraw(cachedReservation, token, options.includeEvent !== false);
+    return this.claimCachedPreparedDraw(cachedReservation, token, options.includeEvent !== false);
   }
 
   private getWorkerPool(): Promise<FairnessWorkerPoolLike | null> {
@@ -936,7 +959,7 @@ export class FairnessCoordinator {
     try {
       const cachedReservation = this.findCachedPreparedReservation(request, token);
       if (cachedReservation) {
-        return Promise.resolve(this.materializeCachedPreparedDraw(cachedReservation, token, includeEvent));
+        return this.claimCachedPreparedDraw(cachedReservation, token, includeEvent);
       }
     } catch (error) {
       return Promise.reject(error);
@@ -966,7 +989,7 @@ export class FairnessCoordinator {
     try {
       const durableReservation = this.findDurableReservation(context, seed);
       if (durableReservation) {
-        return this.materializePreparedDraw(context, durableReservation, token, includeEvent);
+        return this.claimCachedPreparedDraw({ context, reservation: durableReservation }, token, includeEvent);
       }
 
       if (context.mustSearch) {
@@ -974,7 +997,7 @@ export class FairnessCoordinator {
         this.consumeCandidate(context);
         seed = searchResult.seed;
         const reservation = await this.ensureDurableReservation(context, searchResult);
-        if (reservation) return this.materializePreparedDraw(context, reservation, token, includeEvent);
+        if (reservation) return this.claimCachedPreparedDraw({ context, reservation }, token, includeEvent);
         expectedWinnerEntryIds = [searchResult.winnerEntryIds[request.winnerRange.end]];
         const winningEntry = syncedInputs.find((entry) => entry.entryId === expectedWinnerEntryIds?.[0]);
         expectedWinnerParticipantIds = winningEntry?.memberIds.length === 1 ? [winningEntry.memberIds[0]] : null;
@@ -1007,7 +1030,7 @@ export class FairnessCoordinator {
         winnerEntryIds: [],
         draft,
       });
-      if (reservation) return this.materializePreparedDraw(context, reservation, token, includeEvent);
+      if (reservation) return this.claimCachedPreparedDraw({ context, reservation }, token, includeEvent);
       const event = this.createPreparedEventFromDraft(getDrawId(), draft);
       preparedEvent = event;
       await this.enqueueMutation(async () => {
@@ -1067,22 +1090,22 @@ export class FairnessCoordinator {
       const draw = this.projection.draws.find((candidate) => candidate.id === drawId);
       if (!draw || draw.status !== 'prepared') return { confirmed: false, reason: 'Fairness draw is not prepared' };
       if (token !== null && !this.isStartCurrent(token)) {
-        await this.persistClaimedReservation(drawId);
-        await this.appendEvent({
+        await this.finalizeClaimedReservation(drawId, {
           ...createBaseEvent('drawCancelled', this.now, this.createId),
           drawId,
           reason: 'Fairness draw was cancelled before confirmation',
         });
-        await this.removeClaimedReservation(drawId);
         return { confirmed: false, reason: 'Fairness draw was cancelled' };
       }
 
       const winners = mapWinnerMarbles(winnerMarbleIds, draw.entries, draw.members);
       if (!winners || winners.length === 0) {
         const reason = 'Fairness could not map the actual winner to a participant';
-        await this.persistClaimedReservation(drawId);
-        await this.appendEvent({ ...createBaseEvent('drawFailed', this.now, this.createId), drawId, reason });
-        await this.removeClaimedReservation(drawId);
+        await this.finalizeClaimedReservation(drawId, {
+          ...createBaseEvent('drawFailed', this.now, this.createId),
+          drawId,
+          reason,
+        });
         return { confirmed: false, reason };
       }
 
@@ -1092,9 +1115,11 @@ export class FairnessCoordinator {
           expectedWinnerEntryIds.some((entryId, index) => entryId !== winners[index].entryId))
       ) {
         const reason = 'Fairness search verification did not match the actual draw entry';
-        await this.persistClaimedReservation(drawId);
-        await this.appendEvent({ ...createBaseEvent('drawFailed', this.now, this.createId), drawId, reason });
-        await this.removeClaimedReservation(drawId);
+        await this.finalizeClaimedReservation(drawId, {
+          ...createBaseEvent('drawFailed', this.now, this.createId),
+          drawId,
+          reason,
+        });
         return { confirmed: false, reason };
       }
 
@@ -1107,9 +1132,11 @@ export class FairnessCoordinator {
           ))
       ) {
         const reason = 'Fairness search verification did not match the actual run';
-        await this.persistClaimedReservation(drawId);
-        await this.appendEvent({ ...createBaseEvent('drawFailed', this.now, this.createId), drawId, reason });
-        await this.removeClaimedReservation(drawId);
+        await this.finalizeClaimedReservation(drawId, {
+          ...createBaseEvent('drawFailed', this.now, this.createId),
+          drawId,
+          reason,
+        });
         return { confirmed: false, reason };
       }
 
@@ -1119,19 +1146,19 @@ export class FairnessCoordinator {
           expectedWinnerMarbleIds.some((marbleId, index) => marbleId !== winners[index].marbleId))
       ) {
         const reason = 'Fairness search verification did not match the actual marble result';
-        await this.persistClaimedReservation(drawId);
-        await this.appendEvent({ ...createBaseEvent('drawFailed', this.now, this.createId), drawId, reason });
-        await this.removeClaimedReservation(drawId);
+        await this.finalizeClaimedReservation(drawId, {
+          ...createBaseEvent('drawFailed', this.now, this.createId),
+          drawId,
+          reason,
+        });
         return { confirmed: false, reason };
       }
 
-      await this.persistClaimedReservation(drawId);
-      await this.appendEvent({
+      await this.finalizeClaimedReservation(drawId, {
         ...createBaseEvent('drawConfirmed', this.now, this.createId),
         drawId,
         winners,
       });
-      await this.removeClaimedReservation(drawId);
       this.invalidateSearchState();
       return { confirmed: true };
     });
@@ -1143,9 +1170,11 @@ export class FairnessCoordinator {
     await this.enqueueMutation(async () => {
       const draw = this.projection.draws.find((candidate) => candidate.id === drawId);
       if (!draw || draw.status !== 'prepared') return;
-      await this.persistClaimedReservation(drawId);
-      await this.appendEvent({ ...createBaseEvent('drawCancelled', this.now, this.createId), drawId, reason });
-      await this.removeClaimedReservation(drawId);
+      await this.finalizeClaimedReservation(drawId, {
+        ...createBaseEvent('drawCancelled', this.now, this.createId),
+        drawId,
+        reason,
+      });
     });
   }
 
@@ -1214,16 +1243,37 @@ export class FairnessCoordinator {
         this.projection = projectFairnessEvents(this.events);
         this.manualRenames = collectManualRenameBindings(this.events);
         this.durableReservations.clear();
-        const persistedDrawIds = new Set(
-          this.events
-            .filter((event): event is FairnessDrawPreparedEvent => event.type === 'drawPrepared')
-            .map((event) => event.drawId)
-        );
-        const orphanReservationIds: string[] = [];
-        const reservationsByKey = new Map<string, DurableFairnessReservation>();
-        reservations.forEach((reservation) => {
+        const preparedEventsByDrawId = new Map<string, FairnessDrawPreparedEvent>();
+        const terminalDrawIds = new Set<string>();
+        this.events.forEach((event) => {
+          if (event.type === 'drawPrepared') preparedEventsByDrawId.set(event.drawId, event);
           if (
-            persistedDrawIds.has(reservation.drawId) ||
+            event.type === 'drawConfirmed' ||
+            event.type === 'drawFailed' ||
+            event.type === 'drawCancelled' ||
+            event.type === 'drawVoided'
+          ) {
+            terminalDrawIds.add(event.drawId);
+          }
+        });
+        const orphanReservationIds: string[] = [];
+        const recoveryReservations: RecoveryReservation[] = [];
+        const recoveryKeys = new Set<string>();
+        const reservationsByKey = new Map<string, DurableFairnessReservation>();
+        reservations.forEach((rawReservation) => {
+          const normalizedState = rawReservation.state === undefined ? 'ready' : rawReservation.state;
+          const normalizedRulesetVersion = rawReservation.rulesetVersion ?? 0;
+          const reservation: DurableFairnessReservation = {
+            ...rawReservation,
+            state: normalizedState,
+            rulesetVersion: normalizedRulesetVersion,
+            draft: rawReservation.draft,
+          };
+          if (normalizedState !== 'ready' && normalizedState !== 'claimed') {
+            orphanReservationIds.push(reservation.reservationId);
+            return;
+          }
+          if (
             !isPreparedDrawDraft(reservation.draft) ||
             reservation.draft.seed !== reservation.seed ||
             reservation.rulesetVersion !== FAIRNESS_SIMULATION_RULESET_VERSION
@@ -1239,10 +1289,27 @@ export class FairnessCoordinator {
             orphanReservationIds.push(reservation.reservationId);
             return;
           }
-          const normalized: DurableFairnessReservation = {
-            ...reservation,
-            draft: reservation.draft,
-          };
+          const persistedPreparedEvent = preparedEventsByDrawId.get(reservation.drawId);
+          if (terminalDrawIds.has(reservation.drawId)) {
+            orphanReservationIds.push(reservation.reservationId);
+            continue;
+          }
+          if (persistedPreparedEvent || reservation.state === 'claimed') {
+            recoveryReservations.push({
+              reservation,
+              preparedEvent: persistedPreparedEvent ? null : this.createPreparedEventFromDraft(reservation.drawId, reservation.draft),
+            });
+            recoveryKeys.add(reservation.key);
+            this.recordDiagnostic('reservation.interrupted-recovery', {
+              reservationId: reservation.reservationId,
+              drawId: reservation.drawId,
+              key: reservation.key,
+              state: reservation.state,
+              preparedEventPersisted: Boolean(persistedPreparedEvent),
+            });
+            continue;
+          }
+          const normalized = reservation;
           const existing = reservationsByKey.get(normalized.key);
           if (!existing) {
             reservationsByKey.set(normalized.key, normalized);
@@ -1259,8 +1326,38 @@ export class FairnessCoordinator {
           });
         });
         reservationsByKey.forEach((reservation) => {
+          if (recoveryKeys.has(reservation.key)) {
+            orphanReservationIds.push(reservation.reservationId);
+            return;
+          }
           this.durableReservations.set(reservation.reservationId, reservation);
         });
+        for (const recovery of recoveryReservations) {
+          const terminalEvent: FairnessDrawCancelledEvent = {
+            ...createBaseEvent('drawCancelled', this.now, this.createId),
+            drawId: recovery.reservation.drawId,
+            reason: 'Fairness draw was interrupted before confirmation',
+          };
+          const recoverClaimedReservation = this.store.recoverClaimedReservation;
+          try {
+            if (recoverClaimedReservation) {
+              await recoverClaimedReservation.call(
+                this.store,
+                recovery.reservation.reservationId,
+                recovery.preparedEvent,
+                terminalEvent
+              );
+            } else {
+              if (recovery.preparedEvent) await this.store.append(recovery.preparedEvent);
+              await this.store.append(terminalEvent);
+              await this.store.removeReservation?.(recovery.reservation.reservationId);
+            }
+          } catch (error) {
+            this.markUnavailable(error);
+            throw error;
+          }
+          this.applyAlreadyPersistedEvents(recovery.preparedEvent ? [recovery.preparedEvent, terminalEvent] : [terminalEvent]);
+        }
         const removeReservation = this.store.removeReservation;
         if (removeReservation) {
           orphanReservationIds.forEach((reservationId) => {
@@ -1686,6 +1783,46 @@ export class FairnessCoordinator {
     );
   }
 
+  private claimCachedPreparedDraw(
+    cachedReservation: { context: FairnessSearchContext; reservation: DurableFairnessReservation },
+    token: number,
+    includeEvent: boolean
+  ): Promise<FairnessPreparedDraw> {
+    const claimReservation = this.store.claimReservation;
+    if (!claimReservation) {
+      return Promise.resolve(this.materializeCachedPreparedDraw(cachedReservation, token, includeEvent));
+    }
+
+    const { context, reservation } = cachedReservation;
+    const claim = Promise.resolve().then(() =>
+      claimReservation.call(this.store, reservation.reservationId, getReservationIdentity(reservation))
+    );
+    return claim.then(
+      (status) => {
+        if (status !== 'claimed') {
+          this.durableReservations.delete(reservation.reservationId);
+          this.recordDiagnostic('reservation.claim-conflict', {
+            generation: context.generation,
+            key: context.key,
+            seed: reservation.seed,
+            reservationId: reservation.reservationId,
+            status,
+          });
+          throw new FairnessCancelledError();
+        }
+        this.durableReservations.delete(reservation.reservationId);
+        this.assertSearchCurrent(context.generation);
+        this.assertCurrent(token);
+        return this.materializeCachedPreparedDraw(cachedReservation, token, includeEvent);
+      },
+      (error: unknown) => {
+        if (isCancellationError(error)) throw error;
+        this.markUnavailable(error);
+        throw error;
+      }
+    );
+  }
+
   private createPrecomputedPlan(
     context: Pick<FairnessSearchContext, 'key' | 'generation'>,
     fallbackSeed: Seed,
@@ -1741,6 +1878,7 @@ export class FairnessCoordinator {
       winnerMarbleIds: [...result.winnerMarbleIds],
       winnerEntryIds: [...result.winnerEntryIds],
       rulesetVersion: FAIRNESS_SIMULATION_RULESET_VERSION,
+      state: 'ready',
       draft: result.draft,
     };
     this.recordDiagnostic('reservation.start', {
@@ -1832,24 +1970,44 @@ export class FairnessCoordinator {
     };
   }
 
-  private async persistClaimedReservation(drawId: string): Promise<void> {
+  private async finalizeClaimedReservation(
+    drawId: string,
+    terminalEvent: FairnessReservationTerminalEvent
+  ): Promise<void> {
     const claimed = this.claimedReservations.get(drawId);
-    if (!claimed || claimed.persisted) return;
-    this.recordDiagnostic('draw.durability.start', { drawId });
-    try {
-      await this.store.append(claimed.event);
-      claimed.persisted = true;
-      this.recordDiagnostic('draw.durability.ready', { drawId });
-    } catch (error) {
-      this.markUnavailable(error);
-      throw error;
+    if (!claimed) {
+      await this.appendEvent(terminalEvent);
+      return;
     }
-  }
 
-  private async removeClaimedReservation(drawId: string): Promise<void> {
-    const claimed = this.claimedReservations.get(drawId);
-    if (!claimed) return;
+    const finalizeReservation = this.store.finalizeReservation;
+    if (finalizeReservation) {
+      this.recordDiagnostic('draw.finalize.start', {
+        drawId,
+        reservationId: claimed.reservationId,
+      });
+      try {
+        await finalizeReservation.call(this.store, claimed.reservationId, claimed.event, terminalEvent);
+      } catch (error) {
+        this.markUnavailable(error);
+        throw error;
+      }
+      this.applyAlreadyPersistedEvents([terminalEvent]);
+      claimed.persisted = true;
+      this.claimedReservations.delete(drawId);
+      this.recordDiagnostic('draw.finalize.ready', {
+        drawId,
+        reservationId: claimed.reservationId,
+      });
+      return;
+    }
+
     try {
+      if (!claimed.persisted) {
+        await this.store.append(claimed.event);
+        claimed.persisted = true;
+      }
+      await this.appendEvent(terminalEvent);
       await this.store.removeReservation?.(claimed.reservationId);
     } catch (error) {
       this.markUnavailable(error);
@@ -2369,12 +2527,18 @@ export class FairnessCoordinator {
   ): Promise<void> {
     if (!this.available) return;
     await this.enqueueMutation(async () => {
-      await this.persistClaimedReservation(drawId);
+      if (this.claimedReservations.has(drawId)) {
+        await this.finalizeClaimedReservation(drawId, {
+          ...createBaseEvent('drawFailed', this.now, this.createId),
+          drawId,
+          reason,
+        });
+        return;
+      }
       if (preparedEvent && !this.projection.draws.some((draw) => draw.id === drawId)) {
         await this.appendEvent(preparedEvent);
       }
       await this.appendEvent({ ...createBaseEvent('drawFailed', this.now, this.createId), drawId, reason });
-      await this.removeClaimedReservation(drawId);
     });
   }
 
@@ -2394,6 +2558,13 @@ export class FairnessCoordinator {
     );
     await current;
     return result;
+  }
+
+  private applyAlreadyPersistedEvents(events: readonly FairnessEvent[]): void {
+    for (const event of events) {
+      this.events.push(clone(event));
+      this.projection = applyFairnessEvent(this.projection, event);
+    }
   }
 
   private async appendEvent(event: FairnessEvent): Promise<void> {

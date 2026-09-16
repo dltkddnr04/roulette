@@ -904,7 +904,9 @@ export class Roulette extends EventTarget {
 
     let prepared: FairnessPreparedDraw;
     try {
-      prepared = this._fairnessCoordinator.tryPrepareDrawFromCache(request, operationToken, { includeEvent: false });
+      prepared = await this._fairnessCoordinator.tryPrepareDrawFromCache(request, operationToken, {
+        includeEvent: false,
+      });
       if (!prepared) {
         prepared = await this._fairnessCoordinator.prepareDraw(request, operationToken, { includeEvent: false });
       }
