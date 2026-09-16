@@ -71,11 +71,27 @@ export class Roulette extends EventTarget {
   private _fairnessStartPromise: Promise<void> | null = null;
   private _standbyRequestToken = 0;
   private _standbyScheduleCancel: (() => void) | null = null;
-  private _scheduledStandby: { token: number; seed: Seed } | null = null;
+  private _scheduledStandby: {
+    token: number;
+    key: string;
+    generation: number;
+    seed: Seed;
+    reservationId?: string;
+  } | null = null;
   private _standbyPreparation: {
     token: number;
+    key: string;
+    generation: number;
     seed: Seed;
+    reservationId?: string;
     promise: Promise<unknown>;
+  } | null = null;
+  private _readyToStart: {
+    token: number;
+    key: string;
+    generation: number;
+    seed: Seed;
+    reservationId?: string;
   } | null = null;
   private _fairnessBatchDepth = 0;
   private _fairnessBatchInvalidated = false;
@@ -291,49 +307,138 @@ export class Roulette extends EventTarget {
       nextRoundSeed: this._roundSession.getNextRoundSeed(),
     } as const;
     const token = this._standbyRequestToken;
+    this._fairnessCoordinator.recordDiagnostic('precompute.schedule', {
+      delay,
+      token,
+      participantCount: this._roundSession.getCount(),
+    });
     void this._fairnessCoordinator.schedulePrecompute(request, delay).then((plan) => {
       if (!plan || token !== this._standbyRequestToken) return;
+      this._fairnessCoordinator.recordDiagnostic('precompute.plan-ready', {
+        key: plan.key,
+        generation: plan.generation,
+        seed: plan.seed,
+        reservationId: plan.reservationId,
+      });
       this._scheduleAuthoritativeStandby(plan, token);
     });
   }
 
   private _scheduleAuthoritativeStandby(plan: FairnessPrecomputedPlan, token: number): void {
+    if (this._matchesReadyToStart(plan, token)) return;
+    if (
+      this._scheduledStandby &&
+      this._scheduledStandby.token === token &&
+      this._sameStandbyPlan(this._scheduledStandby, plan)
+    ) {
+      return;
+    }
+    if (
+      this._standbyPreparation &&
+      this._standbyPreparation.token === token &&
+      this._sameStandbyPlan(this._standbyPreparation, plan)
+    ) {
+      return;
+    }
+    this._readyToStart = null;
     this._cancelScheduledStandby();
-    this._scheduledStandby = { token, seed: plan.seed };
+    this._scheduledStandby = {
+      token,
+      key: plan.key,
+      generation: plan.generation,
+      seed: plan.seed,
+      ...(plan.reservationId ? { reservationId: plan.reservationId } : {}),
+    };
     const prepare = () => {
       this._standbyScheduleCancel = null;
       if (token !== this._standbyRequestToken) return;
-      if (this._scheduledStandby?.token !== token || this._scheduledStandby.seed !== plan.seed) return;
+      if (!this._scheduledStandby || !this._sameStandbyPlan(this._scheduledStandby, plan)) return;
       this._scheduledStandby = null;
-      const promise = this._beginStandbyPreparation(plan.seed, token);
+      const promise = this._beginStandbyPreparation(plan, token);
       void promise.then(
-        () => {
+        (layout) => {
           if (this._standbyPreparation?.promise === promise) this._standbyPreparation = null;
+          if (layout && token === this._standbyRequestToken && plan.reservationId) {
+            this._readyToStart = {
+              token,
+              key: plan.key,
+              generation: plan.generation,
+              seed: plan.seed,
+              reservationId: plan.reservationId,
+            };
+            this._fairnessCoordinator.recordDiagnostic('start.ready-to-start', {
+              key: plan.key,
+              generation: plan.generation,
+              seed: plan.seed,
+              reservationId: plan.reservationId,
+            });
+          }
         },
         () => {
           if (this._standbyPreparation?.promise === promise) this._standbyPreparation = null;
         }
       );
     };
+    this._fairnessCoordinator.recordDiagnostic('standby.scheduled', {
+      key: plan.key,
+      generation: plan.generation,
+      seed: plan.seed,
+      reservationId: plan.reservationId,
+    });
     this._standbyScheduleCancel = this._scheduleStandbyPreparation(prepare);
   }
 
-  private _beginStandbyPreparation(seed: Seed, token: number): Promise<unknown> {
+  private _beginStandbyPreparation(plan: FairnessPrecomputedPlan, token: number): Promise<unknown> {
     const existing = this._standbyPreparation;
-    if (existing && existing.token === token && existing.seed === seed) return existing.promise;
-    const promise = this._roundSession.prepareAuthoritativeStandby(seed);
-    this._standbyPreparation = { token, seed, promise };
+    if (existing && existing.token === token && this._sameStandbyPlan(existing, plan)) return existing.promise;
+    if (existing) this._roundSession.discardAuthoritativeStandby();
+    this._fairnessCoordinator.recordDiagnostic('standby.start', {
+      key: plan.key,
+      generation: plan.generation,
+      seed: plan.seed,
+      reservationId: plan.reservationId,
+    });
+    const promise = this._roundSession.prepareAuthoritativeStandby(plan.seed);
+    this._standbyPreparation = {
+      token,
+      key: plan.key,
+      generation: plan.generation,
+      seed: plan.seed,
+      ...(plan.reservationId ? { reservationId: plan.reservationId } : {}),
+      promise,
+    };
     return promise;
   }
 
-  private _startScheduledStandby(seed: Seed, token: number): void {
-    if (this._scheduledStandby?.token !== token || this._scheduledStandby.seed !== seed) return;
+  private _startScheduledStandby(plan: FairnessPrecomputedPlan, token: number): void {
+    if (
+      !this._scheduledStandby ||
+      this._scheduledStandby.token !== token ||
+      !this._sameStandbyPlan(this._scheduledStandby, plan)
+    ) {
+      return;
+    }
     this._cancelScheduledStandby();
     this._scheduledStandby = null;
-    const promise = this._beginStandbyPreparation(seed, token);
+    const promise = this._beginStandbyPreparation(plan, token);
     void promise.then(
-      () => {
+      (layout) => {
         if (this._standbyPreparation?.promise === promise) this._standbyPreparation = null;
+        if (layout && token === this._standbyRequestToken && plan.reservationId) {
+          this._readyToStart = {
+            token,
+            key: plan.key,
+            generation: plan.generation,
+            seed: plan.seed,
+            reservationId: plan.reservationId,
+          };
+          this._fairnessCoordinator.recordDiagnostic('start.ready-to-start', {
+            key: plan.key,
+            generation: plan.generation,
+            seed: plan.seed,
+            reservationId: plan.reservationId,
+          });
+        }
       },
       () => {
         if (this._standbyPreparation?.promise === promise) this._standbyPreparation = null;
@@ -341,10 +446,28 @@ export class Roulette extends EventTarget {
     );
   }
 
+  private _sameStandbyPlan(
+    left: { key: string; generation: number; seed: Seed; reservationId?: string },
+    right: { key: string; generation: number; seed: Seed; reservationId?: string }
+  ): boolean {
+    return (
+      left.key === right.key &&
+      left.generation === right.generation &&
+      left.seed === right.seed &&
+      left.reservationId === right.reservationId
+    );
+  }
+
+  private _matchesReadyToStart(plan: FairnessPrecomputedPlan | FairnessPreparedDraw, token: number): boolean {
+    const ready = this._readyToStart;
+    return ready !== null && ready.token === token && this._sameStandbyPlan(ready, plan);
+  }
+
   private _invalidateStandby(): void {
     this._standbyRequestToken++;
     this._cancelScheduledStandby();
     this._scheduledStandby = null;
+    this._readyToStart = null;
     this._standbyPreparation = null;
     this._roundSession.discardAuthoritativeStandby();
   }
@@ -767,6 +890,7 @@ export class Roulette extends EventTarget {
     if (!stage) return;
 
     const operationToken = this._fairnessCoordinator.beginStart();
+    this._fairnessCoordinator.recordDiagnostic('start.click', { operationToken });
     const request = {
       stage,
       mapIndex: stages.indexOf(stage),
@@ -780,7 +904,16 @@ export class Roulette extends EventTarget {
 
     let prepared;
     try {
-      prepared = await this._fairnessCoordinator.prepareDraw(request, operationToken);
+      prepared = await this._fairnessCoordinator.prepareDraw(request, operationToken, { includeEvent: false });
+      this._fairnessCoordinator.recordDiagnostic('start.prepare.ready', {
+        operationToken,
+        drawId: prepared.drawId,
+        key: prepared.key,
+        generation: prepared.generation,
+        seed: prepared.seed,
+        reservationId: prepared.reservationId,
+        readyToStart: this._matchesReadyToStart(prepared, this._standbyRequestToken),
+      });
     } catch (error) {
       if (error instanceof FairnessCancelledError) return;
       const state = await this._fairnessCoordinator.getState();
@@ -799,12 +932,19 @@ export class Roulette extends EventTarget {
     this._invalidateRecording();
     this._presentationEffects.clear();
     let spawnLayout = this._roundSession.adoptPreparedAuthoritativeRound(prepared.seed);
+    if (spawnLayout) this._readyToStart = null;
     if (!spawnLayout) {
-      this._startScheduledStandby(prepared.seed, this._standbyRequestToken);
+      this._startScheduledStandby(prepared, this._standbyRequestToken);
       const standby = this._standbyPreparation;
-      if (standby && standby.token === this._standbyRequestToken && standby.seed === prepared.seed) {
+      if (standby && standby.token === this._standbyRequestToken && this._sameStandbyPlan(standby, prepared)) {
+        this._fairnessCoordinator.recordDiagnostic('start.standby-wait', {
+          key: prepared.key,
+          generation: prepared.generation,
+          seed: prepared.seed,
+        });
         await standby.promise;
         spawnLayout = this._roundSession.adoptPreparedAuthoritativeRound(prepared.seed);
+        if (spawnLayout) this._readyToStart = null;
       }
     }
     if (!this._fairnessCoordinator.isStartCurrent(operationToken)) {
@@ -832,6 +972,7 @@ export class Roulette extends EventTarget {
     this._camera.initializePosition(spawnLayout.center, zoom);
 
     const roundGeneration = this._roundSession.prepareStart();
+    this._fairnessCoordinator.recordDiagnostic('start.prepare-start', { roundGeneration });
     if (roundGeneration === null) {
       await this._fairnessCoordinator.cancelDraw(prepared.drawId, 'Fairness could not start the round');
       this._emitMessage('Fairness could not start the round');
@@ -896,6 +1037,7 @@ export class Roulette extends EventTarget {
     } else {
       startPhysics();
     }
+    this._fairnessCoordinator.recordDiagnostic('start.activate-requested', { roundGeneration });
   }
 
   public setSpeed(value: number) {

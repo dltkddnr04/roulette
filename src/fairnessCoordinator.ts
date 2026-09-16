@@ -21,9 +21,10 @@ import {
   STRICT_BALANCE_POLICY_ID,
   STRICT_BALANCE_POLICY_VERSION,
   searchBudget,
+  validateFairnessEvent,
   validateFairnessExport,
 } from './fairness';
-import { type FairnessEventStore, IndexedDbFairnessStore } from './fairnessStore';
+import { type FairnessEventStore, type FairnessReservationRecord, IndexedDbFairnessStore } from './fairnessStore';
 import type { FairnessWorkerPlan, FairnessWorkerPoolLike } from './fairnessWorkerPool';
 import {
   DEFAULT_HEADLESS_STEP_LIMIT,
@@ -70,10 +71,14 @@ export type FairnessPrecomputedPlan = Readonly<{
   key: string;
   generation: number;
   seed: Seed;
+  reservationId?: string;
 }>;
 
 export type FairnessPreparedDraw = Readonly<{
   drawId: string;
+  key: string;
+  generation: number;
+  reservationId?: string;
   seed: Seed;
   event: FairnessDrawPreparedEvent;
   expectedWinnerEntryIds: readonly string[] | null;
@@ -83,9 +88,20 @@ export type FairnessPreparedDraw = Readonly<{
   operationToken: number;
 }>;
 
+export type FairnessPrepareDrawOptions = Readonly<{
+  /** Internal Start path only: do not clone the event that the coordinator owns. */
+  includeEvent?: boolean;
+}>;
+
 export type FairnessConfirmationResult = Readonly<{
   confirmed: boolean;
   reason?: string;
+}>;
+
+export type FairnessDiagnostic = Readonly<{
+  phase: string;
+  at: number;
+  details?: Readonly<Record<string, unknown>>;
 }>;
 
 export type FairnessCoordinatorOptions = Readonly<{
@@ -96,6 +112,7 @@ export type FairnessCoordinatorOptions = Readonly<{
   createId?: (prefix: string) => string;
   createCandidateSeed?: () => Seed;
   headlessStepLimit?: number;
+  onDiagnostic?: (diagnostic: FairnessDiagnostic) => void;
 }>;
 
 type SyncedEntry = Readonly<{
@@ -146,6 +163,17 @@ type SearchCandidate = SearchResult &
     draft: PreparedDrawDraft;
   }>;
 
+type DurableFairnessReservation = FairnessReservationRecord &
+  Readonly<{
+    draft: PreparedDrawDraft;
+  }>;
+
+type ClaimedFairnessReservation = {
+  reservationId: string;
+  event: FairnessDrawPreparedEvent;
+  persisted: boolean;
+};
+
 type CompletedSearchAttempt = Readonly<{
   seed: Seed;
   winnerMarbleIds?: readonly number[];
@@ -189,6 +217,23 @@ export class FairnessCancelledError extends Error {
 
 function clone<T>(value: T): T {
   return JSON.parse(JSON.stringify(value)) as T;
+}
+
+function isPreparedDrawDraft(value: unknown): value is PreparedDrawDraft {
+  if (!value || typeof value !== 'object') return false;
+  try {
+    validateFairnessEvent({
+      ...(value as Record<string, unknown>),
+      version: FAIRNESS_DATA_VERSION,
+      eventId: 'reservation-validation',
+      timestamp: 0,
+      type: 'drawPrepared',
+      drawId: 'reservation-validation',
+    });
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 function createFairnessSearchKey(
@@ -402,6 +447,7 @@ export class FairnessCoordinator {
   private readonly createId: (prefix: string) => string;
   private readonly createCandidateSeed: () => Seed;
   private readonly headlessStepLimit: number;
+  private readonly onDiagnostic: ((diagnostic: FairnessDiagnostic) => void) | null;
   private readonly useWorkerPool: boolean;
   private readonly configuredWorkerPool: FairnessWorkerPoolLike | null;
   private readonly hasInjectedHeadlessRunner: boolean;
@@ -427,6 +473,9 @@ export class FairnessCoordinator {
   private cachedPreparedDraft: PreparedDrawDraftCache | null = null;
   private cachedContext: FairnessSearchContext | null = null;
   private inFlightSearch: SearchWork | null = null;
+  private readonly durableReservations = new Map<string, DurableFairnessReservation>();
+  private readonly claimedReservations = new Map<string, ClaimedFairnessReservation>();
+  private readonly reservationWrites = new Map<string, Promise<DurableFairnessReservation>>();
   private workerPoolPromise: Promise<FairnessWorkerPoolLike | null> | null = null;
   private workerPoolDisabled = false;
   private precomputeTimer: ReturnType<typeof setTimeout> | null = null;
@@ -443,6 +492,7 @@ export class FairnessCoordinator {
     this.createId = options.createId ?? createFairnessId;
     this.createCandidateSeed = options.createCandidateSeed ?? createFairnessCandidateSeed;
     this.headlessStepLimit = options.headlessStepLimit ?? DEFAULT_HEADLESS_STEP_LIMIT;
+    this.onDiagnostic = options.onDiagnostic ?? null;
     this.enabled = readLocalStorage(FAIRNESS_ENABLED_STORAGE_KEY) === 'true';
     const savedMode = readLocalStorage(FAIRNESS_MODE_STORAGE_KEY);
     this.mode = isFairnessMode(savedMode) ? savedMode : 'simple';
@@ -454,6 +504,17 @@ export class FairnessCoordinator {
 
   getMode(): FairnessMode {
     return this.mode;
+  }
+
+  /**
+   * Emit opt-in timing data for profiling and integration tests. The default
+   * production path has no observer and therefore pays no logging cost.
+   */
+  recordDiagnostic(phase: string, details?: Readonly<Record<string, unknown>>): void {
+    if (!this.onDiagnostic) return;
+    const clock =
+      typeof performance !== 'undefined' && typeof performance.now === 'function' ? performance.now() : Date.now();
+    this.onDiagnostic({ phase, at: clock, ...(details ? { details } : {}) });
   }
 
   /** Start non-blocking worker/runtime warm-up after the app is ready. */
@@ -503,18 +564,54 @@ export class FairnessCoordinator {
 
   async precompute(request: FairnessStartRequest): Promise<FairnessPrecomputedPlan | null> {
     const generation = this.searchGeneration;
+    this.recordDiagnostic('precompute.start', { generation });
     const context = await this.createSearchContext(request, undefined, generation);
     // A context may finish building after another policy mutation invalidated
     // its generation. Never hand that stale context back to the UI, including
     // the strict-balance path where no headless search is awaited.
     this.assertSearchCurrent(generation);
+    this.recordDiagnostic('precompute.context-ready', {
+      generation,
+      key: context.key,
+      mustSearch: context.mustSearch,
+      budget: context.budget,
+    });
     if (!context.mustSearch) {
       const seed = getRequestedRoundSeed(request);
-      this.getOrCreatePreparedDrawDraft(context, seed);
-      return { key: context.key, generation, seed };
+      const draft = this.getOrCreatePreparedDrawDraft(context, seed);
+      const reservation = await this.ensureDurableReservation(context, {
+        seed,
+        winnerMarbleIds: [],
+        winnerEntryIds: [],
+        draft,
+      });
+      this.recordDiagnostic('precompute.ready', {
+        generation,
+        key: context.key,
+        seed,
+        reservationId: reservation?.reservationId,
+      });
+      return {
+        key: context.key,
+        generation,
+        seed,
+        ...(reservation ? { reservationId: reservation.reservationId } : {}),
+      };
     }
     const candidate = await this.ensureSearch(context);
-    return { key: candidate.key, generation: candidate.generation, seed: candidate.seed };
+    const reservation = await this.ensureDurableReservation(context, candidate);
+    this.recordDiagnostic('precompute.ready', {
+      generation,
+      key: context.key,
+      seed: candidate.seed,
+      reservationId: reservation?.reservationId,
+    });
+    return {
+      key: candidate.key,
+      generation: candidate.generation,
+      seed: candidate.seed,
+      ...(reservation ? { reservationId: reservation.reservationId } : {}),
+    };
   }
 
   private clearPrecomputeTimer(): void {
@@ -575,7 +672,15 @@ export class FairnessCoordinator {
     this.cachedPreparedDraft = null;
     this.cachedContext = null;
     this.clearPrecomputeTimer();
+    const staleReservations = [...this.durableReservations.values()];
+    this.durableReservations.clear();
     staleWork?.controller.abort();
+    const removeReservation = this.store.removeReservation;
+    if (removeReservation) {
+      staleReservations.forEach((reservation) => {
+        void removeReservation.call(this.store, reservation.reservationId).catch(() => undefined);
+      });
+    }
     if (this.configuredWorkerPool) {
       this.configuredWorkerPool.dropPlan?.(stalePlanId);
     } else {
@@ -768,6 +873,8 @@ export class FairnessCoordinator {
       this.manualRenames = collectManualRenameBindings(this.events);
       this.pendingExclusionRequests.clear();
       this.pendingRenameRequests.clear();
+      this.durableReservations.clear();
+      this.claimedReservations.clear();
       this.mode = data.mode;
       writeLocalStorage(FAIRNESS_MODE_STORAGE_KEY, this.mode);
     });
@@ -791,31 +898,50 @@ export class FairnessCoordinator {
       this.manualRenames.clear();
       this.pendingExclusionRequests.clear();
       this.pendingRenameRequests.clear();
+      this.durableReservations.clear();
+      this.claimedReservations.clear();
     });
   }
 
-  async prepareDraw(request: FairnessStartRequest, token: number): Promise<FairnessPreparedDraw> {
+  async prepareDraw(
+    request: FairnessStartRequest,
+    token: number,
+    options: FairnessPrepareDrawOptions = {}
+  ): Promise<FairnessPreparedDraw> {
     this.clearPrecomputeTimer();
+    this.recordDiagnostic('start.prepare.begin', { token });
+    const includeEvent = options.includeEvent !== false;
     const context = await this.createSearchContext(request, token);
     const { syncedInputs, mappingRows, totalCount } = context;
     let seed = getRequestedRoundSeed(request);
     let expectedWinnerEntryIds: readonly string[] | null = null;
     let expectedWinnerParticipantIds: readonly string[] | null = null;
     let expectedWinnerMarbleIds: readonly number[] | null = null;
-    const drawId = this.createId('draw');
+    let drawId: string | null = null;
+    const getDrawId = (): string => {
+      if (drawId === null) drawId = this.createId('draw');
+      return drawId;
+    };
     let preparedEvent: FairnessDrawPreparedEvent | null = null;
 
     try {
+      const durableReservation = this.findDurableReservation(context, seed);
+      if (durableReservation) {
+        return this.materializePreparedDraw(context, durableReservation, token, includeEvent);
+      }
+
       if (context.mustSearch) {
         const searchResult = await this.ensureSearch(context, token);
         this.consumeCandidate(context);
         seed = searchResult.seed;
+        const reservation = await this.ensureDurableReservation(context, searchResult);
+        if (reservation) return this.materializePreparedDraw(context, reservation, token, includeEvent);
         expectedWinnerEntryIds = [searchResult.winnerEntryIds[request.winnerRange.end]];
         const winningEntry = syncedInputs.find((entry) => entry.entryId === expectedWinnerEntryIds?.[0]);
         expectedWinnerParticipantIds = winningEntry?.memberIds.length === 1 ? [winningEntry.memberIds[0]] : null;
         expectedWinnerMarbleIds = [searchResult.winnerMarbleIds[request.winnerRange.end]];
 
-        const event = this.createPreparedEventFromDraft(drawId, searchResult.draft);
+        const event = this.createPreparedEventFromDraft(getDrawId(), searchResult.draft);
         preparedEvent = event;
         await this.enqueueMutation(async () => {
           this.assertCurrent(token);
@@ -824,16 +950,26 @@ export class FairnessCoordinator {
         return {
           drawId: event.drawId,
           seed,
-          event: clone(event),
+          event: includeEvent ? clone(event) : event,
           expectedWinnerEntryIds,
           expectedWinnerParticipantIds,
           expectedWinnerMarbleIds,
           operationToken: token,
+          key: context.key,
+          generation: context.generation,
         };
       }
 
       this.assertCurrent(token);
-      const event = this.createPreparedEventFromDraft(drawId, this.getOrCreatePreparedDrawDraft(context, seed));
+      const draft = this.getOrCreatePreparedDrawDraft(context, seed);
+      const reservation = await this.ensureDurableReservation(context, {
+        seed,
+        winnerMarbleIds: [],
+        winnerEntryIds: [],
+        draft,
+      });
+      if (reservation) return this.materializePreparedDraw(context, reservation, token, includeEvent);
+      const event = this.createPreparedEventFromDraft(getDrawId(), draft);
       preparedEvent = event;
       await this.enqueueMutation(async () => {
         this.assertCurrent(token);
@@ -842,23 +978,33 @@ export class FairnessCoordinator {
       return {
         drawId: event.drawId,
         seed,
-        event: clone(event),
+        event: includeEvent ? clone(event) : event,
         expectedWinnerEntryIds,
         expectedWinnerParticipantIds,
         expectedWinnerMarbleIds,
         operationToken: token,
+        key: context.key,
+        generation: context.generation,
       };
     } catch (error) {
       if (error instanceof FairnessCancelledError) throw error;
       if (!preparedEvent) {
         try {
-          preparedEvent = this.createPreparedEvent(request, seed, syncedInputs, mappingRows, totalCount, drawId, true);
+          preparedEvent = this.createPreparedEvent(
+            request,
+            seed,
+            syncedInputs,
+            mappingRows,
+            totalCount,
+            getDrawId(),
+            true
+          );
         } catch {
           // A storage or cancellation failure should not mask the original
           // search error or prevent the legacy race path from continuing.
         }
       }
-      await this.recordFailedDraw(drawId, getErrorMessage(error), preparedEvent).catch(() => undefined);
+      await this.recordFailedDraw(getDrawId(), getErrorMessage(error), preparedEvent).catch(() => undefined);
       throw error;
     }
   }
@@ -882,18 +1028,22 @@ export class FairnessCoordinator {
       const draw = this.projection.draws.find((candidate) => candidate.id === drawId);
       if (!draw || draw.status !== 'prepared') return { confirmed: false, reason: 'Fairness draw is not prepared' };
       if (token !== null && !this.isStartCurrent(token)) {
+        await this.persistClaimedReservation(drawId);
         await this.appendEvent({
           ...createBaseEvent('drawCancelled', this.now, this.createId),
           drawId,
           reason: 'Fairness draw was cancelled before confirmation',
         });
+        await this.removeClaimedReservation(drawId);
         return { confirmed: false, reason: 'Fairness draw was cancelled' };
       }
 
       const winners = mapWinnerMarbles(winnerMarbleIds, draw.entries, draw.members);
       if (!winners || winners.length === 0) {
         const reason = 'Fairness could not map the actual winner to a participant';
+        await this.persistClaimedReservation(drawId);
         await this.appendEvent({ ...createBaseEvent('drawFailed', this.now, this.createId), drawId, reason });
+        await this.removeClaimedReservation(drawId);
         return { confirmed: false, reason };
       }
 
@@ -903,7 +1053,9 @@ export class FairnessCoordinator {
           expectedWinnerEntryIds.some((entryId, index) => entryId !== winners[index].entryId))
       ) {
         const reason = 'Fairness search verification did not match the actual draw entry';
+        await this.persistClaimedReservation(drawId);
         await this.appendEvent({ ...createBaseEvent('drawFailed', this.now, this.createId), drawId, reason });
+        await this.removeClaimedReservation(drawId);
         return { confirmed: false, reason };
       }
 
@@ -916,7 +1068,9 @@ export class FairnessCoordinator {
           ))
       ) {
         const reason = 'Fairness search verification did not match the actual run';
+        await this.persistClaimedReservation(drawId);
         await this.appendEvent({ ...createBaseEvent('drawFailed', this.now, this.createId), drawId, reason });
+        await this.removeClaimedReservation(drawId);
         return { confirmed: false, reason };
       }
 
@@ -926,15 +1080,19 @@ export class FairnessCoordinator {
           expectedWinnerMarbleIds.some((marbleId, index) => marbleId !== winners[index].marbleId))
       ) {
         const reason = 'Fairness search verification did not match the actual marble result';
+        await this.persistClaimedReservation(drawId);
         await this.appendEvent({ ...createBaseEvent('drawFailed', this.now, this.createId), drawId, reason });
+        await this.removeClaimedReservation(drawId);
         return { confirmed: false, reason };
       }
 
+      await this.persistClaimedReservation(drawId);
       await this.appendEvent({
         ...createBaseEvent('drawConfirmed', this.now, this.createId),
         drawId,
         winners,
       });
+      await this.removeClaimedReservation(drawId);
       this.invalidateSearchState();
       return { confirmed: true };
     });
@@ -946,7 +1104,9 @@ export class FairnessCoordinator {
     await this.enqueueMutation(async () => {
       const draw = this.projection.draws.find((candidate) => candidate.id === drawId);
       if (!draw || draw.status !== 'prepared') return;
+      await this.persistClaimedReservation(drawId);
       await this.appendEvent({ ...createBaseEvent('drawCancelled', this.now, this.createId), drawId, reason });
+      await this.removeClaimedReservation(drawId);
     });
   }
 
@@ -982,6 +1142,8 @@ export class FairnessCoordinator {
     });
     return {
       drawId: preparedEvent.drawId,
+      key: '',
+      generation: this.searchGeneration,
       seed: preparedEvent.seed,
       event: clone(preparedEvent),
       expectedWinnerEntryIds: null,
@@ -1005,10 +1167,40 @@ export class FairnessCoordinator {
 
     this.loadingPromise = (async () => {
       try {
-        const events = await this.store.load();
+        const [events, reservations] = await Promise.all([
+          this.store.load(),
+          this.store.loadReservations ? this.store.loadReservations() : Promise.resolve([]),
+        ]);
         this.events = events.map((event) => clone(event));
         this.projection = projectFairnessEvents(this.events);
         this.manualRenames = collectManualRenameBindings(this.events);
+        this.durableReservations.clear();
+        const persistedDrawIds = new Set(
+          this.events
+            .filter((event): event is FairnessDrawPreparedEvent => event.type === 'drawPrepared')
+            .map((event) => event.drawId)
+        );
+        const orphanReservationIds: string[] = [];
+        reservations.forEach((reservation) => {
+          if (
+            persistedDrawIds.has(reservation.drawId) ||
+            !isPreparedDrawDraft(reservation.draft) ||
+            reservation.draft.seed !== reservation.seed
+          ) {
+            orphanReservationIds.push(reservation.reservationId);
+            return;
+          }
+          this.durableReservations.set(reservation.reservationId, {
+            ...reservation,
+            draft: reservation.draft,
+          });
+        });
+        const removeReservation = this.store.removeReservation;
+        if (removeReservation) {
+          orphanReservationIds.forEach((reservationId) => {
+            void removeReservation.call(this.store, reservationId).catch(() => undefined);
+          });
+        }
         this.available = true;
         this.error = null;
       } catch (error) {
@@ -1385,32 +1577,234 @@ export class FairnessCoordinator {
     );
   }
 
+  private findDurableReservation(
+    context: FairnessSearchContext,
+    requestedSeed: Seed
+  ): DurableFairnessReservation | null {
+    for (const reservation of this.durableReservations.values()) {
+      if (reservation.key !== context.key) continue;
+      if (!context.mustSearch && reservation.seed !== requestedSeed) continue;
+      return reservation;
+    }
+    return null;
+  }
+
+  private async ensureDurableReservation(
+    context: FairnessSearchContext,
+    result: Pick<SearchCandidate, 'seed' | 'winnerMarbleIds' | 'winnerEntryIds' | 'draft'>
+  ): Promise<DurableFairnessReservation | null> {
+    const reserve = this.store.reserve;
+    if (!reserve || !this.store.removeReservation) return null;
+    this.assertSearchCurrent(context.generation);
+
+    const requestedSeed = getRequestedRoundSeed(context.request);
+    const existing = this.findDurableReservation(context, requestedSeed);
+    if (existing && existing.seed === result.seed) return existing;
+
+    // A strict fast-path reservation is tied to the physical seed of this
+    // logical round. If that seed changed (for example after an explicit
+    // Shuffle), remove the older same-policy reservation instead of leaving
+    // two physical rounds eligible for a later claim.
+    if (!context.mustSearch) {
+      const removeReservation = this.store.removeReservation;
+      [...this.durableReservations.values()]
+        .filter((candidate) => candidate.key === context.key && candidate.seed !== result.seed)
+        .forEach((candidate) => {
+          this.durableReservations.delete(candidate.reservationId);
+          if (removeReservation) {
+            void removeReservation.call(this.store, candidate.reservationId).catch(() => undefined);
+          }
+        });
+    }
+
+    const identity = `${context.generation}:${context.key}:${typeof result.seed}:${String(result.seed)}`;
+    const pending = this.reservationWrites.get(identity);
+    if (pending) return pending;
+
+    const reservation: DurableFairnessReservation = {
+      reservationId: this.createId('reservation'),
+      drawId: this.createId('draw'),
+      key: context.key,
+      seed: result.seed,
+      winnerMarbleIds: [...result.winnerMarbleIds],
+      winnerEntryIds: [...result.winnerEntryIds],
+      draft: result.draft,
+    };
+    this.recordDiagnostic('reservation.start', {
+      generation: context.generation,
+      key: context.key,
+      seed: result.seed,
+      reservationId: reservation.reservationId,
+    });
+    const removeReservation = this.store.removeReservation;
+    const write = reserve.call(this.store, reservation).then(
+      () => {
+        try {
+          this.assertSearchCurrent(context.generation);
+        } catch (error) {
+          if (removeReservation) {
+            void removeReservation.call(this.store, reservation.reservationId).catch(() => undefined);
+          }
+          throw error;
+        }
+        this.durableReservations.set(reservation.reservationId, reservation);
+        this.recordDiagnostic('reservation.ready', {
+          generation: context.generation,
+          key: context.key,
+          seed: result.seed,
+          reservationId: reservation.reservationId,
+        });
+        return reservation;
+      },
+      (error: unknown) => {
+        this.markUnavailable(error);
+        throw error;
+      }
+    );
+    this.reservationWrites.set(identity, write);
+    void write.then(
+      () => {
+        if (this.reservationWrites.get(identity) === write) this.reservationWrites.delete(identity);
+      },
+      () => {
+        if (this.reservationWrites.get(identity) === write) this.reservationWrites.delete(identity);
+      }
+    );
+    return write;
+  }
+
+  private claimDurableReservation(
+    context: FairnessSearchContext,
+    reservation: DurableFairnessReservation,
+    token: number,
+    includeEvent = true
+  ): FairnessPreparedDraw {
+    this.assertSearchCurrent(context.generation);
+    this.assertCurrent(token);
+    const event = this.createPreparedEventFromDraft(reservation.drawId, reservation.draft);
+    // The draft is coordinator-owned and never exposed. Keep the event object
+    // as the in-memory history record and only clone the public return value;
+    // this removes a second full snapshot copy from the prepared Start path.
+    this.events.push(event);
+    this.projection = applyFairnessEvent(this.projection, event, { reusePreparedSnapshotArrays: true });
+    this.durableReservations.delete(reservation.reservationId);
+    this.claimedReservations.set(event.drawId, {
+      reservationId: reservation.reservationId,
+      event,
+      persisted: false,
+    });
+    const winningEntryId = reservation.winnerEntryIds[context.request.winnerRange.end];
+    const winningEntry = context.syncedInputs.find((entry) => entry.entryId === winningEntryId);
+    const expectedWinnerEntryIds = winningEntryId === undefined ? null : [winningEntryId];
+    const expectedWinnerParticipantIds = winningEntry?.memberIds.length === 1 ? [winningEntry.memberIds[0]] : null;
+    const winningMarbleId = reservation.winnerMarbleIds[context.request.winnerRange.end];
+    const expectedWinnerMarbleIds = winningMarbleId === undefined ? null : [winningMarbleId];
+    this.recordDiagnostic('reservation.claim', {
+      generation: context.generation,
+      key: context.key,
+      seed: reservation.seed,
+      reservationId: reservation.reservationId,
+    });
+    return {
+      drawId: event.drawId,
+      key: context.key,
+      generation: context.generation,
+      reservationId: reservation.reservationId,
+      seed: reservation.seed,
+      event: includeEvent ? clone(event) : event,
+      expectedWinnerEntryIds,
+      expectedWinnerParticipantIds,
+      expectedWinnerMarbleIds,
+      operationToken: token,
+    };
+  }
+
+  private async persistClaimedReservation(drawId: string): Promise<void> {
+    const claimed = this.claimedReservations.get(drawId);
+    if (!claimed || claimed.persisted) return;
+    this.recordDiagnostic('draw.durability.start', { drawId });
+    try {
+      await this.store.append(claimed.event);
+      claimed.persisted = true;
+      this.recordDiagnostic('draw.durability.ready', { drawId });
+    } catch (error) {
+      this.markUnavailable(error);
+      throw error;
+    }
+  }
+
+  private async removeClaimedReservation(drawId: string): Promise<void> {
+    const claimed = this.claimedReservations.get(drawId);
+    if (!claimed) return;
+    try {
+      await this.store.removeReservation?.(claimed.reservationId);
+    } catch (error) {
+      this.markUnavailable(error);
+      throw error;
+    } finally {
+      this.claimedReservations.delete(drawId);
+    }
+  }
+
+  private materializePreparedDraw(
+    context: FairnessSearchContext,
+    reservation: DurableFairnessReservation,
+    token: number,
+    includeEvent = true
+  ): FairnessPreparedDraw {
+    return this.claimDurableReservation(context, reservation, token, includeEvent);
+  }
+
   private ensureSearch(context: FairnessSearchContext, token?: number): Promise<SearchCandidate> {
     this.assertSearchCurrent(context.generation);
     if (token !== undefined) this.assertCurrent(token);
 
     if (this.cachedCandidate?.key === context.key && this.cachedCandidate.generation === context.generation) {
+      this.recordDiagnostic('search.cache-hit', { generation: context.generation, key: context.key });
       return Promise.resolve(this.cachedCandidate);
     }
 
     if (this.inFlightSearch?.key === context.key && this.inFlightSearch.generation === context.generation) {
+      this.recordDiagnostic('search.join', { generation: context.generation, key: context.key });
       return this.inFlightSearch.promise;
     }
 
     const controller = new AbortController();
-    const promise = this.searchForWinner(context, token, controller.signal).then((result) => ({
-      ...result,
-      key: context.key,
+    this.recordDiagnostic('search.start', {
       generation: context.generation,
-      draft: this.createPreparedDrawDraft(
-        context.request,
-        result.seed,
-        context.syncedInputs,
-        context.mappingRows,
-        context.totalCount,
-        true
-      ),
-    }));
+      key: context.key,
+      budget: context.budget,
+    });
+    const promise = this.searchForWinner(context, token, controller.signal).then(
+      (result) => {
+        this.recordDiagnostic('search.complete', {
+          generation: context.generation,
+          key: context.key,
+          seed: result.seed,
+        });
+        return {
+          ...result,
+          key: context.key,
+          generation: context.generation,
+          draft: this.createPreparedDrawDraft(
+            context.request,
+            result.seed,
+            context.syncedInputs,
+            context.mappingRows,
+            context.totalCount,
+            true
+          ),
+        };
+      },
+      (error: unknown) => {
+        this.recordDiagnostic('search.end', {
+          generation: context.generation,
+          key: context.key,
+          cancelled: isCancellationError(error),
+        });
+        throw error;
+      }
+    );
     const work: SearchWork = { key: context.key, generation: context.generation, controller, promise };
     this.inFlightSearch = work;
     void promise
@@ -1514,10 +1908,22 @@ export class FairnessCoordinator {
     const eligible = new Set(context.eligibleEntryIds);
     const maxParallelism =
       Number.isSafeInteger(workerPool.concurrency) && workerPool.concurrency > 0 ? workerPool.concurrency : 1;
+    let lastReportedParallelism = 0;
     const getReadyParallelism = (): number => {
       const ready = workerPool.readyConcurrency;
-      if (typeof ready !== 'number' || !Number.isSafeInteger(ready)) return maxParallelism;
-      return Math.max(1, Math.min(maxParallelism, ready));
+      const parallelism =
+        typeof ready !== 'number' || !Number.isSafeInteger(ready)
+          ? maxParallelism
+          : Math.max(1, Math.min(maxParallelism, ready));
+      if (parallelism !== lastReportedParallelism) {
+        lastReportedParallelism = parallelism;
+        this.recordDiagnostic('search.ready-concurrency', {
+          generation: context.generation,
+          key: context.key,
+          readyConcurrency: parallelism,
+        });
+      }
+      return parallelism;
     };
     const active = new Map<number, { seed: Seed; controller: AbortController; promise: Promise<void> }>();
     const completed = new Map<number, CompletedSearchAttempt>();
@@ -1534,6 +1940,12 @@ export class FairnessCoordinator {
       const abortChild = () => controller.abort();
       signal.addEventListener('abort', abortChild, { once: true });
       const seed = this.createCandidateSeed();
+      this.recordDiagnostic('search.attempt.start', {
+        generation: context.generation,
+        key: context.key,
+        attempt,
+        seed,
+      });
       const cleanup = () => {
         signal.removeEventListener('abort', abortChild);
         active.delete(attempt);
@@ -1632,6 +2044,13 @@ export class FairnessCoordinator {
 
         completed.delete(attempt);
         const candidate = this.findEligibleSearchResult(context, result.seed, result.winnerMarbleIds ?? [], eligible);
+        this.recordDiagnostic('search.attempt.commit', {
+          generation: context.generation,
+          key: context.key,
+          attempt,
+          seed: result.seed,
+          eligible: candidate !== null,
+        });
         nextCommit++;
         if (!candidate) continue;
         active.forEach(({ controller }, higherAttempt) => {
@@ -1725,6 +2144,14 @@ export class FairnessCoordinator {
         result?.winnerMarbleIds !== undefined && !result.error
           ? this.findEligibleSearchResult(context, seed, result.winnerMarbleIds, eligible)
           : await evaluateOnMainThread(seed);
+      this.recordDiagnostic('search.attempt.commit', {
+        generation: context.generation,
+        key: context.key,
+        attempt,
+        seed,
+        eligible: candidate !== null,
+        fallback: true,
+      });
       if (candidate) return candidate;
       await yieldToHost();
     }
@@ -1732,7 +2159,22 @@ export class FairnessCoordinator {
     for (let attempt = launchedAttempts; attempt < context.budget; attempt++) {
       checkCurrent();
       const seed = this.createCandidateSeed();
+      this.recordDiagnostic('search.attempt.start', {
+        generation: context.generation,
+        key: context.key,
+        attempt,
+        seed,
+        fallback: true,
+      });
       const candidate = await evaluateOnMainThread(seed);
+      this.recordDiagnostic('search.attempt.commit', {
+        generation: context.generation,
+        key: context.key,
+        attempt,
+        seed,
+        eligible: candidate !== null,
+        fallback: true,
+      });
       if (candidate) return candidate;
       await yieldToHost();
     }
@@ -1756,6 +2198,12 @@ export class FairnessCoordinator {
       this.assertSearchCurrent(context.generation);
       if (token !== undefined) this.assertCurrent(token);
       const seed = this.createCandidateSeed();
+      this.recordDiagnostic('search.attempt.start', {
+        generation: context.generation,
+        key: context.key,
+        attempt,
+        seed,
+      });
       let winnerMarbleIds: readonly number[];
       try {
         winnerMarbleIds = await this.headlessRunner(
@@ -1782,6 +2230,13 @@ export class FairnessCoordinator {
       this.assertSearchCurrent(context.generation);
       if (token !== undefined) this.assertCurrent(token);
       const candidate = this.findEligibleSearchResult(context, seed, winnerMarbleIds, eligible);
+      this.recordDiagnostic('search.attempt.commit', {
+        generation: context.generation,
+        key: context.key,
+        attempt,
+        seed,
+        eligible: candidate !== null,
+      });
       if (candidate) return candidate;
       await yieldToHost();
       if (signal.aborted) throw new FairnessCancelledError();
@@ -1801,10 +2256,12 @@ export class FairnessCoordinator {
   ): Promise<void> {
     if (!this.available) return;
     await this.enqueueMutation(async () => {
+      await this.persistClaimedReservation(drawId);
       if (preparedEvent && !this.projection.draws.some((draw) => draw.id === drawId)) {
         await this.appendEvent(preparedEvent);
       }
       await this.appendEvent({ ...createBaseEvent('drawFailed', this.now, this.createId), drawId, reason });
+      await this.removeClaimedReservation(drawId);
     });
   }
 

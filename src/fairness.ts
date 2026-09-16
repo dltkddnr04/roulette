@@ -737,7 +737,11 @@ function normalizeEvent(event: FairnessEvent | unknown): FairnessEvent {
   return event.version === LEGACY_FAIRNESS_DATA_VERSION ? migrateLegacyEvent(event) : (event as FairnessEvent);
 }
 
-function applyFairnessEventToProjection(projection: FairnessProjection, rawEvent: FairnessEvent | unknown): void {
+function applyFairnessEventToProjection(
+  projection: FairnessProjection,
+  rawEvent: FairnessEvent | unknown,
+  options: FairnessEventApplyOptions = {}
+): void {
   const event = normalizeEvent(rawEvent);
   switch (event.type) {
     case 'epochStarted': {
@@ -812,6 +816,7 @@ function applyFairnessEventToProjection(projection: FairnessProjection, rawEvent
     }
     case 'drawPrepared':
       if (!projection.draws.some((draw) => draw.id === event.drawId)) {
+        const reusePreparedSnapshotArrays = options.reusePreparedSnapshotArrays === true;
         projection.draws.push({
           id: event.drawId,
           epochId: event.epochId,
@@ -820,17 +825,25 @@ function applyFairnessEventToProjection(projection: FairnessProjection, rawEvent
           seed: event.seed,
           mapIndex: event.mapIndex,
           mapTitle: event.mapTitle,
-          rawParticipantInputs: [...event.rawParticipantInputs],
-          winnerRange: { ...event.winnerRange },
+          rawParticipantInputs: reusePreparedSnapshotArrays
+            ? (event.rawParticipantInputs as string[])
+            : [...event.rawParticipantInputs],
+          winnerRange: reusePreparedSnapshotArrays
+            ? (event.winnerRange as { start: number; end: number })
+            : { ...event.winnerRange },
           skillsEnabled: event.skillsEnabled,
           fairnessEnabledAtDraw: event.fairnessEnabledAtDraw,
-          policy: { ...event.policy },
-          members: event.members.map((member) => ({ ...member })),
-          entries: event.entries.map((entry) => ({
-            ...entry,
-            memberIds: [...entry.memberIds],
-            marbleIds: [...entry.marbleIds],
-          })),
+          policy: reusePreparedSnapshotArrays ? event.policy : { ...event.policy },
+          members: reusePreparedSnapshotArrays
+            ? (event.members as FairnessMemberSnapshot[])
+            : event.members.map((member) => ({ ...member })),
+          entries: reusePreparedSnapshotArrays
+            ? (event.entries as FairnessDrawEntrySnapshot[])
+            : event.entries.map((entry) => ({
+                ...entry,
+                memberIds: [...entry.memberIds],
+                marbleIds: [...entry.marbleIds],
+              })),
           winners: [],
         });
       }
@@ -855,8 +868,17 @@ function applyFairnessEventToProjection(projection: FairnessProjection, rawEvent
   }
 }
 
-export function applyFairnessEvent(projection: FairnessProjection, event: FairnessEvent): FairnessProjection {
-  applyFairnessEventToProjection(projection, event);
+export type FairnessEventApplyOptions = Readonly<{
+  /** Internal immutable-event path; avoids copying prepared snapshot arrays. */
+  reusePreparedSnapshotArrays?: boolean;
+}>;
+
+export function applyFairnessEvent(
+  projection: FairnessProjection,
+  event: FairnessEvent,
+  options: FairnessEventApplyOptions = {}
+): FairnessProjection {
+  applyFairnessEventToProjection(projection, event, options);
   setCurrentEpochValues(projection);
   return projection;
 }

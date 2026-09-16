@@ -2631,10 +2631,11 @@ function createReadyControlledWorkerPool() {
   return pool;
 }
 
-async function createUnbalancedSearchCoordinator(headlessRunner, createCandidateSeed, workerPool) {
+async function createUnbalancedSearchCoordinator(headlessRunner, createCandidateSeed, workerPool, options = {}) {
   let id = 0;
   const store = new InMemoryFairnessStore();
   const coordinator = new FairnessCoordinator({
+    ...options,
     store,
     createId: (prefix) => `${prefix}-${++id}`,
     now: () => id,
@@ -2672,6 +2673,116 @@ test('fairness precompute reuses one ready candidate without creating draw event
   const prepared = await coordinator.prepareDraw(request, coordinator.beginStart());
   assert.equal(calls, 1);
   assert.equal(prepared.seed, 'precomputed-seed');
+});
+
+test('durable fairness reservation removes storage I/O from prepared Start', async () => {
+  let calls = 0;
+  const diagnostics = [];
+  const { coordinator, stage, store } = await createUnbalancedSearchCoordinator(
+    async ({ seed }) => {
+      calls++;
+      return [marbleForEntry(seed, ['entry-0', 'entry-1'])];
+    },
+    () => 'durable-reservation-seed',
+    undefined,
+    { onDiagnostic: (diagnostic) => diagnostics.push(diagnostic) }
+  );
+  let appendCalls = 0;
+  let reserveCalls = 0;
+  const append = store.append.bind(store);
+  const reserve = store.reserve.bind(store);
+  store.append = async (event) => {
+    appendCalls++;
+    return append(event);
+  };
+  store.reserve = async (reservation) => {
+    reserveCalls++;
+    return reserve(reservation);
+  };
+
+  const request = searchTestRequest(stage, ['A', 'B'], 'unused-current');
+  const initialDrawCount = (await coordinator.getState()).recentDraws.length;
+  await coordinator.precompute(request);
+  assert.equal(calls, 1);
+  assert.equal(reserveCalls, 1);
+  assert.equal(appendCalls, 0);
+  assert.equal((await store.loadReservations()).length, 1);
+  assert.equal((await coordinator.getState()).recentDraws.length, initialDrawCount);
+  assert.ok(diagnostics.some(({ phase }) => phase === 'search.start'));
+  assert.ok(diagnostics.some(({ phase }) => phase === 'search.attempt.start'));
+  assert.ok(diagnostics.some(({ phase }) => phase === 'search.attempt.commit'));
+  assert.ok(diagnostics.some(({ phase }) => phase === 'reservation.ready'));
+
+  const prepared = await coordinator.prepareDraw(request, coordinator.beginStart());
+  assert.equal(prepared.seed, 'durable-reservation-seed');
+  assert.equal(calls, 1);
+  assert.equal(appendCalls, 0);
+  assert.equal((await store.loadReservations()).length, 1);
+  assert.ok(diagnostics.some(({ phase }) => phase === 'reservation.claim'));
+  assert.equal(
+    diagnostics.some(({ phase }) => phase === 'draw.durability.start'),
+    false
+  );
+
+  const persistedBeforeConfirmation = await store.load();
+  assert.equal(
+    persistedBeforeConfirmation.some(({ type, drawId }) => type === 'drawPrepared' && drawId === prepared.drawId),
+    false
+  );
+  const confirmation = await coordinator.confirmDraw(
+    prepared.drawId,
+    prepared.expectedWinnerMarbleIds,
+    prepared.operationToken,
+    prepared.expectedWinnerParticipantIds,
+    prepared.expectedWinnerMarbleIds,
+    prepared.expectedWinnerEntryIds
+  );
+  assert.equal(confirmation.confirmed, true);
+  assert.equal(appendCalls, 2);
+  const persistedAfterConfirmation = await store.load();
+  assert.ok(
+    persistedAfterConfirmation
+      .filter(({ type }) => type === 'drawPrepared')
+      .some(({ drawId }) => drawId === prepared.drawId)
+  );
+  assert.equal(
+    persistedAfterConfirmation.filter(({ type, drawId }) => type === 'drawConfirmed' && drawId === prepared.drawId)
+      .length,
+    1
+  );
+  assert.equal((await store.loadReservations()).length, 0);
+});
+
+test('durable fairness reservation survives coordinator reload without a new search', async () => {
+  let firstCalls = 0;
+  const { coordinator, stage, store } = await createUnbalancedSearchCoordinator(
+    async ({ seed }) => {
+      firstCalls++;
+      return [marbleForEntry(seed, ['entry-0', 'entry-1'])];
+    },
+    () => 'reloadable-reservation-seed'
+  );
+  const request = searchTestRequest(stage, ['A', 'B'], 'unused-current');
+  await coordinator.precompute(request);
+  assert.equal(firstCalls, 1);
+
+  let reloadedCalls = 0;
+  const reloaded = new FairnessCoordinator({
+    store,
+    headlessRunner: async ({ seed }) => {
+      reloadedCalls++;
+      return [marbleForEntry(seed, ['entry-0', 'entry-1'])];
+    },
+    createCandidateSeed: () => 'should-not-run',
+  });
+  reloaded.setCurrentParticipantInputs(['A', 'B']);
+  await reloaded.setEnabled(true);
+  const prepared = await reloaded.prepareDraw(request, reloaded.beginStart());
+
+  assert.equal(reloadedCalls, 0);
+  assert.equal(prepared.seed, 'reloadable-reservation-seed');
+  await reloaded.cancelDraw(prepared.drawId);
+  assert.equal((await store.loadReservations()).length, 0);
 });
 
 test('fairness start joins an in-flight precompute instead of starting a second search', async () => {
