@@ -8,6 +8,7 @@ import {
   createFairnessState,
   evaluateStrictBalanceEntries,
   FAIRNESS_DATA_VERSION,
+  FAIRNESS_SIMULATION_RULESET_VERSION,
   type FairnessDrawEntrySnapshot,
   type FairnessDrawPreparedEvent,
   type FairnessEvent,
@@ -274,6 +275,7 @@ function createFairnessSearchKey(
       id: STRICT_BALANCE_POLICY_ID,
       version: STRICT_BALANCE_POLICY_VERSION,
     },
+    simulationRulesetVersion: FAIRNESS_SIMULATION_RULESET_VERSION,
     budget,
     headlessStepLimit,
   });
@@ -576,8 +578,24 @@ export class FairnessCoordinator {
       mustSearch: context.mustSearch,
       budget: context.budget,
     });
+    const requestedSeed = getRequestedRoundSeed(request);
+    const existingReservation = this.findDurableReservation(context, requestedSeed);
+    if (existingReservation) {
+      this.recordDiagnostic('precompute.reservation-hit', {
+        generation,
+        key: context.key,
+        seed: existingReservation.seed,
+        reservationId: existingReservation.reservationId,
+      });
+      return {
+        key: context.key,
+        generation,
+        seed: existingReservation.seed,
+        reservationId: existingReservation.reservationId,
+      };
+    }
     if (!context.mustSearch) {
-      const seed = getRequestedRoundSeed(request);
+      const seed = requestedSeed;
       const draft = this.getOrCreatePreparedDrawDraft(context, seed);
       const reservation = await this.ensureDurableReservation(context, {
         seed,
@@ -1181,19 +1199,46 @@ export class FairnessCoordinator {
             .map((event) => event.drawId)
         );
         const orphanReservationIds: string[] = [];
+        const reservationsByKey = new Map<string, DurableFairnessReservation>();
         reservations.forEach((reservation) => {
           if (
             persistedDrawIds.has(reservation.drawId) ||
             !isPreparedDrawDraft(reservation.draft) ||
-            reservation.draft.seed !== reservation.seed
+            reservation.draft.seed !== reservation.seed ||
+            reservation.rulesetVersion !== FAIRNESS_SIMULATION_RULESET_VERSION
           ) {
+            if (reservation.rulesetVersion !== FAIRNESS_SIMULATION_RULESET_VERSION) {
+              this.recordDiagnostic('reservation.ruleset-stale', {
+                reservationId: reservation.reservationId,
+                key: reservation.key,
+                rulesetVersion: reservation.rulesetVersion,
+                expectedRulesetVersion: FAIRNESS_SIMULATION_RULESET_VERSION,
+              });
+            }
             orphanReservationIds.push(reservation.reservationId);
             return;
           }
-          this.durableReservations.set(reservation.reservationId, {
+          const normalized: DurableFairnessReservation = {
             ...reservation,
             draft: reservation.draft,
+          };
+          const existing = reservationsByKey.get(normalized.key);
+          if (!existing) {
+            reservationsByKey.set(normalized.key, normalized);
+            return;
+          }
+          const keep = existing.reservationId.localeCompare(normalized.reservationId) <= 0 ? existing : normalized;
+          const discard = keep === existing ? normalized : existing;
+          reservationsByKey.set(normalized.key, keep);
+          orphanReservationIds.push(discard.reservationId);
+          this.recordDiagnostic('reservation.duplicate-discard', {
+            key: normalized.key,
+            keptReservationId: keep.reservationId,
+            discardedReservationId: discard.reservationId,
           });
+        });
+        reservationsByKey.forEach((reservation) => {
+          this.durableReservations.set(reservation.reservationId, reservation);
         });
         const removeReservation = this.store.removeReservation;
         if (removeReservation) {
@@ -1598,8 +1643,14 @@ export class FairnessCoordinator {
     this.assertSearchCurrent(context.generation);
 
     const requestedSeed = getRequestedRoundSeed(context.request);
+    const identity = context.mustSearch
+      ? `${context.generation}:${context.key}`
+      : `${context.generation}:${context.key}:${typeof result.seed}:${String(result.seed)}`;
+    const pending = this.reservationWrites.get(identity);
+    if (pending) return pending;
+
     const existing = this.findDurableReservation(context, requestedSeed);
-    if (existing && existing.seed === result.seed) return existing;
+    if (existing && (context.mustSearch || existing.seed === result.seed)) return existing;
 
     // A strict fast-path reservation is tied to the physical seed of this
     // logical round. If that seed changed (for example after an explicit
@@ -1617,10 +1668,6 @@ export class FairnessCoordinator {
         });
     }
 
-    const identity = `${context.generation}:${context.key}:${typeof result.seed}:${String(result.seed)}`;
-    const pending = this.reservationWrites.get(identity);
-    if (pending) return pending;
-
     const reservation: DurableFairnessReservation = {
       reservationId: this.createId('reservation'),
       drawId: this.createId('draw'),
@@ -1628,6 +1675,7 @@ export class FairnessCoordinator {
       seed: result.seed,
       winnerMarbleIds: [...result.winnerMarbleIds],
       winnerEntryIds: [...result.winnerEntryIds],
+      rulesetVersion: FAIRNESS_SIMULATION_RULESET_VERSION,
       draft: result.draft,
     };
     this.recordDiagnostic('reservation.start', {

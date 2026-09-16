@@ -2,6 +2,11 @@ import type { Seed } from './utils/random';
 
 export const FAIRNESS_DATA_VERSION = 2 as const;
 export const LEGACY_FAIRNESS_DATA_VERSION = 1 as const;
+/**
+ * Increment when deterministic production simulation semantics relevant to
+ * Fairness candidate verification change.
+ */
+export const FAIRNESS_SIMULATION_RULESET_VERSION = 1 as const;
 export const STRICT_BALANCE_POLICY_ID = 'strict-balance-v1' as const;
 export const STRICT_BALANCE_POLICY_VERSION = 1 as const;
 const FAIRNESS_SEARCH_SUCCESS_TARGET = 0.95;

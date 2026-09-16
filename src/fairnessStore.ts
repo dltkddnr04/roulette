@@ -1,4 +1,9 @@
-import { FAIRNESS_DATA_VERSION, type FairnessEvent, validateFairnessEvent, validateFairnessExport } from './fairness';
+import {
+  FAIRNESS_DATA_VERSION,
+  type FairnessEvent,
+  validateFairnessEvent,
+  validateFairnessExport,
+} from './fairness';
 import type { Seed } from './utils/random';
 
 /**
@@ -15,6 +20,8 @@ export type FairnessReservationRecord = Readonly<{
   seed: Seed;
   winnerMarbleIds: readonly number[];
   winnerEntryIds: readonly string[];
+  /** 0 is the normalized value for reservations written before versioning. */
+  rulesetVersion: number;
   draft: unknown;
 }>;
 
@@ -62,6 +69,10 @@ function validateReservation(value: unknown): FairnessReservationRecord {
   ) {
     throw new Error('Fairness reservation is corrupt');
   }
+  const rulesetVersion = candidate.rulesetVersion === undefined ? 0 : candidate.rulesetVersion;
+  if (!Number.isSafeInteger(rulesetVersion) || rulesetVersion < 0) {
+    throw new Error('Fairness reservation is corrupt');
+  }
   return {
     reservationId: candidate.reservationId,
     drawId: candidate.drawId,
@@ -69,6 +80,7 @@ function validateReservation(value: unknown): FairnessReservationRecord {
     seed: candidate.seed,
     winnerMarbleIds: [...candidate.winnerMarbleIds],
     winnerEntryIds: [...candidate.winnerEntryIds],
+    rulesetVersion,
     draft: clone(candidate.draft),
   };
 }
