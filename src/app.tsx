@@ -204,12 +204,17 @@ export function App({ roulette }: { roulette: Roulette }) {
       if (typeof message === 'string') showToast(message);
       if (roulette.roundState === 'ready') setSettingsHidden(false);
     };
+    const onStartCancelled = () => {
+      if (roulette.roundState !== 'running') setSettingsHidden(false);
+    };
     roulette.addEventListener('goal', onGoal);
     roulette.addEventListener('message', onMessage);
+    roulette.addEventListener('startcancelled', onStartCancelled);
     roulette.addEventListener('fairness', refreshFairness);
     return () => {
       roulette.removeEventListener('goal', onGoal);
       roulette.removeEventListener('message', onMessage);
+      roulette.removeEventListener('startcancelled', onStartCancelled);
       roulette.removeEventListener('fairness', refreshFairness);
       if (settingsTimer.current !== null) {
         window.clearTimeout(settingsTimer.current);

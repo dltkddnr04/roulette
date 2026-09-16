@@ -69,6 +69,8 @@ export class Roulette extends EventTarget {
     prepared: Promise<FairnessPreparedDraw | null>;
   } | null = null;
   private _fairnessStartPromise: Promise<void> | null = null;
+  private _initialParticipantSetupPending = true;
+  private _allowPersistedFairnessReservationSeed = false;
   private _standbyRequestToken = 0;
   private _standbyScheduleCancel: (() => void) | null = null;
   private _scheduledStandby: {
@@ -305,6 +307,7 @@ export class Roulette extends EventTarget {
       skillsEnabled: this._roundSession.getSkillsEnabled(),
       currentSeed: this._roundSession.getSeed(),
       nextRoundSeed: this._roundSession.getNextRoundSeed(),
+      allowPersistedReservationSeed: this._allowPersistedFairnessReservationSeed,
     } as const;
     const token = this._standbyRequestToken;
     this._fairnessCoordinator.recordDiagnostic('precompute.schedule', {
@@ -899,6 +902,7 @@ export class Roulette extends EventTarget {
       skillsEnabled: this._roundSession.getSkillsEnabled(),
       currentSeed: this._roundSession.getSeed(),
       nextRoundSeed: this._roundSession.getNextRoundSeed(),
+      allowPersistedReservationSeed: this._allowPersistedFairnessReservationSeed,
     } as const;
     const restoreRandomSeedMode = this._roundSession.getSeedMode() === 'random';
 
@@ -920,7 +924,10 @@ export class Roulette extends EventTarget {
         readyToStart: this._matchesReadyToStart(prepared, this._standbyRequestToken),
       });
     } catch (error) {
-      if (error instanceof FairnessCancelledError) return;
+      if (error instanceof FairnessCancelledError) {
+        this.dispatchEvent(new Event('startcancelled'));
+        return;
+      }
       const state = await this._fairnessCoordinator.getState();
       this._emitMessage(error instanceof Error ? error.message : 'Fairness could not start this draw');
       // A storage failure disables fairness and leaves the old roulette path
@@ -1071,6 +1078,7 @@ export class Roulette extends EventTarget {
   }
 
   public setSeed(seed: Seed) {
+    this._allowPersistedFairnessReservationSeed = false;
     if (!this._applyingReplay) this._cancelActiveFairnessDraw('Fairness draw was cancelled because the seed changed');
     this._roundSession.setSeed(seed);
   }
@@ -1080,6 +1088,7 @@ export class Roulette extends EventTarget {
   }
 
   public useRandomSeed(): void {
+    this._allowPersistedFairnessReservationSeed = false;
     if (!this._applyingReplay) this._cancelActiveFairnessDraw('Fairness draw was cancelled because the seed changed');
     this._roundSession.setRandomSeedMode();
   }
@@ -1095,6 +1104,7 @@ export class Roulette extends EventTarget {
   public setWinnerRange(start: number, end: number, fairnessPrecomputeDelay = 150) {
     const changed = this._roundSession.setWinnerRange(start, end);
     if (!changed) return true;
+    this._allowPersistedFairnessReservationSeed = false;
     if (!this._applyingReplay) this._cancelActiveFairnessDraw('Fairness draw was cancelled because the winner changed');
     this._scheduleFairnessPrecompute(fairnessPrecomputeDelay);
     return true;
@@ -1116,6 +1126,7 @@ export class Roulette extends EventTarget {
   public setSkillsEnabled(enabled: boolean): void {
     const changed = this._roundSession.setSkillsEnabled(enabled);
     if (!changed) return;
+    this._allowPersistedFairnessReservationSeed = false;
     if (!this._applyingReplay) this._cancelActiveFairnessDraw('Fairness draw was cancelled because skills changed');
     this._scheduleFairnessPrecompute();
   }
@@ -1235,6 +1246,13 @@ export class Roulette extends EventTarget {
 
   public setMarbles(names: string[], fairnessPrecomputeDelay = 150) {
     if (!this._roundSession.isInitialized) return;
+
+    if (this._initialParticipantSetupPending) {
+      this._initialParticipantSetupPending = false;
+      this._allowPersistedFairnessReservationSeed = true;
+    } else {
+      this._allowPersistedFairnessReservationSeed = false;
+    }
 
     const participantsChanged = !sameStrings(this._roundSession.getParticipantInputs(), names);
     if (!this._applyingReplay) {
@@ -1370,6 +1388,7 @@ export class Roulette extends EventTarget {
       throw new Error('Incorrect map number');
     }
     if (this._roundSession.currentStage === stages[index]) return;
+    this._allowPersistedFairnessReservationSeed = false;
     if (!this._applyingReplay) {
       this._replayPending = false;
       this._cancelActiveFairnessDraw('Fairness draw was cancelled because the map changed');

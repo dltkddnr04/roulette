@@ -64,6 +64,8 @@ export type FairnessStartRequest = Readonly<{
   currentSeed: Seed;
   /** Seed reserved for the next logical round; excluded from policy identity. */
   nextRoundSeed?: Seed;
+  /** Allow the first post-reload bootstrap to recover a persisted strict-path seed. */
+  allowPersistedReservationSeed?: boolean;
 }>;
 
 export type FairnessHeadlessSearchRequest = HeadlessSimulationRequest;
@@ -601,7 +603,11 @@ export class FairnessCoordinator {
       budget: context.budget,
     });
     const requestedSeed = getRequestedRoundSeed(request);
-    const existingReservation = this.findDurableReservation(context, requestedSeed);
+    const existingReservation = this.findDurableReservation(
+      context,
+      requestedSeed,
+      request.allowPersistedReservationSeed === true
+    );
     if (existingReservation) {
       const plan = this.createPrecomputedPlan(context, requestedSeed, existingReservation);
       this.recordDiagnostic('precompute.reservation-hit', {
@@ -987,7 +993,11 @@ export class FairnessCoordinator {
     let preparedEvent: FairnessDrawPreparedEvent | null = null;
 
     try {
-      const durableReservation = this.findDurableReservation(context, seed);
+      const durableReservation = this.findDurableReservation(
+        context,
+        seed,
+        request.allowPersistedReservationSeed === true
+      );
       if (durableReservation) {
         return this.claimCachedPreparedDraw({ context, reservation: durableReservation }, token, includeEvent);
       }
@@ -1742,14 +1752,18 @@ export class FairnessCoordinator {
 
   private findDurableReservation(
     context: FairnessSearchContext,
-    requestedSeed: Seed
+    requestedSeed: Seed,
+    allowPersistedReservationSeed = false
   ): DurableFairnessReservation | null {
+    let persistedSeedFallback: DurableFairnessReservation | null = null;
     for (const reservation of this.durableReservations.values()) {
       if (reservation.key !== context.key) continue;
-      if (!context.mustSearch && reservation.seed !== requestedSeed) continue;
-      return reservation;
+      if (context.mustSearch || reservation.seed === requestedSeed) return reservation;
+      if (allowPersistedReservationSeed && persistedSeedFallback === null) {
+        persistedSeedFallback = reservation;
+      }
     }
-    return null;
+    return persistedSeedFallback;
   }
 
   private findCachedPreparedReservation(
@@ -1766,7 +1780,11 @@ export class FairnessCoordinator {
       return null;
     }
     this.assertCurrent(token);
-    const reservation = this.findDurableReservation(context, getRequestedRoundSeed(request));
+    const reservation = this.findDurableReservation(
+      context,
+      getRequestedRoundSeed(request),
+      request.allowPersistedReservationSeed === true
+    );
     return reservation ? { context, reservation } : null;
   }
 
