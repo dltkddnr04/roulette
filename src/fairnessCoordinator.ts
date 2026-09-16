@@ -1292,7 +1292,7 @@ export class FairnessCoordinator {
           const persistedPreparedEvent = preparedEventsByDrawId.get(reservation.drawId);
           if (terminalDrawIds.has(reservation.drawId)) {
             orphanReservationIds.push(reservation.reservationId);
-            continue;
+            return;
           }
           if (persistedPreparedEvent || reservation.state === 'claimed') {
             recoveryReservations.push({
@@ -1307,7 +1307,7 @@ export class FairnessCoordinator {
               state: reservation.state,
               preparedEventPersisted: Boolean(persistedPreparedEvent),
             });
-            continue;
+            return;
           }
           const normalized = reservation;
           const existing = reservationsByKey.get(normalized.key);
