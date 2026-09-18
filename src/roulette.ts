@@ -5,6 +5,7 @@ import type { FairnessExport, FairnessMode, FairnessState } from './fairness';
 import {
   FairnessCancelledError,
   FairnessCoordinator,
+  FairnessStaleStateError,
   type FairnessPrecomputedPlan,
   type FairnessPreparedDraw,
 } from './fairnessCoordinator';
@@ -69,6 +70,7 @@ export class Roulette extends EventTarget {
     prepared: Promise<FairnessPreparedDraw | null>;
   } | null = null;
   private _fairnessStartPromise: Promise<void> | null = null;
+  private _firstFairnessPhysicsDiagnosticGeneration: number | null = null;
   private _initialParticipantSetupPending = true;
   private _allowPersistedFairnessReservationSeed = false;
   private _standbyRequestToken = 0;
@@ -148,6 +150,17 @@ export class Roulette extends EventTarget {
   constructor(renderScale: RenderScale = 0.5, fairnessCoordinator = new FairnessCoordinator()) {
     super();
     this._fairnessCoordinator = fairnessCoordinator;
+    this._fairnessCoordinator.addStateChangeListener((change) => {
+      if (change.external && change.autoPrecompute && !change.foreignActiveDraw) {
+        // Another tab may have advanced the durable projection while this tab
+        // was holding an older ReadyToStart/standby cache. Drop only the
+        // speculative physical preparation; the visible round remains owned
+        // by this session and is never interrupted by a state notification.
+        this._invalidateStandby();
+        this._scheduleFairnessPrecompute(0, true);
+      }
+      this._emitFairnessStateChange();
+    });
     this._renderScale = renderScale;
     document.addEventListener('visibilitychange', this._handleVisibilityChange);
     this._renderer = this.createRenderer();
@@ -216,6 +229,17 @@ export class Roulette extends EventTarget {
       onStepComplete: () => {
         this._presentationEffects.update(FIXED_PHYSICS_INTERVAL);
         this._uiObjects.forEach((obj) => obj.update(FIXED_PHYSICS_INTERVAL));
+        const fairnessRound = this._fairnessRound;
+        if (
+          fairnessRound &&
+          this._roundSession.isRunning(fairnessRound.generation) &&
+          this._firstFairnessPhysicsDiagnosticGeneration !== fairnessRound.generation
+        ) {
+          this._firstFairnessPhysicsDiagnosticGeneration = fairnessRound.generation;
+          this._fairnessCoordinator.recordDiagnostic('start.first-physics-step', {
+            roundGeneration: fairnessRound.generation,
+          });
+        }
       },
     });
 
@@ -925,6 +949,10 @@ export class Roulette extends EventTarget {
       });
     } catch (error) {
       if (error instanceof FairnessCancelledError) {
+        if (error instanceof FairnessStaleStateError) {
+          this._invalidateStandby();
+          this._scheduleFairnessPrecompute(0, true);
+        }
         this.dispatchEvent(new Event('startcancelled'));
         return;
       }
@@ -944,7 +972,15 @@ export class Roulette extends EventTarget {
     this._invalidateRecording();
     this._presentationEffects.clear();
     let spawnLayout = this._roundSession.adoptPreparedAuthoritativeRound(prepared.seed);
-    if (spawnLayout) this._readyToStart = null;
+    if (spawnLayout) {
+      this._readyToStart = null;
+      this._fairnessCoordinator.recordDiagnostic('start.standby-adopt', {
+        key: prepared.key,
+        generation: prepared.generation,
+        seed: prepared.seed,
+        reservationId: prepared.reservationId,
+      });
+    }
     if (!spawnLayout) {
       this._startScheduledStandby(prepared, this._standbyRequestToken);
       const standby = this._standbyPreparation;
@@ -956,7 +992,15 @@ export class Roulette extends EventTarget {
         });
         await standby.promise;
         spawnLayout = this._roundSession.adoptPreparedAuthoritativeRound(prepared.seed);
-        if (spawnLayout) this._readyToStart = null;
+        if (spawnLayout) {
+          this._readyToStart = null;
+          this._fairnessCoordinator.recordDiagnostic('start.standby-adopt', {
+            key: prepared.key,
+            generation: prepared.generation,
+            seed: prepared.seed,
+            reservationId: prepared.reservationId,
+          });
+        }
       }
     }
     if (!this._fairnessCoordinator.isStartCurrent(operationToken)) {
@@ -1010,6 +1054,7 @@ export class Roulette extends EventTarget {
 
     const startPhysics = () => {
       if (!this._roundSession.isRunning(roundGeneration)) return;
+      this._fairnessCoordinator.recordDiagnostic('start.activate', { roundGeneration });
       this._roundSession.activate(roundGeneration);
     };
 

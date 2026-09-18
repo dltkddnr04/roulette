@@ -175,6 +175,10 @@ export class RaceSimulation {
 
   loadStage(stage: StageDef): void {
     this.stage = stage;
+    // Loading a stage replaces the physics world. The old Marble objects are
+    // just as stale as their bodies, so clear the host-side collection before
+    // a subsequent participant rebuild can append the new round.
+    this.clearMarbleStateForNewWorld();
     this.physics.loadStage(stage);
     this.resetInterpolationSnapshots();
   }
@@ -191,6 +195,7 @@ export class RaceSimulation {
   ): Promise<boolean> {
     if (!shouldContinue()) return false;
     this.stage = stage;
+    this.clearMarbleStateForNewWorld();
     const beginStageLoad = this.physics.beginStageLoad;
     const loadStageEntityBatch = this.physics.loadStageEntityBatch;
     if (!beginStageLoad || !loadStageEntityBatch) {
@@ -281,9 +286,7 @@ export class RaceSimulation {
 
   clearMarbles(): void {
     this.physics.clearMarbles();
-    this.marbles = [];
-    this.previousMarbleTransforms.clear();
-    this.currentMarbleTransforms.clear();
+    this.clearMarbleStateForNewWorld();
   }
 
   /** Remove one bounded batch of marble bodies, retaining atomic compatibility. */
@@ -435,6 +438,12 @@ export class RaceSimulation {
     this.currentMarbleTransforms = new Map(
       this.marbles.map((marble) => [marble.id, { ...marble.getSimulationPosition() }])
     );
+  }
+
+  private clearMarbleStateForNewWorld(): void {
+    this.marbles = [];
+    this.previousMarbleTransforms.clear();
+    this.currentMarbleTransforms.clear();
   }
 
   private getMarbleRenderStates(alpha: number): MarbleRenderState[] {

@@ -132,6 +132,10 @@ export class RoundSession {
     if (this.hasDeferredCleanup(this.simulation) || this.simulation.getCount() > 0) this.clearCurrentMarbles();
     this.stage = stage;
     this.simulation.loadStage(stage);
+    // loadStage() replaces the Box2D world, so any cleanup record for that
+    // same simulation has already lost ownership of its old bodies. Do not
+    // leave a stale record that would block the new world's stepping.
+    this.forgetDeferredCleanup(this.simulation);
   }
 
   setSeed(seed: Seed): void {
@@ -389,6 +393,7 @@ export class RoundSession {
       // Start will create those bodies from this canonical stage as needed.
       this.clearCurrentMarbles();
       this.simulation.loadStage(stage);
+      this.forgetDeferredCleanup(this.simulation);
       return this.rebuildPreview(true);
     }
     return this.rebuildParticipants();
@@ -408,6 +413,7 @@ export class RoundSession {
     this.state = 'ready';
     if (this.stage) {
       this.simulation.loadStage(this.stage);
+      this.forgetDeferredCleanup(this.simulation);
     }
   }
 
@@ -520,6 +526,9 @@ export class RoundSession {
     if (this.state === 'ready' && this.previewMarbles.length > 0) {
       return { ...renderStates, marbles: this.previewMarbles };
     }
+    if (this.state === 'ready' && this.configuredCount === 0) {
+      return { ...renderStates, marbles: [] };
+    }
     return renderStates;
   }
 
@@ -611,19 +620,26 @@ export class RoundSession {
     this.scheduleDeferredCleanup();
   }
 
-  private flushDeferredCleanup(): void {
-    const index = this.deferredCleanup.findIndex(({ simulation }) => simulation === this.simulation);
+  private forgetDeferredCleanup(simulation: RaceSimulation): void {
+    const index = this.deferredCleanup.findIndex(({ simulation: candidate }) => candidate === simulation);
     if (index < 0) return;
+    this.deferredCleanup.splice(index, 1);
     this.cancelDeferredCleanupSchedule();
-    const [cleanup] = this.deferredCleanup.splice(index, 1);
-    cleanup.simulation.clearMarbles();
     this.scheduleDeferredCleanup();
   }
 
+  private deferCurrentMarbleCleanup(): void {
+    if (this.simulation.getCount() > 0 && !this.hasDeferredCleanup(this.simulation)) {
+      this.deferMarbleCleanup();
+    }
+  }
+
   private clearCurrentMarbles(): void {
-    const deferred = this.hasDeferredCleanup(this.simulation);
-    this.flushDeferredCleanup();
-    if (!deferred) this.simulation.clearMarbles();
+    // Never synchronously flush a deferred world. User actions may arrive
+    // while its background cleanup is in progress; leave ownership with the
+    // chunk scheduler and let a subsequent world replacement discard the
+    // record after resetWorld() has made the old bodies unreachable.
+    this.deferCurrentMarbleCleanup();
   }
 
   private cancelDeferredCleanupSchedule(): void {
