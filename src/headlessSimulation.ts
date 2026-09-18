@@ -88,6 +88,7 @@ export async function simulateHeadlessRace(
         onStepComplete() {
           steps++;
         },
+        captureRenderState: false,
       });
       throwIfAborted(signal);
       advances++;

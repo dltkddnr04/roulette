@@ -25,6 +25,12 @@ export type SimulationStepCallbacks = {
   onFinish: (marble: MarblePresentationState) => void;
   afterStep: () => number;
   onStepComplete: () => void;
+  /**
+   * Headless callers can skip interpolation snapshots because they consume
+   * only authoritative physics/winner results. Visible simulation keeps the
+   * default render-state bookkeeping enabled.
+   */
+  captureRenderState?: boolean;
   /** Optional owner-level stop hook for lifecycle transitions during a step. */
   shouldContinue?: () => boolean;
 };
@@ -364,6 +370,7 @@ export class RaceSimulation {
 
   advance(frameDelta: number, speed: number, fastForwardSpeed: number, callbacks: SimulationStepCallbacks): number {
     this.elapsed += frameDelta * speed * fastForwardSpeed;
+    const captureRenderState = callbacks.captureRenderState !== false;
 
     let accumulatedTime = this.physicsDebt + this.elapsed;
     this.physicsDebt = 0;
@@ -375,16 +382,18 @@ export class RaceSimulation {
       const stepBudget = getStepBudget(FIXED_PHYSICS_INTERVAL, this.timeScale);
       if (accumulatedTime < stepBudget) break;
 
-      this.capturePreviousTransforms();
+      if (captureRenderState) this.capturePreviousTransforms();
       this.physics.step(FIXED_PHYSICS_INTERVAL / 1000);
       if (this.marbles.length > 1) {
         this.marbles.sort((a, b) => b.y - a.y || a.id - b.id);
       }
-      this.currentEntities = this.copyEntityStates(this.physics.getEntityRenderStates());
+      if (captureRenderState) {
+        this.currentEntities = this.copyEntityStates(this.physics.getEntityRenderStates());
+      }
       this.updateMarbles(callbacks);
 
       this.timeScale = callbacks.afterStep();
-      this.captureCurrentMarbleTransforms();
+      if (captureRenderState) this.captureCurrentMarbleTransforms();
 
       accumulatedTime -= stepBudget;
       physicsSteps++;
