@@ -602,7 +602,6 @@ export class Roulette extends EventTarget {
         )
         .then((confirmation) => {
           if (!confirmation.confirmed && confirmation.reason) this._emitMessage(confirmation.reason);
-          this._emitFairnessStateChange();
           if (confirmation.confirmed) {
             // Confirmation changes the policy projection and invalidates any
             // standby that was prepared for the previous balance state before
@@ -645,7 +644,6 @@ export class Roulette extends EventTarget {
             if (!confirmation.confirmed && confirmation.reason) {
               this._emitMessage(confirmation.reason);
             }
-            this._emitFairnessStateChange();
             return undefined;
           })
           .catch((error) => {

@@ -641,6 +641,7 @@ export class FairnessCoordinator {
   private readonly hasInjectedHeadlessRunner: boolean;
   private readonly stateChangeListeners = new Set<(change: FairnessStateChange) => void>();
   private readonly stateChangeChannel: BroadcastChannel | null;
+  private stateChangeSequence = 0;
   private externalStateRefresh: Promise<void> | null = null;
   private externalStateRefreshPending = false;
   private durableChangeNotificationPending = false;
@@ -754,10 +755,21 @@ export class FairnessCoordinator {
   }
 
   private notifyStateChanged(broadcast = true, external = false, autoPrecompute = true): void {
+    this.stateChangeSequence += 1;
     for (const listener of this.stateChangeListeners) {
       listener({ external, foreignActiveDraw: this.foreignActiveDraw, autoPrecompute });
     }
     if (!broadcast) return;
+    this.broadcastStateChanged();
+  }
+
+  /**
+   * Publish a private control-plane transition to peer documents without
+   * turning it into a public same-document state refresh. Reservations are
+   * shared through this channel, but they are not user-visible Fairness
+   * projection mutations.
+   */
+  private broadcastStateChanged(): void {
     if (this.stateChangeChannel) {
       try {
         this.stateChangeChannel.postMessage({ type: 'fairness-state-changed' });
@@ -1355,7 +1367,7 @@ export class FairnessCoordinator {
     void discardReadyReservation
       .call(this.store, reservation.reservationId, getReservationIdentity(reservation))
       .then((result) => {
-        if (result === 'discarded') this.notifyStateChanged();
+        if (result === 'discarded') this.broadcastStateChanged();
       })
       .catch(() => undefined);
   }
@@ -1453,11 +1465,13 @@ export class FairnessCoordinator {
   }
 
   async setEnabled(enabled: boolean): Promise<void> {
-    if (enabled === this.enabled && this.available) return;
+    if (enabled === this.enabled && (!enabled || this.available)) return;
+    const notificationSequence = this.stateChangeSequence;
     if (!enabled) {
       this.invalidateSearchState();
       this.enabled = false;
       writeLocalStorage(FAIRNESS_ENABLED_STORAGE_KEY, 'false');
+      if (this.stateChangeSequence === notificationSequence) this.notifyStateChanged();
       return;
     }
 
@@ -1467,10 +1481,14 @@ export class FairnessCoordinator {
       this.available = true;
       this.error = null;
       this.enabled = true;
+      // Persist the preference before participant synchronization can publish
+      // a durable event, so every successful notification observes the final
+      // enabled state.
+      writeLocalStorage(FAIRNESS_ENABLED_STORAGE_KEY, 'true');
       const generation = this.searchGeneration;
       await this.syncCurrentParticipants(false, this.currentInputs, undefined, true, generation);
       this.warmWorkerPool();
-      writeLocalStorage(FAIRNESS_ENABLED_STORAGE_KEY, 'true');
+      if (this.stateChangeSequence === notificationSequence) this.notifyStateChanged();
     } catch (error) {
       if (error instanceof FairnessCancelledError) return;
       if (isFairnessInputError(error)) {
@@ -1486,8 +1504,10 @@ export class FairnessCoordinator {
 
   async setMode(mode: FairnessMode): Promise<void> {
     if (!isFairnessMode(mode)) throw new Error('Fairness mode is invalid');
+    if (this.mode === mode) return;
     this.mode = mode;
     writeLocalStorage(FAIRNESS_MODE_STORAGE_KEY, mode);
+    this.notifyStateChanged();
   }
 
   async getState(): Promise<FairnessState> {
@@ -2924,7 +2944,7 @@ export class FairnessCoordinator {
       // Publish the private ready -> claimed transition immediately. Peers
       // must stop treating this reservation as reusable while the active draw
       // continues to hold the long-lived origin lock.
-      this.notifyStateChanged();
+      this.broadcastStateChanged();
       try {
         this.assertSearchCurrent(context.generation);
         this.assertCurrent(token);
@@ -3089,9 +3109,10 @@ export class FairnessCoordinator {
         throw error;
       }
       this.durableReservations.set(reservation.reservationId, reservation);
-      // Reservation state is private to the control plane, so publish it
-      // explicitly; it does not advance the event-log history stamp.
-      this.markDurableStateChanged();
+      // Reservation state is private to the control plane, so publish it to
+      // peers without emitting a same-document public state refresh. It does
+      // not advance the event-log history stamp.
+      this.broadcastStateChanged();
       this.recordDiagnostic('reservation.ready', {
         generation: context.generation,
         key: context.key,
