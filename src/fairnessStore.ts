@@ -1,5 +1,6 @@
 import {
   FAIRNESS_DATA_VERSION,
+  type FairnessProfile,
   type FairnessEvent,
   type FairnessDrawCancelledEvent,
   type FairnessDrawConfirmedEvent,
@@ -18,6 +19,7 @@ import type { Seed } from './utils/random';
  * speculative preparation visible in Fairness history.
  */
 export type FairnessReservationRecord = Readonly<{
+  profileId: string;
   reservationId: string;
   drawId: string;
   key: string;
@@ -32,6 +34,8 @@ export type FairnessReservationRecord = Readonly<{
 }>;
 
 export type FairnessReservationIdentity = Readonly<{
+  /** Optional for callers written before profile-scoped reservations. */
+  profileId?: string;
   reservationId: string;
   drawId: string;
   key: string;
@@ -57,12 +61,14 @@ export type FairnessReservationTerminalEvent =
   | FairnessDrawCancelledEvent;
 
 export interface FairnessEventStore {
-  load(): Promise<FairnessEvent[]>;
-  loadHistoryStamp?(): Promise<FairnessHistoryStamp>;
-  append(event: FairnessEvent): Promise<void>;
-  replace(events: readonly FairnessEvent[]): Promise<void>;
-  clear(): Promise<void>;
-  loadReservations?(): Promise<FairnessReservationRecord[]>;
+  load(profileId?: string): Promise<FairnessEvent[]>;
+  loadHistoryStamp?(profileId?: string): Promise<FairnessHistoryStamp>;
+  loadProfiles?(): Promise<FairnessProfile[]>;
+  saveProfile?(profile: FairnessProfile): Promise<void>;
+  append(event: FairnessEvent, profileId?: string): Promise<void>;
+  replace(events: readonly FairnessEvent[], profileId?: string): Promise<void>;
+  clear(profileId?: string): Promise<void>;
+  loadReservations?(profileId?: string): Promise<FairnessReservationRecord[]>;
   hasQuarantinedClaimedReservations?(): Promise<boolean>;
   reserve?(reservation: FairnessReservationRecord): Promise<void>;
   removeReservation?(reservationId: string): Promise<void>;
@@ -93,23 +99,29 @@ export interface FairnessEventStore {
 
 type StoredFairnessEvent = {
   sequence?: number;
+  profileId?: string;
   event: FairnessEvent;
 };
 
 const DATABASE_NAME = 'marble-roulette-fairness-v1';
-const DATABASE_VERSION = 2;
+const DATABASE_VERSION = 3;
 const EVENT_STORE_NAME = 'events';
 const RESERVATION_STORE_NAME = 'reservations';
-// Keep the history revision in the existing event store so the freshness
-// protocol does not require a version-3 upgrade that can be blocked by a live
-// version-2 tab. The reserved negative key is never produced by the event
-// store's auto-increment key generator and is filtered from the public log.
+const PROFILE_STORE_NAME = 'profiles';
+export const DEFAULT_FAIRNESS_PROFILE_ID = 'default';
+export const DEFAULT_FAIRNESS_PROFILE_NAME = 'Default';
+// Keep the per-profile history revision in the existing event store instead
+// of adding another metadata store. The reserved negative key is never
+// produced by the event store's auto-increment key generator and is filtered
+// from the public log.
 const HISTORY_METADATA_SEQUENCE = -1;
 
 type StoredHistoryMetadata = {
   sequence: typeof HISTORY_METADATA_SEQUENCE;
   kind: 'history-metadata';
-  revision: number;
+  /** Legacy v2 global revision, retained for the default profile migration. */
+  revision?: number;
+  revisions?: Record<string, number>;
 };
 
 function isHistoryMetadata(value: unknown): value is StoredHistoryMetadata {
@@ -119,6 +131,16 @@ function isHistoryMetadata(value: unknown): value is StoredHistoryMetadata {
     (value as { sequence?: unknown }).sequence === HISTORY_METADATA_SEQUENCE &&
     (value as { kind?: unknown }).kind === 'history-metadata'
   );
+}
+
+function profileIdOrDefault(profileId: string | undefined): string {
+  return profileId && profileId.trim() ? profileId : DEFAULT_FAIRNESS_PROFILE_ID;
+}
+
+function profileMatches(value: unknown, profileId: string): boolean {
+  if (!value || typeof value !== 'object') return true;
+  const recordProfileId = (value as { profileId?: unknown }).profileId;
+  return profileIdOrDefault(typeof recordProfileId === 'string' ? recordProfileId : undefined) === profileIdOrDefault(profileId);
 }
 
 function clone<T>(value: T): T {
@@ -134,6 +156,7 @@ function sameReservationIdentity(
   expected: FairnessReservationIdentity
 ): boolean {
   return (
+    profileIdOrDefault(reservation.profileId) === profileIdOrDefault(expected.profileId) &&
     reservation.reservationId === expected.reservationId &&
     reservation.drawId === expected.drawId &&
     reservation.key === expected.key &&
@@ -172,17 +195,39 @@ function readHistoryRevision(value: unknown): number {
   return 0;
 }
 
-function withNextHistoryRevision(store: IDBObjectStore, callback: (revision: number) => void): void {
+function withNextHistoryRevision(
+  store: IDBObjectStore,
+  profileId: string,
+  callback: (revision: number, metadata: StoredHistoryMetadata) => void
+): void {
   const request = store.get(HISTORY_METADATA_SEQUENCE);
   request.onsuccess = () => {
-    const revision = readHistoryRevision(request.result) + 1;
-    callback(revision);
+    const existing = request.result as StoredHistoryMetadata | undefined;
+    const revisions = { ...(existing?.revisions ?? {}) };
+    const previous =
+      revisions[profileId] ??
+      (profileId === DEFAULT_FAIRNESS_PROFILE_ID ? readHistoryRevision(existing) : 0);
+    const revision = previous + 1;
+    revisions[profileId] = revision;
+    callback(revision, {
+      sequence: HISTORY_METADATA_SEQUENCE,
+      kind: 'history-metadata',
+      revision: revisions[DEFAULT_FAIRNESS_PROFILE_ID] ?? 0,
+      revisions,
+    });
   };
 }
 
 function validateReservation(value: unknown): FairnessReservationRecord {
   if (!value || typeof value !== 'object') throw new Error('Fairness reservation is corrupt');
   const candidate = value as Partial<FairnessReservationRecord>;
+  const rawProfileId = (value as { profileId?: unknown }).profileId;
+  if (
+    rawProfileId !== undefined &&
+    (typeof rawProfileId !== 'string' || rawProfileId.trim().length === 0 || rawProfileId.length > 256)
+  ) {
+    throw new Error('Fairness reservation is corrupt');
+  }
   if (
     typeof candidate.reservationId !== 'string' ||
     typeof candidate.drawId !== 'string' ||
@@ -209,6 +254,7 @@ function validateReservation(value: unknown): FairnessReservationRecord {
     throw new Error('Fairness reservation is corrupt');
   }
   return {
+    profileId: rawProfileId === undefined ? DEFAULT_FAIRNESS_PROFILE_ID : (rawProfileId as string),
     reservationId: candidate.reservationId,
     drawId: candidate.drawId,
     key: candidate.key,
@@ -220,6 +266,35 @@ function validateReservation(value: unknown): FairnessReservationRecord {
     ...(claimedAt === undefined ? {} : { claimedAt }),
     draft: clone(candidate.draft),
   };
+}
+
+function validateProfile(value: unknown): FairnessProfile {
+  if (!value || typeof value !== 'object') throw new Error('Fairness profile is corrupt');
+  const candidate = value as Partial<FairnessProfile>;
+  if (
+    typeof candidate.id !== 'string' ||
+    candidate.id.trim().length === 0 ||
+    candidate.id.length > 256 ||
+    typeof candidate.name !== 'string' ||
+    candidate.name.trim().length === 0 ||
+    candidate.name.length > 256 ||
+    typeof candidate.createdAt !== 'number' ||
+    !Number.isFinite(candidate.createdAt) ||
+    typeof candidate.updatedAt !== 'number' ||
+    !Number.isFinite(candidate.updatedAt)
+  ) {
+    throw new Error('Fairness profile is corrupt');
+  }
+  return {
+    id: candidate.id,
+    name: candidate.name.trim(),
+    createdAt: candidate.createdAt,
+    updatedAt: candidate.updatedAt,
+  };
+}
+
+function profileOrder(left: FairnessProfile, right: FairnessProfile): number {
+  return left.createdAt - right.createdAt || left.id.localeCompare(right.id);
 }
 
 export class IndexedDbFairnessStore implements FairnessEventStore {
@@ -248,6 +323,9 @@ export class IndexedDbFairnessStore implements FairnessEventStore {
         }
         if (!request.result.objectStoreNames.contains(RESERVATION_STORE_NAME)) {
           request.result.createObjectStore(RESERVATION_STORE_NAME, { keyPath: 'reservationId' });
+        }
+        if (!request.result.objectStoreNames.contains(PROFILE_STORE_NAME)) {
+          request.result.createObjectStore(PROFILE_STORE_NAME, { keyPath: 'id' });
         }
       };
       request.onsuccess = () => {
@@ -303,9 +381,10 @@ export class IndexedDbFairnessStore implements FairnessEventStore {
     );
   }
 
-  async load(): Promise<FairnessEvent[]> {
+  async load(profileId = DEFAULT_FAIRNESS_PROFILE_ID): Promise<FairnessEvent[]> {
+    const scopedProfileId = profileIdOrDefault(profileId);
     const records = await this.request<StoredFairnessEvent[]>('readonly', (store) => store.getAll());
-    const events = records.map((record) => {
+    const events = records.filter((record) => profileMatches(record, scopedProfileId)).map((record) => {
       if (isHistoryMetadata(record)) return null;
       if (!record || typeof record !== 'object' || !record.event) throw new Error('Fairness storage is corrupt');
       const event = validateFairnessEvent(record.event);
@@ -315,55 +394,63 @@ export class IndexedDbFairnessStore implements FairnessEventStore {
     return [...validateFairnessExport({ version: FAIRNESS_DATA_VERSION, mode: 'simple', events }).events];
   }
 
-  async loadHistoryStamp(): Promise<FairnessHistoryStamp> {
+  async loadHistoryStamp(profileId = DEFAULT_FAIRNESS_PROFILE_ID): Promise<FairnessHistoryStamp> {
+    const scopedProfileId = profileIdOrDefault(profileId);
     const database = await this.open();
     return new Promise<FairnessHistoryStamp>((resolve, reject) => {
       let transaction: IDBTransaction;
       let storedRecordCount = 0;
       let tailEventId: string | null = null;
       let revision = 0;
-      let hasMetadata = false;
       try {
         transaction = database.transaction(EVENT_STORE_NAME, 'readonly');
         const eventStore = transaction.objectStore(EVENT_STORE_NAME);
-        const countRequest = eventStore.count();
-        const tailRequest = eventStore.openCursor(null, 'prev');
+        const recordsRequest = eventStore.getAll();
         const metadataRequest = eventStore.get(HISTORY_METADATA_SEQUENCE);
-        countRequest.onsuccess = () => {
-          storedRecordCount = countRequest.result;
-        };
-        tailRequest.onsuccess = () => {
-          const record = tailRequest.result?.value as StoredFairnessEvent | undefined;
-          if (isHistoryMetadata(record)) {
-            tailRequest.result?.continue();
-            return;
-          }
-          const eventId = record?.event && typeof record.event.eventId === 'string' ? record.event.eventId : null;
-          tailEventId = eventId;
+        recordsRequest.onsuccess = () => {
+          const records = (recordsRequest.result ?? []) as StoredFairnessEvent[];
+          const profileRecords = records.filter(
+            (record) => !isHistoryMetadata(record) && profileMatches(record, scopedProfileId)
+          );
+          storedRecordCount = profileRecords.length;
+          tailEventId = profileRecords[profileRecords.length - 1]?.event?.eventId ?? null;
         };
         metadataRequest.onsuccess = () => {
-          hasMetadata = isHistoryMetadata(metadataRequest.result);
-          revision = readHistoryRevision(metadataRequest.result);
+          const metadata = isHistoryMetadata(metadataRequest.result) ? metadataRequest.result : undefined;
+          const revisions = metadata?.revisions ?? {};
+          revision =
+            revisions[scopedProfileId] ??
+            (scopedProfileId === DEFAULT_FAIRNESS_PROFILE_ID ? readHistoryRevision(metadata) : 0);
         };
       } catch (error) {
         reject(error);
         return;
       }
-      transaction.oncomplete = () =>
-        resolve({ revision, eventCount: Math.max(0, storedRecordCount - (hasMetadata ? 1 : 0)), tailEventId });
+      transaction.oncomplete = () => resolve({ revision, eventCount: storedRecordCount, tailEventId });
       transaction.onerror = () => reject(transaction.error ?? new Error('Fairness history stamp failed'));
       transaction.onabort = () => reject(transaction.error ?? new Error('Fairness history stamp aborted'));
     });
   }
 
-  async loadReservations(): Promise<FairnessReservationRecord[]> {
+  async loadReservations(profileId = DEFAULT_FAIRNESS_PROFILE_ID): Promise<FairnessReservationRecord[]> {
+    const scopedProfileId = profileIdOrDefault(profileId);
     this.quarantinedClaimedReservationCount = 0;
     const records = await this.request<unknown[]>('readonly', (store) => store.getAll(), RESERVATION_STORE_NAME);
     const reservations: FairnessReservationRecord[] = [];
     const invalidReadyReservationIds: string[] = [];
     records.forEach((record) => {
+      const rawProfileId =
+        record && typeof record === 'object' ? (record as { profileId?: unknown }).profileId : undefined;
+      if (
+        (rawProfileId !== undefined && typeof rawProfileId !== 'string') ||
+        (typeof rawProfileId === 'string' && profileIdOrDefault(rawProfileId) !== scopedProfileId) ||
+        (rawProfileId === undefined && scopedProfileId !== DEFAULT_FAIRNESS_PROFILE_ID)
+      ) {
+        return;
+      }
       try {
-        reservations.push(validateReservation(record));
+        const reservation = validateReservation(record);
+        if (reservation.profileId === scopedProfileId) reservations.push(reservation);
       } catch {
         if (record && typeof record === 'object' && (record as { state?: unknown }).state === 'claimed') {
           // A malformed claimed record cannot be safely attributed to this
@@ -392,11 +479,41 @@ export class IndexedDbFairnessStore implements FairnessEventStore {
     return reservations;
   }
 
+  async loadProfiles(): Promise<FairnessProfile[]> {
+    const records = await this.request<unknown[]>('readonly', (store) => store.getAll(), PROFILE_STORE_NAME);
+    const profiles: FairnessProfile[] = [];
+    records.forEach((record) => {
+      try {
+        profiles.push(validateProfile(record));
+      } catch {
+        // Ignore malformed metadata. The event log remains recoverable and a
+        // fresh default profile is created below when no valid profile exists.
+      }
+    });
+    if (!profiles.some((profile) => profile.id === DEFAULT_FAIRNESS_PROFILE_ID)) {
+      const now = Date.now();
+      const profile: FairnessProfile = {
+        id: DEFAULT_FAIRNESS_PROFILE_ID,
+        name: DEFAULT_FAIRNESS_PROFILE_NAME,
+        createdAt: now,
+        updatedAt: now,
+      };
+      await this.saveProfile(profile);
+      profiles.push(profile);
+    }
+    return profiles.sort(profileOrder);
+  }
+
+  async saveProfile(profile: FairnessProfile): Promise<void> {
+    const checked = validateProfile(profile);
+    await this.request<IDBValidKey>('readwrite', (store) => store.put(checked), PROFILE_STORE_NAME);
+  }
+
   async hasQuarantinedClaimedReservations(): Promise<boolean> {
     return this.quarantinedClaimedReservationCount > 0;
   }
 
-  async append(event: FairnessEvent): Promise<void> {
+  async append(event: FairnessEvent, profileId = DEFAULT_FAIRNESS_PROFILE_ID): Promise<void> {
     const checked = validateFairnessEvent(event);
     const database = await this.open();
     await new Promise<void>((resolve, reject) => {
@@ -404,13 +521,9 @@ export class IndexedDbFairnessStore implements FairnessEventStore {
       try {
         transaction = database.transaction(EVENT_STORE_NAME, 'readwrite');
         const eventStore = transaction.objectStore(EVENT_STORE_NAME);
-        withNextHistoryRevision(eventStore, (revision) => {
-          eventStore.put({
-            sequence: HISTORY_METADATA_SEQUENCE,
-            kind: 'history-metadata',
-            revision,
-          } satisfies StoredHistoryMetadata);
-          eventStore.add({ event: checked } satisfies StoredFairnessEvent);
+        withNextHistoryRevision(eventStore, profileIdOrDefault(profileId), (_revision, metadata) => {
+          eventStore.put(metadata);
+          eventStore.add({ event: checked, profileId: profileIdOrDefault(profileId) } satisfies StoredFairnessEvent);
         });
       } catch (error) {
         reject(error);
@@ -662,15 +775,11 @@ export class IndexedDbFairnessStore implements FairnessEventStore {
             ) {
               throw new Error('Fairness reservation claim identity is invalid');
             }
-            eventStore.add({ event: checked.preparedEvent } satisfies StoredFairnessEvent);
-            eventStore.add({ event: checked.terminalEvent } satisfies StoredFairnessEvent);
+            eventStore.add({ event: checked.preparedEvent, profileId: reservation.profileId } satisfies StoredFairnessEvent);
+            eventStore.add({ event: checked.terminalEvent, profileId: reservation.profileId } satisfies StoredFairnessEvent);
             reservationStore.delete(reservationId);
-            withNextHistoryRevision(eventStore, (revision) => {
-              eventStore.put({
-                sequence: HISTORY_METADATA_SEQUENCE,
-                kind: 'history-metadata',
-                revision,
-              } satisfies StoredHistoryMetadata);
+            withNextHistoryRevision(eventStore, reservation.profileId, (_revision, metadata) => {
+              eventStore.put(metadata);
             });
           } catch (error) {
             rejectOnce(error);
@@ -740,15 +849,11 @@ export class IndexedDbFairnessStore implements FairnessEventStore {
             ) {
               throw new Error('Fairness reservation recovery identity is invalid');
             }
-            if (checkedPrepared) eventStore.add({ event: checkedPrepared } satisfies StoredFairnessEvent);
-            eventStore.add({ event: checkedTerminal } satisfies StoredFairnessEvent);
+            if (checkedPrepared) eventStore.add({ event: checkedPrepared, profileId: reservation.profileId } satisfies StoredFairnessEvent);
+            eventStore.add({ event: checkedTerminal, profileId: reservation.profileId } satisfies StoredFairnessEvent);
             reservationStore.delete(reservationId);
-            withNextHistoryRevision(eventStore, (revision) => {
-              eventStore.put({
-                sequence: HISTORY_METADATA_SEQUENCE,
-                kind: 'history-metadata',
-                revision,
-              } satisfies StoredHistoryMetadata);
+            withNextHistoryRevision(eventStore, reservation.profileId, (_revision, metadata) => {
+              eventStore.put(metadata);
             });
           } catch (error) {
             rejectOnce(error);
@@ -771,24 +876,54 @@ export class IndexedDbFairnessStore implements FairnessEventStore {
     });
   }
 
-  async replace(events: readonly FairnessEvent[]): Promise<void> {
+  async replace(events: readonly FairnessEvent[], profileId = DEFAULT_FAIRNESS_PROFILE_ID): Promise<void> {
     const checked = events.map((event) => validateFairnessEvent(event));
+    const scopedProfileId = profileIdOrDefault(profileId);
     const database = await this.open();
     await new Promise<void>((resolve, reject) => {
       let transaction: IDBTransaction;
       try {
         transaction = database.transaction([EVENT_STORE_NAME, RESERVATION_STORE_NAME], 'readwrite');
         const eventStore = transaction.objectStore(EVENT_STORE_NAME);
-        transaction.objectStore(RESERVATION_STORE_NAME).clear();
-        withNextHistoryRevision(eventStore, (revision) => {
-          eventStore.clear();
-          eventStore.put({
-            sequence: HISTORY_METADATA_SEQUENCE,
-            kind: 'history-metadata',
-            revision,
-          } satisfies StoredHistoryMetadata);
-          checked.forEach((event) => eventStore.add({ event } satisfies StoredFairnessEvent));
-        });
+        const reservationStore = transaction.objectStore(RESERVATION_STORE_NAME);
+        const eventRecordsRequest = eventStore.getAll();
+        const reservationRecordsRequest = reservationStore.getAll();
+        let eventRecords: StoredFairnessEvent[] | null = null;
+        let reservationRecords: unknown[] | null = null;
+        const commit = (): void => {
+          if (!eventRecords || !reservationRecords) return;
+          eventRecords.forEach((record) => {
+            if (
+              !isHistoryMetadata(record) &&
+              record &&
+              typeof record === 'object' &&
+              profileMatches(record, scopedProfileId) &&
+              record.sequence !== undefined
+            ) {
+              eventStore.delete(record.sequence);
+            }
+          });
+          reservationRecords.forEach((record) => {
+            if (profileMatches(record, scopedProfileId) && record && typeof record === 'object') {
+              const reservationId = (record as { reservationId?: unknown }).reservationId;
+              if (typeof reservationId === 'string') reservationStore.delete(reservationId);
+            }
+          });
+          withNextHistoryRevision(eventStore, scopedProfileId, (_revision, metadata) => {
+            eventStore.put(metadata);
+            checked.forEach((event) =>
+              eventStore.add({ event, profileId: scopedProfileId } satisfies StoredFairnessEvent)
+            );
+          });
+        };
+        eventRecordsRequest.onsuccess = () => {
+          eventRecords = eventRecordsRequest.result as StoredFairnessEvent[];
+          commit();
+        };
+        reservationRecordsRequest.onsuccess = () => {
+          reservationRecords = reservationRecordsRequest.result as unknown[];
+          commit();
+        };
       } catch (error) {
         reject(error);
         return;
@@ -799,22 +934,50 @@ export class IndexedDbFairnessStore implements FairnessEventStore {
     });
   }
 
-  async clear(): Promise<void> {
+  async clear(profileId = DEFAULT_FAIRNESS_PROFILE_ID): Promise<void> {
+    const scopedProfileId = profileIdOrDefault(profileId);
     const database = await this.open();
     await new Promise<void>((resolve, reject) => {
       let transaction: IDBTransaction;
       try {
         transaction = database.transaction([EVENT_STORE_NAME, RESERVATION_STORE_NAME], 'readwrite');
         const eventStore = transaction.objectStore(EVENT_STORE_NAME);
-        transaction.objectStore(RESERVATION_STORE_NAME).clear();
-        withNextHistoryRevision(eventStore, (revision) => {
-          eventStore.clear();
-          eventStore.put({
-            sequence: HISTORY_METADATA_SEQUENCE,
-            kind: 'history-metadata',
-            revision,
-          } satisfies StoredHistoryMetadata);
-        });
+        const reservationStore = transaction.objectStore(RESERVATION_STORE_NAME);
+        const eventRecordsRequest = eventStore.getAll();
+        const reservationRecordsRequest = reservationStore.getAll();
+        let eventRecords: StoredFairnessEvent[] | null = null;
+        let reservationRecords: unknown[] | null = null;
+        const commit = (): void => {
+          if (!eventRecords || !reservationRecords) return;
+          eventRecords.forEach((record) => {
+            if (
+              !isHistoryMetadata(record) &&
+              record &&
+              typeof record === 'object' &&
+              profileMatches(record, scopedProfileId) &&
+              record.sequence !== undefined
+            ) {
+              eventStore.delete(record.sequence);
+            }
+          });
+          reservationRecords.forEach((record) => {
+            if (profileMatches(record, scopedProfileId) && record && typeof record === 'object') {
+              const reservationId = (record as { reservationId?: unknown }).reservationId;
+              if (typeof reservationId === 'string') reservationStore.delete(reservationId);
+            }
+          });
+          withNextHistoryRevision(eventStore, scopedProfileId, (_revision, metadata) => {
+            eventStore.put(metadata);
+          });
+        };
+        eventRecordsRequest.onsuccess = () => {
+          eventRecords = eventRecordsRequest.result as StoredFairnessEvent[];
+          commit();
+        };
+        reservationRecordsRequest.onsuccess = () => {
+          reservationRecords = reservationRecordsRequest.result as unknown[];
+          commit();
+        };
       } catch (error) {
         reject(error);
         return;
@@ -828,37 +991,60 @@ export class IndexedDbFairnessStore implements FairnessEventStore {
 
 /** Small deterministic store useful for pure orchestration tests and host integrations. */
 export class InMemoryFairnessStore implements FairnessEventStore {
-  private events: FairnessEvent[];
+  private events = new Map<string, FairnessEvent[]>();
   private reservations = new Map<string, FairnessReservationRecord>();
-  private historyRevision = 0;
+  private historyRevision = new Map<string, number>();
+  private profiles = new Map<string, FairnessProfile>();
 
   constructor(initialEvents: readonly FairnessEvent[] = []) {
-    this.events = initialEvents.map((event) => validateFairnessEvent(event));
+    this.profiles.set(DEFAULT_FAIRNESS_PROFILE_ID, {
+      id: DEFAULT_FAIRNESS_PROFILE_ID,
+      name: DEFAULT_FAIRNESS_PROFILE_NAME,
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+    });
+    this.events.set(DEFAULT_FAIRNESS_PROFILE_ID, initialEvents.map((event) => validateFairnessEvent(event)));
+    this.historyRevision.set(DEFAULT_FAIRNESS_PROFILE_ID, 0);
   }
 
-  async load(): Promise<FairnessEvent[]> {
-    return clone(this.events);
+  async load(profileId = DEFAULT_FAIRNESS_PROFILE_ID): Promise<FairnessEvent[]> {
+    return clone(this.events.get(profileIdOrDefault(profileId)) ?? []);
   }
 
-  async loadHistoryStamp(): Promise<FairnessHistoryStamp> {
+  async loadHistoryStamp(profileId = DEFAULT_FAIRNESS_PROFILE_ID): Promise<FairnessHistoryStamp> {
+    const events = this.events.get(profileIdOrDefault(profileId)) ?? [];
     return {
-      revision: this.historyRevision,
-      eventCount: this.events.length,
-      tailEventId: this.events[this.events.length - 1]?.eventId ?? null,
+      revision: this.historyRevision.get(profileIdOrDefault(profileId)) ?? 0,
+      eventCount: events.length,
+      tailEventId: events[events.length - 1]?.eventId ?? null,
     };
   }
 
-  async loadReservations(): Promise<FairnessReservationRecord[]> {
-    return clone([...this.reservations.values()]);
+  async loadProfiles(): Promise<FairnessProfile[]> {
+    return clone([...this.profiles.values()].sort(profileOrder));
+  }
+
+  async saveProfile(profile: FairnessProfile): Promise<void> {
+    this.profiles.set(profile.id, clone(profile));
+    if (!this.events.has(profile.id)) this.events.set(profile.id, []);
+    if (!this.historyRevision.has(profile.id)) this.historyRevision.set(profile.id, 0);
+  }
+
+  async loadReservations(profileId = DEFAULT_FAIRNESS_PROFILE_ID): Promise<FairnessReservationRecord[]> {
+    const scopedProfileId = profileIdOrDefault(profileId);
+    return clone([...this.reservations.values()].filter((reservation) => reservation.profileId === scopedProfileId));
   }
 
   async hasQuarantinedClaimedReservations(): Promise<boolean> {
     return false;
   }
 
-  async append(event: FairnessEvent): Promise<void> {
-    this.events.push(validateFairnessEvent(event));
-    this.historyRevision += 1;
+  async append(event: FairnessEvent, profileId = DEFAULT_FAIRNESS_PROFILE_ID): Promise<void> {
+    const scopedProfileId = profileIdOrDefault(profileId);
+    const events = this.events.get(scopedProfileId) ?? [];
+    events.push(validateFairnessEvent(event));
+    this.events.set(scopedProfileId, events);
+    this.historyRevision.set(scopedProfileId, (this.historyRevision.get(scopedProfileId) ?? 0) + 1);
   }
 
   async reserve(reservation: FairnessReservationRecord): Promise<void> {
@@ -931,9 +1117,9 @@ export class InMemoryFairnessStore implements FairnessEventStore {
     ) {
       throw new Error('Fairness reservation claim identity is invalid');
     }
-    const nextEvents = [...this.events, checked.preparedEvent, checked.terminalEvent];
-    this.events = nextEvents;
-    this.historyRevision += 1;
+    const events = this.events.get(reservation.profileId) ?? [];
+    this.events.set(reservation.profileId, [...events, checked.preparedEvent, checked.terminalEvent]);
+    this.historyRevision.set(reservation.profileId, (this.historyRevision.get(reservation.profileId) ?? 0) + 1);
     this.reservations.delete(reservationId);
   }
 
@@ -964,21 +1150,31 @@ export class InMemoryFairnessStore implements FairnessEventStore {
     if (checkedPrepared && reservation.state !== 'claimed') {
       throw new Error('Fairness reservation recovery state is invalid');
     }
-    this.events = [...this.events, ...(checkedPrepared ? [checkedPrepared] : []), checkedTerminal];
-    this.historyRevision += 1;
+    const events = this.events.get(reservation.profileId) ?? [];
+    this.events.set(
+      reservation.profileId,
+      [...events, ...(checkedPrepared ? [checkedPrepared] : []), checkedTerminal]
+    );
+    this.historyRevision.set(reservation.profileId, (this.historyRevision.get(reservation.profileId) ?? 0) + 1);
     this.reservations.delete(reservationId);
   }
 
-  async replace(events: readonly FairnessEvent[]): Promise<void> {
-    this.events = events.map((event) => validateFairnessEvent(event));
-    this.historyRevision += 1;
-    this.reservations.clear();
+  async replace(events: readonly FairnessEvent[], profileId = DEFAULT_FAIRNESS_PROFILE_ID): Promise<void> {
+    const scopedProfileId = profileIdOrDefault(profileId);
+    this.events.set(scopedProfileId, events.map((event) => validateFairnessEvent(event)));
+    this.historyRevision.set(scopedProfileId, (this.historyRevision.get(scopedProfileId) ?? 0) + 1);
+    [...this.reservations.values()]
+      .filter((reservation) => reservation.profileId === scopedProfileId)
+      .forEach((reservation) => this.reservations.delete(reservation.reservationId));
   }
 
-  async clear(): Promise<void> {
-    this.events = [];
-    this.historyRevision += 1;
-    this.reservations.clear();
+  async clear(profileId = DEFAULT_FAIRNESS_PROFILE_ID): Promise<void> {
+    const scopedProfileId = profileIdOrDefault(profileId);
+    this.events.set(scopedProfileId, []);
+    this.historyRevision.set(scopedProfileId, (this.historyRevision.get(scopedProfileId) ?? 0) + 1);
+    [...this.reservations.values()]
+      .filter((reservation) => reservation.profileId === scopedProfileId)
+      .forEach((reservation) => this.reservations.delete(reservation.reservationId));
   }
 }
 

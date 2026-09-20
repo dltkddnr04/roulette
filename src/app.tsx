@@ -300,6 +300,64 @@ export function App({ roulette }: { roulette: Roulette }) {
     }
   };
 
+  const handleFairnessProfileSelect = async (profileId: string) => {
+    try {
+      await roulette.selectFairnessProfile(profileId);
+      await refreshFairness();
+    } catch (error) {
+      showToast(error instanceof Error ? error.message : 'Fairness profile could not be selected');
+      await refreshFairness();
+    }
+  };
+
+  const handleFairnessProfileCreate = async () => {
+    const name = window.prompt('New fairness profile name', 'New profile');
+    if (name === null) return;
+    try {
+      const profile = await roulette.createFairnessProfile(name);
+      await roulette.selectFairnessProfile(profile.id);
+      await refreshFairness();
+    } catch (error) {
+      showToast(error instanceof Error ? error.message : 'Fairness profile could not be created');
+    }
+  };
+
+  const handleFairnessProfileRename = async () => {
+    const profile = fairnessState?.profiles.find((candidate) => candidate.id === fairnessState.activeProfileId);
+    if (!profile) return;
+    const name = window.prompt('Rename fairness profile', profile.name);
+    if (name === null) return;
+    try {
+      await roulette.renameFairnessProfile(profile.id, name);
+      await refreshFairness();
+    } catch (error) {
+      showToast(error instanceof Error ? error.message : 'Fairness profile could not be renamed');
+    }
+  };
+
+  const handleFairnessProfileDuplicate = async () => {
+    const profile = fairnessState?.profiles.find((candidate) => candidate.id === fairnessState.activeProfileId);
+    if (!profile) return;
+    const name = window.prompt('Duplicate fairness profile', `${profile.name} copy`);
+    if (name === null) return;
+    try {
+      const duplicate = await roulette.duplicateFairnessProfile(profile.id, name);
+      await roulette.selectFairnessProfile(duplicate.id);
+      await refreshFairness();
+    } catch (error) {
+      showToast(error instanceof Error ? error.message : 'Fairness profile could not be duplicated');
+    }
+  };
+
+  const handleFairnessAddParticipant = async (name: string) => {
+    try {
+      await roulette.addFairnessParticipant(name);
+      await refreshFairness();
+    } catch (error) {
+      showToast(error instanceof Error ? error.message : 'Participant could not be added');
+    }
+  };
+
   const handleFairnessRename = async (participantId: string, currentName: string) => {
     const nextName = window.prompt('Rename fairness participant', currentName);
     if (nextName === null) return;
@@ -317,6 +375,16 @@ export function App({ roulette }: { roulette: Roulette }) {
       await refreshFairness();
     } catch (error) {
       showToast(error instanceof Error ? error.message : 'Participant exclusion could not be changed');
+      await refreshFairness();
+    }
+  };
+
+  const handleFairnessActive = async (participantId: string, active: boolean) => {
+    try {
+      await roulette.setFairnessParticipantActive(participantId, active);
+      await refreshFairness();
+    } catch (error) {
+      showToast(error instanceof Error ? error.message : 'Participant activity could not be changed');
       await refreshFairness();
     }
   };
@@ -355,7 +423,7 @@ export function App({ roulette }: { roulette: Roulette }) {
   };
 
   const handleFairnessImport = async (value: string) => {
-    if (!window.confirm('Replace fairness history with this import?')) return;
+    if (!window.confirm('Import this fairness data as a new profile?')) return;
     try {
       await roulette.importFairnessData(value);
       await refreshFairness();
@@ -365,7 +433,7 @@ export function App({ roulette }: { roulette: Roulette }) {
   };
 
   const handleFairnessDelete = async () => {
-    if (!window.confirm('Delete all fairness history?')) return;
+    if (!window.confirm('Delete fairness history for this profile?')) return;
     try {
       await roulette.deleteFairnessData();
       await refreshFairness();
@@ -446,7 +514,13 @@ export function App({ roulette }: { roulette: Roulette }) {
             state: fairnessState,
             onEnabled: (value) => void handleFairnessEnabled(value),
             onModeChange: (value) => void handleFairnessMode(value),
+            onProfileSelect: (profileId) => void handleFairnessProfileSelect(profileId),
+            onProfileCreate: () => void handleFairnessProfileCreate(),
+            onProfileRename: () => void handleFairnessProfileRename(),
+            onProfileDuplicate: () => void handleFairnessProfileDuplicate(),
+            onAddParticipant: (name) => void handleFairnessAddParticipant(name),
             onRename: (participantId, currentName) => void handleFairnessRename(participantId, currentName),
+            onActive: (participantId, active) => void handleFairnessActive(participantId, active),
             onExcluded: (participantId, excluded) => void handleFairnessExcluded(participantId, excluded),
             onNewEpoch: () => void handleFairnessNewEpoch(),
             onVoid: (drawId) => void handleFairnessVoid(drawId),

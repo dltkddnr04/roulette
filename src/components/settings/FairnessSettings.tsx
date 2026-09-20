@@ -1,4 +1,5 @@
 import { Scale } from 'lucide-react';
+import { useState } from 'react';
 import type { FairnessState } from '../../fairness';
 import { SettingsRow } from './SettingsRow';
 import { SettingsToggle } from './SettingsToggle';
@@ -7,7 +8,13 @@ export type FairnessSettingsProps = {
   state: FairnessState | null;
   onEnabled: (enabled: boolean) => void;
   onModeChange: (mode: FairnessState['mode']) => void;
+  onProfileSelect: (profileId: string) => void;
+  onProfileCreate: () => void;
+  onProfileRename: () => void;
+  onProfileDuplicate: () => void;
+  onAddParticipant: (name: string) => void;
   onRename: (participantId: string, currentName: string) => void;
+  onActive: (participantId: string, active: boolean) => void;
   onExcluded: (participantId: string, excluded: boolean) => void;
   onNewEpoch: () => void;
   onVoid: (drawId: string) => void;
@@ -20,7 +27,13 @@ export function FairnessSettings({
   state,
   onEnabled,
   onModeChange,
+  onProfileSelect,
+  onProfileCreate,
+  onProfileRename,
+  onProfileDuplicate,
+  onAddParticipant,
   onRename,
+  onActive,
   onExcluded,
   onNewEpoch,
   onVoid,
@@ -29,6 +42,7 @@ export function FairnessSettings({
   onDelete,
 }: FairnessSettingsProps) {
   const complete = state?.mode === 'complete';
+  const [newParticipant, setNewParticipant] = useState('');
 
   return (
     <div className="settings-fairness">
@@ -44,6 +58,28 @@ export function FairnessSettings({
       </SettingsRow>
       {state?.enabled ? (
         <div className="settings-fairness-details">
+          <SettingsRow className="settings-row-fairness-profile" label={<span data-trans>Profile</span>}>
+            <select
+              id="sltFairnessProfile"
+              value={state.activeProfileId}
+              onChange={(event) => onProfileSelect(event.currentTarget.value)}
+            >
+              {state.profiles.map((profile) => (
+                <option value={profile.id} key={profile.id}>
+                  {profile.name}
+                </option>
+              ))}
+            </select>
+            <button type="button" onClick={onProfileCreate} data-trans>
+              New
+            </button>
+            <button type="button" onClick={onProfileRename} data-trans>
+              Rename
+            </button>
+            <button type="button" onClick={onProfileDuplicate} data-trans>
+              Duplicate
+            </button>
+          </SettingsRow>
           <SettingsRow
             className="settings-row-fairness-mode"
             label={<span data-trans>Mode</span>}
@@ -102,6 +138,26 @@ export function FairnessSettings({
           <h4 className="settings-section-heading" data-trans>
             Participants
           </h4>
+          <form
+            className="settings-fairness-add-participant"
+            onSubmit={(event) => {
+              event.preventDefault();
+              const name = newParticipant.trim();
+              if (!name) return;
+              onAddParticipant(name);
+              setNewParticipant('');
+            }}
+          >
+            <input
+              value={newParticipant}
+              onChange={(event) => setNewParticipant(event.currentTarget.value)}
+              aria-label="Add fairness participant"
+              placeholder="Add participant"
+            />
+            <button type="submit" data-trans>
+              Add
+            </button>
+          </form>
           <div className="settings-table-wrapper settings-fairness-participants">
             <table className="settings-table settings-fairness-participant-table">
               <thead>
@@ -129,6 +185,9 @@ export function FairnessSettings({
                       Wins
                     </th>
                   )}
+                  <th scope="col" data-trans>
+                    Active
+                  </th>
                   <th scope="col" data-trans>
                     Excluded
                   </th>
@@ -162,6 +221,17 @@ export function FairnessSettings({
                     ) : (
                       <td>{participant.currentEpochWins}</td>
                     )}
+                    <td>
+                      <label htmlFor={`active-${participant.id}`}>
+                        <input
+                          type="checkbox"
+                          id={`active-${participant.id}`}
+                          aria-label={`Activate ${participant.displayName}`}
+                          checked={participant.active}
+                          onChange={(event) => onActive(participant.id, event.currentTarget.checked)}
+                        />
+                      </label>
+                    </td>
                     <td>
                       <label className="settings-fairness-excluded" htmlFor={`exclude-${participant.id}`}>
                         <input

@@ -1,7 +1,7 @@
 import { Camera } from './camera';
 import { canvasHeight, canvasWidth, initialZoom, Themes, zoomThreshold } from './data/constants';
 import { stages } from './data/maps';
-import type { FairnessExport, FairnessMode, FairnessState } from './fairness';
+import type { FairnessExport, FairnessMode, FairnessProfile, FairnessState } from './fairness';
 import {
   FairnessCancelledError,
   FairnessCoordinator,
@@ -41,6 +41,7 @@ export type {
   FairnessMemberSnapshot,
   FairnessMode,
   FairnessPublicParticipant,
+  FairnessProfile,
   FairnessState,
   FairnessWinnerMemberSnapshot,
 } from './fairness';
@@ -1209,11 +1210,45 @@ export class Roulette extends EventTarget {
     });
   }
 
+  public addFairnessParticipant(name: string): Promise<string> {
+    this._invalidateStandby();
+    return this._fairnessCoordinator.addParticipant(name).then((participantId) => {
+      this._scheduleFairnessPrecompute();
+      return participantId;
+    });
+  }
+
+  public setFairnessParticipantActive(participantId: string, active: boolean): Promise<void> {
+    this._invalidateStandby();
+    return this._fairnessCoordinator.setParticipantActive(participantId, active).then(() => {
+      this._scheduleFairnessPrecompute();
+    });
+  }
+
   public renameFairParticipant(participantId: string, name: string): Promise<void> {
     this._invalidateStandby();
     return this._fairnessCoordinator.renameParticipant(participantId, name).then(() => {
       this._scheduleFairnessPrecompute();
     });
+  }
+
+  public createFairnessProfile(name: string): Promise<FairnessProfile> {
+    return this._fairnessCoordinator.createProfile(name);
+  }
+
+  public renameFairnessProfile(profileId: string, name: string): Promise<void> {
+    return this._fairnessCoordinator.renameProfile(profileId, name);
+  }
+
+  public selectFairnessProfile(profileId: string): Promise<void> {
+    this._invalidateStandby();
+    return this._fairnessCoordinator.selectProfile(profileId).then(() => {
+      this._scheduleFairnessPrecompute(0, true);
+    });
+  }
+
+  public duplicateFairnessProfile(profileId: string, name: string): Promise<FairnessProfile> {
+    return this._fairnessCoordinator.duplicateProfile(profileId, name);
   }
 
   public startNewFairnessEpoch(): Promise<void> {

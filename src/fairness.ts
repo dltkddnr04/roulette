@@ -14,6 +14,13 @@ const MAX_FAIRNESS_SEARCH_ATTEMPTS = 3072;
 
 export type FairnessMode = 'simple' | 'complete';
 
+export type FairnessProfile = Readonly<{
+  id: string;
+  name: string;
+  createdAt: number;
+  updatedAt: number;
+}>;
+
 export type FairnessPolicyDescriptor = Readonly<{
   id: typeof STRICT_BALANCE_POLICY_ID;
   version: typeof STRICT_BALANCE_POLICY_VERSION;
@@ -24,6 +31,7 @@ export type FairnessMemberSnapshot = Readonly<{
   displayName: string;
   active: boolean;
   excluded: boolean;
+  /** Whether this roster member was present in the physical draw snapshot. */
   included: boolean;
   effectiveBalance: number;
 }>;
@@ -76,6 +84,9 @@ export type FairnessParticipantRenamedEvent = FairnessEventBase &
   }>;
 
 export type FairnessParticipantParticipationChangedEvent = FairnessEventBase &
+  // Kept under the historical event name for storage compatibility. The
+  // field now represents persistent profile-roster activation, not transient
+  // presence in the current roulette input.
   Readonly<{ type: 'participantParticipationChanged'; participantId: string; active: boolean }>;
 
 export type FairnessParticipantInactiveEvent = FairnessEventBase &
@@ -228,6 +239,8 @@ export type FairnessState = Readonly<{
   available: boolean;
   enabled: boolean;
   mode: FairnessMode;
+  activeProfileId: string;
+  profiles: readonly FairnessProfile[];
   participants: readonly FairnessPublicParticipant[];
   recentDraws: readonly FairnessDrawSummary[];
   currentEpoch: FairnessCurrentEpoch | null;
@@ -238,6 +251,7 @@ export type FairnessState = Readonly<{
 export type FairnessExport = Readonly<{
   version: typeof FAIRNESS_DATA_VERSION;
   mode: FairnessMode;
+  profile?: Readonly<{ name: string; createdAt?: number; updatedAt?: number }>;
   events: readonly FairnessEvent[];
 }>;
 
@@ -515,7 +529,7 @@ function applyConfirmedDraw(projection: FairnessProjection, event: FairnessDrawC
       if (!participant) return;
       participant.actualWins += 1;
       const snapshot = draw.members.find((candidate) => candidate.participantId === participantId);
-      if (!snapshot?.included || !epoch) return;
+      if (!snapshot?.included || !snapshot.active || snapshot.excluded || !epoch) return;
       participant.fairnessCountedWins += 1;
       epoch.balances[participantId] = getBalance(epoch, participantId) + 1;
       epoch.wins[participantId] = (epoch.wins[participantId] ?? 0) + 1;
@@ -541,7 +555,7 @@ function applyVoidedDraw(projection: FairnessProjection, event: FairnessDrawVoid
         const participant = getParticipant(projection, participantId);
         if (participant) participant.actualWins = Math.max(0, participant.actualWins - 1);
         const snapshot = draw.members.find((candidate) => candidate.participantId === participantId);
-        if (!participant || !snapshot?.included || !epoch) return;
+        if (!participant || !snapshot?.included || !snapshot.active || snapshot.excluded || !epoch) return;
         participant.fairnessCountedWins = Math.max(0, participant.fairnessCountedWins - 1);
         epoch.balances[participantId] = Math.max(0, getBalance(epoch, participantId) - 1);
         epoch.wins[participantId] = Math.max(0, (epoch.wins[participantId] ?? 0) - 1);
@@ -914,7 +928,14 @@ export function getCurrentEpoch(projection: FairnessProjection): FairnessCurrent
 
 export function createFairnessState(
   projection: FairnessProjection,
-  options: Readonly<{ available: boolean; enabled: boolean; mode: FairnessMode; error?: string | null }>
+  options: Readonly<{
+    available: boolean;
+    enabled: boolean;
+    mode: FairnessMode;
+    activeProfileId: string;
+    profiles: readonly FairnessProfile[];
+    error?: string | null;
+  }>
 ): FairnessState {
   const draws =
     options.mode === 'complete' ? projection.draws.slice().reverse() : projection.draws.slice(-20).reverse();
@@ -922,6 +943,8 @@ export function createFairnessState(
     available: options.available,
     enabled: options.enabled,
     mode: options.mode,
+    activeProfileId: options.activeProfileId,
+    profiles: options.profiles.map((profile) => ({ ...profile })),
     participants: projection.participants.map((participant) => ({
       id: participant.id,
       displayName: participant.displayName,
@@ -977,8 +1000,7 @@ function validateMemberSnapshot(candidate: unknown): FairnessMemberSnapshot {
     typeof candidate.excluded !== 'boolean' ||
     typeof candidate.included !== 'boolean' ||
     !isSafeInteger(candidate.effectiveBalance) ||
-    candidate.effectiveBalance < 0 ||
-    candidate.included !== (candidate.active && !candidate.excluded)
+    candidate.effectiveBalance < 0
   ) {
     invalid('draw member snapshot is invalid');
   }
@@ -1205,10 +1227,23 @@ export function validateFairnessExport(value: unknown): FairnessExport {
     invalid('unsupported export version');
   const mode = value.mode === undefined ? 'simple' : value.mode;
   if (mode !== 'simple' && mode !== 'complete') invalid('mode is invalid');
+  let profile: { name: string; createdAt?: number; updatedAt?: number } | undefined;
+  if (value.profile !== undefined) {
+    if (!isRecord(value.profile) || !isSafeString(value.profile.name, 256)) invalid('profile is invalid');
+    const createdAt = value.profile.createdAt;
+    const updatedAt = value.profile.updatedAt;
+    if (createdAt !== undefined && (!isFiniteNumber(createdAt) || createdAt < 0)) invalid('profile is invalid');
+    if (updatedAt !== undefined && (!isFiniteNumber(updatedAt) || updatedAt < 0)) invalid('profile is invalid');
+    profile = {
+      name: value.profile.name.trim(),
+      ...(createdAt === undefined ? {} : { createdAt }),
+      ...(updatedAt === undefined ? {} : { updatedAt }),
+    };
+  }
   if (!Array.isArray(value.events)) invalid('events must be an array');
   const events = value.events.map((event) => validateFairnessEvent(event));
   validateFairnessEventSequence(events);
-  return { version: FAIRNESS_DATA_VERSION, mode, events: copyJson(events) };
+  return { version: FAIRNESS_DATA_VERSION, mode, ...(profile ? { profile } : {}), events: copyJson(events) };
 }
 
 function validateFairnessEventSequence(events: readonly FairnessEvent[]): void {
@@ -1279,6 +1314,10 @@ function validateFairnessEventSequence(events: readonly FairnessEvent[]): void {
   }
 }
 
-export function createFairnessExport(events: readonly FairnessEvent[], mode: FairnessMode): FairnessExport {
-  return validateFairnessExport({ version: FAIRNESS_DATA_VERSION, mode, events: copyJson(events) });
+export function createFairnessExport(
+  events: readonly FairnessEvent[],
+  mode: FairnessMode,
+  profile?: Readonly<{ name: string; createdAt?: number; updatedAt?: number }>
+): FairnessExport {
+  return validateFairnessExport({ version: FAIRNESS_DATA_VERSION, mode, ...(profile ? { profile } : {}), events: copyJson(events) });
 }

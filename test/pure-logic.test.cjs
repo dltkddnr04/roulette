@@ -1876,7 +1876,7 @@ test('fairness participant rename keeps identity across a fresh coordinator', as
   assert.equal(secondState.participants.length, 2);
 });
 
-test('fairness participant identity survives temporary absence and rejoin', async () => {
+test('fairness roster identity stays active through temporary input absence', async () => {
   let id = 0;
   const coordinator = new FairnessCoordinator({
     store: new InMemoryFairnessStore(),
@@ -1898,10 +1898,10 @@ test('fairness participant identity survives temporary absence and rejoin', asyn
   assert.equal(rejoinedC.id, initialC.id);
   assert.equal(rejoinedC.active, true);
   assert.equal(rejoinedC.actualWins, 0);
-  assert.equal(rejoinedC.participationHistory.filter(({ active }) => active === false).length, 1);
+  assert.equal(rejoinedC.participationHistory.filter(({ active }) => active === false).length, 0);
 });
 
-test('renamed participant identity survives temporary absence and rejoin', async () => {
+test('renamed fairness roster identity stays active through temporary input absence', async () => {
   let id = 0;
   const coordinator = new FairnessCoordinator({
     store: new InMemoryFairnessStore(),

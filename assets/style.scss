@@ -385,6 +385,21 @@ div.copyright a {
       }
     }
 
+    .settings-row-fairness-profile {
+      flex-wrap: wrap;
+
+      .settings-row-control {
+        display: flex;
+        align-items: center;
+        flex-wrap: wrap;
+        gap: 4px;
+      }
+
+      select {
+        min-width: 120px;
+      }
+    }
+
     .settings-fairness-actions {
       display: flex;
       align-items: center;
@@ -392,6 +407,17 @@ div.copyright a {
       min-width: 0;
       gap: 6px;
       padding: 4px 0;
+    }
+
+    .settings-fairness-add-participant {
+      display: flex;
+      gap: 6px;
+      margin: 4px 0;
+
+      input {
+        min-width: 0;
+        flex: 1 1 auto;
+      }
     }
 
     .settings-fairness-import,

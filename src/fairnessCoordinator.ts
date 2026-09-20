@@ -9,6 +9,7 @@ import {
   evaluateStrictBalanceEntries,
   FAIRNESS_DATA_VERSION,
   FAIRNESS_SIMULATION_RULESET_VERSION,
+  type FairnessProfile,
   type FairnessDrawCancelledEvent,
   type FairnessDrawEntrySnapshot,
   type FairnessDrawPreparedEvent,
@@ -33,6 +34,8 @@ import {
   type FairnessReservationRecord,
   type FairnessReservationTerminalEvent,
   IndexedDbFairnessStore,
+  DEFAULT_FAIRNESS_PROFILE_ID,
+  DEFAULT_FAIRNESS_PROFILE_NAME,
 } from './fairnessStore';
 import type { FairnessWorkerPlan, FairnessWorkerPoolLike } from './fairnessWorkerPool';
 import {
@@ -48,11 +51,14 @@ import { MAX_MARBLES } from './roundSession';
 import { getMarbleSpawnLayout } from './utils/marbleSpawn';
 import { getSimulationParticipantSetup } from './utils/participants';
 import type { Seed } from './utils/random';
-import { readLocalStorage, writeLocalStorage } from './utils/storage';
+import { readLocalStorage, readSessionStorage, writeLocalStorage, writeSessionStorage } from './utils/storage';
 import { parseName } from './utils/utils';
 
 const FAIRNESS_ENABLED_STORAGE_KEY = 'mbr_fairness_enabled';
 const FAIRNESS_MODE_STORAGE_KEY = 'mbr_fairness_mode';
+// Profile data is shared through IndexedDB, but selection is document-local so
+// changing profiles in one tab cannot retarget another tab's active draw.
+const FAIRNESS_ACTIVE_PROFILE_STORAGE_KEY = 'mbr_fairness_active_profile';
 const FAIRNESS_ACTIVE_DRAW_LOCK_NAME = 'marble-roulette-fairness-active-draw-v1';
 const FAIRNESS_STATE_CHANGE_CHANNEL_NAME = 'marble-roulette-fairness-state-v1';
 const FAIRNESS_STATE_CHANGE_STORAGE_KEY = 'mbr_fairness_state_change';
@@ -171,6 +177,8 @@ type FairnessSearchContext = Readonly<{
   eligibleEntryIds: readonly string[];
   budget: number;
   key: string;
+  /** Legacy unscoped key accepted only for the migrated default profile. */
+  legacyKey?: string;
   planId: string;
   generation: number;
   mustSearch: boolean;
@@ -253,6 +261,7 @@ function getRequestedRoundSeed(request: FairnessStartRequest): Seed {
 
 function getReservationIdentity(reservation: FairnessReservationRecord): FairnessReservationIdentity {
   return {
+    profileId: reservation.profileId,
     reservationId: reservation.reservationId,
     drawId: reservation.drawId,
     key: reservation.key,
@@ -266,6 +275,7 @@ function sameReservationIdentityValues(
   right: FairnessReservationRecord
 ): boolean {
   return (
+    left.profileId === right.profileId &&
     left.reservationId === right.reservationId &&
     left.drawId === right.drawId &&
     left.key === right.key &&
@@ -425,6 +435,7 @@ function isPreparedDrawDraft(value: unknown): value is PreparedDrawDraft {
 
 function createFairnessSearchKey(
   request: FairnessStartRequest,
+  profileId: string | undefined,
   participants: readonly MarbleParticipant[],
   syncedInputs: readonly SyncedEntry[],
   projection: FairnessProjection,
@@ -433,6 +444,7 @@ function createFairnessSearchKey(
   headlessStepLimit: number
 ): string {
   return JSON.stringify({
+    ...(profileId === undefined ? {} : { profileId }),
     mapIndex: request.mapIndex,
     stage: request.stage,
     participantInputs: request.participantInputs,
@@ -490,6 +502,41 @@ function isFairnessInputError(error: unknown): boolean {
 
 function isFairnessMode(value: unknown): value is FairnessMode {
   return value === 'simple' || value === 'complete';
+}
+
+function normalizeProfileName(value: string): string {
+  const name = value.trim();
+  if (!name || name.length > 256) throw new Error('Fairness profile name is invalid');
+  return name;
+}
+
+function profileNameKey(name: string): string {
+  return name.trim().toLocaleLowerCase();
+}
+
+function hasProfileName(profiles: readonly FairnessProfile[], name: string, exceptId?: string): boolean {
+  const key = profileNameKey(name);
+  return profiles.some((profile) => profile.id !== exceptId && profileNameKey(profile.name) === key);
+}
+
+function uniqueImportedProfileName(profiles: readonly FairnessProfile[], requestedName: string): string {
+  const normalized = normalizeProfileName(requestedName);
+  if (!hasProfileName(profiles, normalized)) return normalized;
+  for (let suffix = 2; suffix < 10000; suffix += 1) {
+    const suffixText = ` (${suffix})`;
+    const base = normalized.slice(0, 256 - suffixText.length).trim();
+    const candidate = `${base}${suffixText}`;
+    if (!hasProfileName(profiles, candidate)) return candidate;
+  }
+  throw new Error('Fairness profile name is already in use');
+}
+
+function participantNameKey(name: string): string {
+  return name.trim().toLocaleLowerCase();
+}
+
+function profileOrder(left: FairnessProfile, right: FairnessProfile): number {
+  return left.createdAt - right.createdAt || left.id.localeCompare(right.id);
 }
 
 function collectManualRenameBindings(events: readonly FairnessEvent[]): Map<string, string> {
@@ -667,6 +714,8 @@ export class FairnessCoordinator {
   private available = false;
   private enabled: boolean;
   private mode: FairnessMode;
+  private profiles: FairnessProfile[] = [];
+  private activeProfileId: string;
   private error: string | null = null;
   private operationToken = 0;
   private searchGeneration = 0;
@@ -697,6 +746,7 @@ export class FairnessCoordinator {
     this.enabled = readLocalStorage(FAIRNESS_ENABLED_STORAGE_KEY) === 'true';
     const savedMode = readLocalStorage(FAIRNESS_MODE_STORAGE_KEY);
     this.mode = isFairnessMode(savedMode) ? savedMode : 'simple';
+    this.activeProfileId = readSessionStorage(FAIRNESS_ACTIVE_PROFILE_STORAGE_KEY) ?? DEFAULT_FAIRNESS_PROFILE_ID;
 
     let stateChangeChannel: BroadcastChannel | null = null;
     if (typeof window !== 'undefined' && typeof BroadcastChannel !== 'undefined') {
@@ -723,8 +773,9 @@ export class FairnessCoordinator {
     this.externalStateRefresh = (async () => {
       const historyChanged = await this.refreshDurableHistoryIfStale();
       const reservationsChanged = await this.refreshDurableReservations();
+      const profilesChanged = await this.refreshProfiles();
       const foreignActiveDrawChanged = previousForeignActiveDraw !== this.foreignActiveDraw;
-      if (!historyChanged && !reservationsChanged && !foreignActiveDrawChanged) return;
+      if (!historyChanged && !reservationsChanged && !profilesChanged && !foreignActiveDrawChanged) return;
 
       // Only a tab whose local inputs still describe the refreshed durable
       // roster may speculate on the next Fairness plan. A divergent tab must
@@ -734,7 +785,7 @@ export class FairnessCoordinator {
       // retry it once the foreign draw no longer owns the origin.
       const autoPrecompute =
         !this.foreignActiveDraw &&
-        (this.participantInputsDirty || this.currentInputsMatchActiveParticipants());
+        (this.participantInputsDirty || this.currentInputsMatchKnownParticipants());
       this.notifyStateChanged(false, true, autoPrecompute);
     })()
       .catch((error) => {
@@ -796,6 +847,10 @@ export class FairnessCoordinator {
 
   getMode(): FairnessMode {
     return this.mode;
+  }
+
+  getActiveProfileId(): string {
+    return this.activeProfileId;
   }
 
   /**
@@ -1106,15 +1161,15 @@ export class FairnessCoordinator {
     const loadHistoryStamp = this.store.loadHistoryStamp;
     if (!loadHistoryStamp) {
       return {
-        events: await this.store.load(),
+        events: await this.store.load(this.activeProfileId),
         historyStamp: null,
       };
     }
 
     for (let attempt = 0; attempt < 8; attempt += 1) {
-      const before = await loadHistoryStamp.call(this.store);
-      const events = await this.store.load();
-      const after = await loadHistoryStamp.call(this.store);
+      const before = await loadHistoryStamp.call(this.store, this.activeProfileId);
+      const events = await this.store.load(this.activeProfileId);
+      const after = await loadHistoryStamp.call(this.store, this.activeProfileId);
 
       if (
         before?.revision === after?.revision &&
@@ -1137,7 +1192,9 @@ export class FairnessCoordinator {
       this.historyStamp = durableStamp;
       return false;
     }
-    const reservations = this.store.loadReservations ? await this.store.loadReservations() : [];
+    const reservations = this.store.loadReservations
+      ? await this.store.loadReservations.call(this.store, this.activeProfileId)
+      : [];
     const hasQuarantinedClaimedReservations = this.store.hasQuarantinedClaimedReservations
       ? await this.store.hasQuarantinedClaimedReservations()
       : false;
@@ -1259,7 +1316,7 @@ export class FairnessCoordinator {
    */
   private async refreshDurableReservations(): Promise<boolean> {
     if (!this.loaded || this.hasOwnedFairnessDraw() || !this.store.loadReservations) return false;
-    const reservations = await this.store.loadReservations.call(this.store);
+    const reservations = await this.store.loadReservations.call(this.store, this.activeProfileId);
     const hasQuarantinedClaimedReservations = this.store.hasQuarantinedClaimedReservations
       ? await this.store.hasQuarantinedClaimedReservations()
       : false;
@@ -1405,8 +1462,7 @@ export class FairnessCoordinator {
     if (generation !== this.searchGeneration) throw new FairnessCancelledError();
   }
 
-  private currentInputsMatchActiveParticipants(): boolean {
-    const activeParticipants = this.projection.participants.filter((participant) => participant.active);
+  private currentInputsMatchKnownParticipants(): boolean {
     try {
       const rows = parseFairnessEntries(this.currentInputs, this.enabled || this.events.length > 0);
       // parseFairnessEntries skips malformed rows, so make that invalid-input
@@ -1415,11 +1471,13 @@ export class FairnessCoordinator {
 
       const memberNames = new Set<string>();
       rows.forEach((row) => row.memberNames.forEach((name) => memberNames.add(name)));
-      const displayNames = new Set(activeParticipants.map((participant) => participant.displayName));
-      if (memberNames.size !== activeParticipants.length || displayNames.size !== activeParticipants.length) {
-        return false;
-      }
-      return memberNames.size === displayNames.size && [...memberNames].every((name) => displayNames.has(name));
+      return [...memberNames].every((name) =>
+        this.projection.participants.some(
+          (participant) =>
+            participantNameKey(participant.displayName) === participantNameKey(name) ||
+            participantNameKey(this.manualRenames.get(participant.id) ?? '') === participantNameKey(name)
+        )
+      );
     } catch {
       return false;
     }
@@ -1510,12 +1568,189 @@ export class FairnessCoordinator {
     this.notifyStateChanged();
   }
 
+  async addParticipant(displayName: string): Promise<string> {
+    const name = displayName.trim();
+    if (!name || name.length > 512) throw new Error('Fairness participant name is invalid');
+    await this.ensureLoaded();
+    this.invalidateStart();
+    let participantId = '';
+    await this.withDurableStateMutation('participant-add', async () => {
+      await this.enqueueMutation(async () => {
+        await this.ensureOperational();
+        const nameKey = participantNameKey(name);
+        if (
+          this.projection.participants.some(
+            (participant) =>
+              participantNameKey(participant.displayName) === nameKey ||
+              participantNameKey(this.manualRenames.get(participant.id) ?? '') === nameKey
+          )
+        ) {
+          throw new Error('Fairness participant name is already in use');
+        }
+        await this.ensureEpoch();
+        participantId = this.createId('participant');
+        const base = createBaseEvent('participantDiscovered', this.now, this.createId);
+        await this.appendEventDirect({
+          ...base,
+          participantId,
+          displayName: name,
+          active: true,
+          excluded: false,
+        });
+      });
+    });
+    return participantId;
+  }
+
+  async setParticipantActive(participantId: string, active: boolean): Promise<void> {
+    await this.ensureLoaded();
+    this.invalidateStart();
+    await this.withDurableStateMutation('participant-active', async () => {
+      await this.enqueueMutation(async () => {
+        await this.ensureOperational();
+        const participant = this.projection.participants.find((candidate) => candidate.id === participantId);
+        if (!participant) throw new Error('Fairness participant was not found');
+        if (participant.active === active) return;
+        await this.ensureEpoch();
+        const base = createBaseEvent('participantParticipationChanged', this.now, this.createId);
+        await this.appendEventDirect({ ...base, participantId, active });
+      });
+    });
+  }
+
+  async createProfile(name: string): Promise<FairnessProfile> {
+    const normalizedName = normalizeProfileName(name);
+    await this.ensureLoaded();
+    const profile: FairnessProfile = {
+      id: this.createId('profile'),
+      name: normalizedName,
+      createdAt: this.now(),
+      updatedAt: this.now(),
+    };
+    await this.withDurableStateMutation('profile-create', async () => {
+      const saveProfile = this.store.saveProfile;
+      if (!saveProfile) throw new Error('Fairness profiles are unavailable');
+      await this.refreshProfiles();
+      if (hasProfileName(this.profiles, normalizedName)) {
+        throw new Error('Fairness profile name is already in use');
+      }
+      await saveProfile.call(this.store, profile);
+      this.profiles = [...this.profiles, profile].sort(profileOrder);
+      this.markDurableStateChanged();
+    });
+    return profile;
+  }
+
+  async renameProfile(profileId: string, name: string): Promise<void> {
+    const normalizedName = normalizeProfileName(name);
+    await this.ensureLoaded();
+    const current = this.profiles.find((profile) => profile.id === profileId);
+    if (!current) throw new Error('Fairness profile was not found');
+    await this.withDurableStateMutation('profile-rename', async () => {
+      const saveProfile = this.store.saveProfile;
+      if (!saveProfile) throw new Error('Fairness profiles are unavailable');
+      await this.refreshProfiles();
+      const latest = this.profiles.find((profile) => profile.id === profileId);
+      if (!latest) throw new Error('Fairness profile was not found');
+      if (latest.name === normalizedName) return;
+      if (hasProfileName(this.profiles, normalizedName, profileId)) {
+        throw new Error('Fairness profile name is already in use');
+      }
+      const updated = { ...latest, name: normalizedName, updatedAt: this.now() };
+      await saveProfile.call(this.store, updated);
+      this.profiles = this.profiles.map((profile) => (profile.id === profileId ? updated : profile));
+      this.markDurableStateChanged();
+    });
+  }
+
+  async duplicateProfile(sourceProfileId: string, name: string): Promise<FairnessProfile> {
+    const normalizedName = normalizeProfileName(name);
+    await this.ensureLoaded();
+    const load = this.store.load;
+    const saveProfile = this.store.saveProfile;
+    if (!load || !saveProfile) throw new Error('Fairness profiles are unavailable');
+    let profile: FairnessProfile | null = null;
+    await this.withDurableStateMutation('profile-duplicate', async () => {
+      await this.refreshProfiles();
+      if (!this.profiles.some((candidate) => candidate.id === sourceProfileId)) {
+        throw new Error('Fairness profile was not found');
+      }
+      if (hasProfileName(this.profiles, normalizedName)) {
+        throw new Error('Fairness profile name is already in use');
+      }
+      const sourceEvents = await load.call(this.store, sourceProfileId);
+      const sourceProjection = projectFairnessEvents(sourceEvents);
+      const duplicate = {
+        id: this.createId('profile'),
+        name: normalizedName,
+        createdAt: this.now(),
+        updatedAt: this.now(),
+      };
+      profile = duplicate;
+      await saveProfile.call(this.store, duplicate);
+      const epochId = this.createId('epoch');
+      await this.store.append(
+        { ...createBaseEvent('epochStarted', this.now, this.createId), epochId },
+        duplicate.id
+      );
+      for (const participant of sourceProjection.participants) {
+        const participantId = this.createId('participant');
+        await this.store.append(
+          {
+            ...createBaseEvent('participantDiscovered', this.now, this.createId),
+            participantId,
+            displayName: participant.displayName,
+            active: participant.active,
+            excluded: participant.excluded,
+          },
+          duplicate.id
+        );
+      }
+      this.profiles = [...this.profiles, duplicate].sort(profileOrder);
+      this.markDurableStateChanged();
+    });
+    if (!profile) throw new Error('Fairness profile could not be duplicated');
+    return profile;
+  }
+
+  async selectProfile(profileId: string): Promise<void> {
+    await this.ensureLoaded();
+    await this.refreshProfiles();
+    if (profileId === this.activeProfileId) return;
+    if (!this.profiles.some((profile) => profile.id === profileId)) {
+      throw new Error('Fairness profile was not found');
+    }
+    if (this.hasOwnedFairnessDraw()) throw new FairnessStateBusyError();
+    await this.durableMutationQueue;
+    if (this.hasOwnedFairnessDraw()) throw new FairnessStateBusyError();
+    await this.mutationQueue;
+    this.operationToken += 1;
+    this.invalidateSearchState(false);
+    this.activeProfileId = profileId;
+    writeSessionStorage(FAIRNESS_ACTIVE_PROFILE_STORAGE_KEY, profileId);
+    this.events = [];
+    this.projection = projectFairnessEvents([]);
+    this.historyFingerprint = getHistoryFingerprint([]);
+    this.historyStamp = null;
+    this.manualRenames.clear();
+    this.inputBindings = [];
+    this.boundInputs = [];
+    this.participantInputsDirty = true;
+    this.durableReservations.clear();
+    this.claimedReservations.clear();
+    this.loaded = false;
+    this.available = false;
+    await this.ensureLoaded();
+    this.notifyStateChanged();
+  }
+
   async getState(): Promise<FairnessState> {
     try {
       await this.ensureLoaded();
       await this.mutationQueue;
       await this.refreshDurableHistoryIfStale();
       await this.refreshDurableReservations();
+      await this.refreshProfiles();
     } catch (error) {
       this.markUnavailable(error);
     }
@@ -1523,6 +1758,8 @@ export class FairnessCoordinator {
       available: this.available,
       enabled: this.enabled && this.available,
       mode: this.mode,
+      activeProfileId: this.activeProfileId,
+      profiles: this.profiles,
       error: this.error,
     });
   }
@@ -1565,6 +1802,16 @@ export class FairnessCoordinator {
           participant = this.projection.participants.find((candidate) => candidate.id === participantId);
           if (!participant) throw new Error('Fairness participant was not found');
           if (participant.displayName === trimmedName) return;
+          if (
+            this.projection.participants.some(
+              (candidate) =>
+                candidate.id !== participantId &&
+                (participantNameKey(candidate.displayName) === participantNameKey(trimmedName) ||
+                  participantNameKey(this.manualRenames.get(candidate.id) ?? '') === participantNameKey(trimmedName))
+            )
+          ) {
+            throw new Error('Fairness participant name is already in use');
+          }
           await this.ensureEpoch();
           const boundIndex = this.inputBindings.findIndex((binding) => binding?.includes(participantId));
           const memberIndex = boundIndex >= 0 ? (this.inputBindings[boundIndex]?.indexOf(participantId) ?? -1) : -1;
@@ -1631,7 +1878,14 @@ export class FairnessCoordinator {
     await this.mutationQueue;
     await this.refreshDurableHistoryIfStale();
     await this.refreshDurableReservations();
-    return createFairnessExport(this.events, this.mode);
+    const profile = this.profiles.find((candidate) => candidate.id === this.activeProfileId);
+    return createFairnessExport(
+      this.events,
+      this.mode,
+      profile
+        ? { name: profile.name, createdAt: profile.createdAt, updatedAt: profile.updatedAt }
+        : undefined
+    );
   }
 
   async importData(value: unknown): Promise<void> {
@@ -1640,30 +1894,29 @@ export class FairnessCoordinator {
     await this.ensureLoaded();
     if (!this.available) throw new Error(this.error ?? DEFAULT_RECENT_ERROR);
 
+    const importedName = normalizeProfileName(
+      data.profile?.name ?? `Imported ${new Date(this.now()).toLocaleDateString()}`
+    );
+    let profile: FairnessProfile | null = null;
     await this.withDurableStateMutation('fairness-import', async () => {
-      await this.enqueueMutation(async () => {
-        try {
-          await this.store.replace(data.events);
-        } catch (error) {
-          this.markUnavailable(error);
-          throw error;
-        }
-        this.events = data.events.map((event) => clone(event));
-        this.projection = projectFairnessEvents(this.events);
-        this.historyFingerprint = getHistoryFingerprint(this.events);
-        this.advanceHistoryStamp();
-        this.inputBindings = [];
-        this.boundInputs = [];
-        this.manualRenames = collectManualRenameBindings(this.events);
-        this.pendingExclusionRequests.clear();
-        this.pendingRenameRequests.clear();
-        this.durableReservations.clear();
-        this.claimedReservations.clear();
-        this.mode = data.mode;
-        writeLocalStorage(FAIRNESS_MODE_STORAGE_KEY, this.mode);
-        this.markDurableStateChanged();
-      });
+      const saveProfile = this.store.saveProfile;
+      if (!saveProfile) throw new Error('Fairness profiles are unavailable');
+      await this.refreshProfiles();
+      const importedProfile = {
+        id: this.createId('profile'),
+        name: uniqueImportedProfileName(this.profiles, importedName),
+        createdAt: this.now(),
+        updatedAt: this.now(),
+      };
+      profile = importedProfile;
+      await saveProfile.call(this.store, importedProfile);
+      await this.store.replace(data.events, importedProfile.id);
+      this.profiles = [...this.profiles, importedProfile].sort(profileOrder);
+      this.mode = data.mode;
+      writeLocalStorage(FAIRNESS_MODE_STORAGE_KEY, this.mode);
     });
+    if (!profile) throw new Error('Fairness import did not create a profile');
+    await this.selectProfile(profile.id);
   }
 
   async clearData(): Promise<void> {
@@ -1673,7 +1926,7 @@ export class FairnessCoordinator {
     await this.withDurableStateMutation('fairness-clear', async () => {
       await this.enqueueMutation(async () => {
         try {
-          await this.store.clear();
+          await this.store.clear(this.activeProfileId);
         } catch (error) {
           this.markUnavailable(error);
           throw error;
@@ -1999,8 +2252,8 @@ export class FairnessCoordinator {
     const loadReservations = this.store.loadReservations;
     if (!loadReservations) return [];
     const [events, reservations] = await Promise.all([
-      this.store.load(),
-      loadReservations.call(this.store),
+      this.store.load(this.activeProfileId),
+      loadReservations.call(this.store, this.activeProfileId),
     ]);
     const preparedEventsByDrawId = new Map<string, FairnessDrawPreparedEvent>();
     const terminalDrawIds = new Set<string>();
@@ -2052,7 +2305,7 @@ export class FairnessCoordinator {
    */
   private async recoverReservationsWhileOwned(recoveryReservations: readonly RecoveryReservation[]): Promise<void> {
     if (recoveryReservations.length === 0) return;
-    const recoveryEvents = await this.store.load();
+    const recoveryEvents = await this.store.load(this.activeProfileId);
     const recoveryPreparedEvents = new Map<string, FairnessDrawPreparedEvent>();
     const recoveryTerminalDrawIds = new Set<string>();
     recoveryEvents.forEach((event) => {
@@ -2067,7 +2320,7 @@ export class FairnessCoordinator {
       }
     });
     const currentReservations = this.store.loadReservations
-      ? await this.store.loadReservations()
+      ? await this.store.loadReservations(this.activeProfileId)
       : [];
     const currentReservationsById = new Map(
       currentReservations.map((reservation) => [reservation.reservationId, reservation])
@@ -2133,8 +2386,8 @@ export class FairnessCoordinator {
             getReservationIdentity(currentReservation)
           );
         } else {
-          if (preparedEvent) await this.store.append(preparedEvent);
-          await this.store.append(terminalEvent);
+          if (preparedEvent) await this.store.append(preparedEvent, this.activeProfileId);
+          await this.store.append(terminalEvent, this.activeProfileId);
           await this.store.removeReservation?.(currentReservation.reservationId);
         }
       } catch (error) {
@@ -2163,7 +2416,7 @@ export class FairnessCoordinator {
     // the freshness read taken immediately before this check. Legacy
     // drawPrepared + ready records are also covered when their draw is already
     // present in this tab's fresh projection.
-    const reservations = await loadReservations.call(this.store);
+    const reservations = await loadReservations.call(this.store, this.activeProfileId);
     const hasQuarantinedClaimedReservations = this.store.hasQuarantinedClaimedReservations
       ? await this.store.hasQuarantinedClaimedReservations()
       : false;
@@ -2186,7 +2439,7 @@ export class FairnessCoordinator {
       return;
     }
     await this.recoverReservationsWhileOwned(await this.collectRecoverableReservations());
-    const remaining = await loadReservations.call(this.store);
+    const remaining = await loadReservations.call(this.store, this.activeProfileId);
     const remainingHasQuarantinedClaimedReservations = this.store.hasQuarantinedClaimedReservations
       ? await this.store.hasQuarantinedClaimedReservations()
       : false;
@@ -2195,15 +2448,68 @@ export class FairnessCoordinator {
       remaining.some((reservation) => (reservation.state ?? 'ready') === 'claimed');
   }
 
+  private async ensureProfiles(): Promise<void> {
+    const loadProfiles = this.store.loadProfiles;
+    if (!loadProfiles) {
+      this.profiles = [
+        {
+          id: DEFAULT_FAIRNESS_PROFILE_ID,
+          name: DEFAULT_FAIRNESS_PROFILE_NAME,
+          createdAt: 0,
+          updatedAt: 0,
+        },
+      ];
+      this.activeProfileId = DEFAULT_FAIRNESS_PROFILE_ID;
+      return;
+    }
+    let profiles = await loadProfiles.call(this.store);
+    if (profiles.length === 0) {
+      const profile: FairnessProfile = {
+        id: DEFAULT_FAIRNESS_PROFILE_ID,
+        name: DEFAULT_FAIRNESS_PROFILE_NAME,
+        createdAt: this.now(),
+        updatedAt: this.now(),
+      };
+      await this.store.saveProfile?.(profile);
+      profiles = [profile];
+    }
+    this.profiles = profiles.map((profile) => ({ ...profile }));
+    if (!this.profiles.some((profile) => profile.id === this.activeProfileId)) {
+      this.activeProfileId = this.profiles[0].id;
+      writeSessionStorage(FAIRNESS_ACTIVE_PROFILE_STORAGE_KEY, this.activeProfileId);
+    }
+  }
+
+  private async refreshProfiles(): Promise<boolean> {
+    if (!this.store.loadProfiles) return false;
+    const next = (await this.store.loadProfiles()).map((profile) => ({ ...profile }));
+    const changed =
+      next.length !== this.profiles.length ||
+      next.some((profile, index) => {
+        const current = this.profiles[index];
+        return (
+          !current ||
+          current.id !== profile.id ||
+          current.name !== profile.name ||
+          current.updatedAt !== profile.updatedAt
+        );
+      });
+    if (changed) this.profiles = next;
+    return changed;
+  }
+
   private async ensureLoaded(): Promise<void> {
     if (this.loaded) return;
     if (this.loadingPromise) return this.loadingPromise;
 
     this.loadingPromise = (async () => {
       try {
+        await this.ensureProfiles();
         const [{ events, historyStamp }, reservations] = await Promise.all([
           this.loadDurableHistorySnapshot(),
-          this.store.loadReservations ? this.store.loadReservations() : Promise.resolve([]),
+          this.store.loadReservations
+            ? this.store.loadReservations(this.activeProfileId)
+            : Promise.resolve([]),
         ]);
         const hasQuarantinedClaimedReservations = this.store.hasQuarantinedClaimedReservations
           ? await this.store.hasQuarantinedClaimedReservations()
@@ -2345,7 +2651,7 @@ export class FairnessCoordinator {
           // example, a malformed legacy record). Re-read the authoritative
           // store before declaring this document free of foreign ownership.
           const remainingReservations = this.store.loadReservations
-            ? await this.store.loadReservations()
+            ? await this.store.loadReservations(this.activeProfileId)
             : [];
           const remainingHasQuarantinedClaimedReservations = this.store.hasQuarantinedClaimedReservations
             ? await this.store.hasQuarantinedClaimedReservations()
@@ -2434,14 +2740,14 @@ export class FairnessCoordinator {
     previousMemberNames.forEach((names, rowIndex) => {
       names.forEach((name, memberIndex) => {
         const participantId = this.inputBindings[rowIndex]?.[memberIndex];
-        if (participantId && !previousMemberBindings.has(name)) previousMemberBindings.set(name, participantId);
+        const nameKey = participantNameKey(name);
+        if (participantId && !previousMemberBindings.has(nameKey)) previousMemberBindings.set(nameKey, participantId);
       });
     });
     const currentMemberNames = new Set<string>();
-    rows.forEach((row) => row.memberNames.forEach((name) => currentMemberNames.add(name)));
+    rows.forEach((row) => row.memberNames.forEach((name) => currentMemberNames.add(participantNameKey(name))));
     const usedIds = new Set<string>();
     const nextBindings: Array<readonly string[] | null> = [];
-    const currentIds = new Set<string>();
     const syncedInputs: SyncedEntry[] = [];
 
     for (let rowIndex = 0; rowIndex < rows.length; rowIndex++) {
@@ -2459,13 +2765,24 @@ export class FairnessCoordinator {
         const boundParticipant = priorId
           ? this.projection.participants.find((candidate) => candidate.id === priorId && !usedIds.has(candidate.id))
           : undefined;
-        const previousTokenId = previousMemberBindings.get(memberName);
+        const memberNameKey = participantNameKey(memberName);
+        const previousTokenId = previousMemberBindings.get(memberNameKey);
         const previousTokenParticipant = previousTokenId
           ? this.projection.participants.find((candidate) => candidate.id === previousTokenId)
           : undefined;
-        const namedParticipant = this.projection.participants.find((candidate) => candidate.displayName === memberName);
+        const nameMatches = this.projection.participants.filter(
+          (candidate) =>
+            participantNameKey(candidate.displayName) === memberNameKey ||
+            participantNameKey(this.manualRenames.get(candidate.id) ?? '') === memberNameKey
+        );
+        if (nameMatches.length > 1) {
+          throw new Error('Fairness member name is ambiguous');
+        }
+        const namedParticipant = nameMatches.find(
+          (candidate) => participantNameKey(candidate.displayName) === memberNameKey
+        );
         const pinnedParticipant = this.projection.participants.find(
-          (candidate) => this.manualRenames.get(candidate.id) === memberName
+          (candidate) => participantNameKey(this.manualRenames.get(candidate.id) ?? '') === memberNameKey
         );
         if (
           [namedParticipant, pinnedParticipant].some(
@@ -2474,14 +2791,16 @@ export class FairnessCoordinator {
         ) {
           throw new Error('Fairness member cannot appear in multiple draw entries');
         }
-        const isPinnedRename = boundParticipant && this.manualRenames.get(boundParticipant.id) === memberName;
+        const isPinnedRename =
+          boundParticipant && participantNameKey(this.manualRenames.get(boundParticipant.id) ?? '') === memberNameKey;
         let participant =
           namedParticipant ??
           pinnedParticipant ??
+          nameMatches[0] ??
           previousTokenParticipant ??
           (boundParticipant &&
           priorMemberCount === row.memberNames.length &&
-          (!priorMemberName || !currentMemberNames.has(priorMemberName))
+          (!priorMemberName || !currentMemberNames.has(participantNameKey(priorMemberName)))
             ? boundParticipant
             : undefined);
 
@@ -2503,12 +2822,7 @@ export class FairnessCoordinator {
         if (usedIds.has(participant.id)) throw new Error('Fairness member cannot appear in multiple draw entries');
 
         usedIds.add(participant.id);
-        currentIds.add(participant.id);
         memberIds.push(participant.id);
-        if (!participant.active) {
-          const base = createBaseEvent('participantParticipationChanged', this.now, this.createId);
-          await this.appendEventDirect({ ...base, participantId: participant.id, active: true });
-        }
         const latestParticipant = this.projection.participants.find((candidate) => candidate.id === participant.id);
         const manualRename = this.manualRenames.get(participant.id);
         if (latestParticipant && latestParticipant.displayName !== memberName && manualRename !== memberName) {
@@ -2533,15 +2847,6 @@ export class FairnessCoordinator {
       });
     }
 
-    // Keep absence events sequential so each event is persisted and projected
-    // before the next participant operation can observe the roster.
-    for (const participant of this.projection.participants.slice()) {
-      if (generation !== undefined) this.assertSearchCurrent(generation);
-      if (token !== undefined) this.assertCurrent(token);
-      if (!participant.active || currentIds.has(participant.id)) continue;
-      const base = createBaseEvent('participantParticipationChanged', this.now, this.createId);
-      await this.appendEventDirect({ ...base, participantId: participant.id, active: false });
-    }
     if (generation !== undefined) this.assertSearchCurrent(generation);
     this.inputBindings = nextBindings;
     this.boundInputs = rows.map((row) => row.rawInput);
@@ -2607,6 +2912,7 @@ export class FairnessCoordinator {
     const budget = searchBudget(setup.totalCount, Math.max(1, mappingRows.length), evaluation.eligibleEntryIds.length);
     const key = createFairnessSearchKey(
       request,
+      this.activeProfileId,
       setup.participants,
       syncedInputs,
       this.projection,
@@ -2614,6 +2920,19 @@ export class FairnessCoordinator {
       budget,
       this.headlessStepLimit
     );
+    const legacyKey =
+      this.activeProfileId === DEFAULT_FAIRNESS_PROFILE_ID
+        ? createFairnessSearchKey(
+            request,
+            undefined,
+            setup.participants,
+            syncedInputs,
+            this.projection,
+            evaluation.eligibleEntryIds,
+            budget,
+            this.headlessStepLimit
+          )
+        : undefined;
 
     const context = {
       request,
@@ -2625,6 +2944,7 @@ export class FairnessCoordinator {
       eligibleEntryIds: evaluation.eligibleEntryIds,
       budget,
       key,
+      ...(legacyKey ? { legacyKey } : {}),
       planId: `fairness-plan-${generation}`,
       generation,
       mustSearch: !canUseStrictBalanceEntryFastPath(evaluation),
@@ -2652,13 +2972,20 @@ export class FairnessCoordinator {
       });
     });
     const participantById = new Map(this.projection.participants.map((participant) => [participant.id, participant]));
+    const includedMemberIds = new Set(memberIds);
+    const snapshotMemberIds = [
+      ...memberIds,
+      ...this.projection.participants
+        .map((participant) => participant.id)
+        .filter((participantId) => !includedMemberIds.has(participantId)),
+    ];
     const marbleIdsByEntryId = new Map<string, number[]>();
     mapping.forEach((entryId, marbleId) => {
       const marbleIds = marbleIdsByEntryId.get(entryId) ?? [];
       marbleIds.push(marbleId);
       marbleIdsByEntryId.set(entryId, marbleIds);
     });
-    const members: FairnessMemberSnapshot[] = memberIds.map((memberId) => {
+    const members: FairnessMemberSnapshot[] = snapshotMemberIds.map((memberId) => {
       const participant = participantById.get(memberId);
       if (!participant) throw new Error('Fairness participant mapping is unavailable');
       return {
@@ -2666,7 +2993,11 @@ export class FairnessCoordinator {
         displayName: participant.displayName,
         active: participant.active,
         excluded: participant.excluded,
-        included: participant.active && !participant.excluded,
+        // `included` describes participation in this physical draw. It is
+        // intentionally independent from the persistent roster `active`
+        // flag: an inactive roster member can still appear in the roulette
+        // input, while an active member may be absent from this draw.
+        included: includedMemberIds.has(memberId),
         effectiveBalance: participant.effectiveBalance,
       };
     });
@@ -2749,7 +3080,7 @@ export class FairnessCoordinator {
   ): DurableFairnessReservation | null {
     let persistedSeedFallback: DurableFairnessReservation | null = null;
     for (const reservation of this.durableReservations.values()) {
-      if (reservation.key !== context.key) continue;
+      if (reservation.key !== context.key && reservation.key !== context.legacyKey) continue;
       if (context.mustSearch || reservation.seed === requestedSeed) return reservation;
       if (allowPersistedReservationSeed && persistedSeedFallback === null) {
         persistedSeedFallback = reservation;
@@ -2987,9 +3318,9 @@ export class FairnessCoordinator {
     const loadReservations = this.store.loadReservations;
     if (!loadReservations) return null;
     const sameKey: DurableFairnessReservation[] = [];
-    const records = await loadReservations.call(this.store);
+    const records = await loadReservations.call(this.store, this.activeProfileId);
     records
-      .filter((record) => record.key === context.key)
+      .filter((record) => record.key === context.key || record.key === context.legacyKey)
       .sort((left, right) => left.reservationId.localeCompare(right.reservationId))
       .forEach((record) => {
         const reservation: DurableFairnessReservation = {
@@ -3053,7 +3384,10 @@ export class FairnessCoordinator {
     // two physical rounds eligible for a later claim.
     if (!context.mustSearch) {
       [...this.durableReservations.values()]
-        .filter((candidate) => candidate.key === context.key && candidate.seed !== result.seed)
+        .filter(
+          (candidate) =>
+            (candidate.key === context.key || candidate.key === context.legacyKey) && candidate.seed !== result.seed
+        )
         .forEach((candidate) => {
           this.durableReservations.delete(candidate.reservationId);
           this.scheduleReadyReservationDiscard(candidate);
@@ -3061,6 +3395,7 @@ export class FairnessCoordinator {
     }
 
     const reservation: DurableFairnessReservation = {
+      profileId: this.activeProfileId,
       reservationId: this.createId('reservation'),
       drawId: this.createId('draw'),
       key: context.key,
@@ -3239,7 +3574,7 @@ export class FairnessCoordinator {
     let finalized = false;
     try {
       if (!claimed.persisted) {
-        await this.store.append(claimed.event);
+        await this.store.append(claimed.event, this.activeProfileId);
         claimed.persisted = true;
       }
       await this.appendEventDirect(terminalEvent);
@@ -3901,7 +4236,7 @@ export class FairnessCoordinator {
   private async appendEventDirect(event: FairnessEvent): Promise<void> {
     if (!this.available) throw new Error(this.error ?? DEFAULT_RECENT_ERROR);
     try {
-      await this.store.append(event);
+      await this.store.append(event, this.activeProfileId);
     } catch (error) {
       this.markUnavailable(error);
       throw error;
