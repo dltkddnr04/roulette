@@ -72,14 +72,22 @@ function roomStorageKey(roomCode: string): string {
 export function getRoomCodeFromLocation(): string | null {
   if (typeof window === 'undefined') return null;
   const value = new URLSearchParams(window.location.search).get('room');
-  return value?.trim() || null;
+  return value ? normalizeRoomCode(value) || null : null;
+}
+
+export function normalizeRoomCode(value: string): string {
+  return value.replace(/\s+/g, '').toUpperCase();
 }
 
 export function createRoomJoinUrl(roomCode: string): string {
-  const url = new URL(window.location.href);
-  url.search = '';
-  url.hash = '';
-  url.searchParams.set('room', roomCode);
+  const url = new URL('/join', window.location.origin);
+  url.searchParams.set('room', normalizeRoomCode(roomCode));
+  return url.toString();
+}
+
+export function createRoomPlaybackUrl(roomCode: string): string {
+  const url = new URL('/', window.location.origin);
+  url.searchParams.set('room', normalizeRoomCode(roomCode));
   return url.toString();
 }
 

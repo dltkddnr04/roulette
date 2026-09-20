@@ -686,16 +686,6 @@ export function App({ roulette }: { roulette: Roulette }) {
     }
   };
 
-  const handleJoinSharedRoom = async (name: string) => {
-    if (!sharedClient || sharedClient.role !== 'guest') return;
-    try {
-      setSharedError(null);
-      await sharedClient.join(name);
-    } catch (error) {
-      setSharedError(error instanceof Error ? error.message : 'Could not join the shared room');
-    }
-  };
-
   const handleStopSharedRoom = () => {
     if (!sharedClient || sharedClient.role !== 'host') return;
     sharedStartRequestRef.current += 1;
@@ -732,6 +722,7 @@ export function App({ roulette }: { roulette: Roulette }) {
   };
 
   const handleLeaveSharedRoom = () => {
+    const roomCode = sharedClient?.role === 'guest' ? sharedClient.roomCode : null;
     sharedClient?.leave();
     sharedClient?.disconnect();
     setSharedClient(null);
@@ -742,7 +733,11 @@ export function App({ roulette }: { roulette: Roulette }) {
     guestPreparedRoundRef.current = null;
     guestStartedRoundRef.current = null;
     setGuestPlaybackRoundId(null);
-    window.history.replaceState(null, '', `${window.location.pathname}${window.location.hash}`);
+    if (roomCode) {
+      window.location.assign(createRoomJoinUrl(roomCode));
+    } else {
+      window.history.replaceState(null, '', `${window.location.pathname}${window.location.hash}`);
+    }
   };
 
   const handleSharedStart = async () => {
@@ -976,7 +971,6 @@ export function App({ roulette }: { roulette: Roulette }) {
           roundStatus={sharedRound?.status ?? sharedSnapshot?.scheduledRound?.status ?? null}
           playbackActive={guestPlaybackRoundId === activeSharedRoundId}
           error={sharedError}
-          onJoin={(name) => void handleJoinSharedRoom(name)}
           onLeave={handleLeaveSharedRoom}
         />
       ) : null}
