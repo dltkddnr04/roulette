@@ -7,6 +7,7 @@ import type { WinnerSettingsProps } from './WinnerSettings';
 import { WinnerSettings } from './WinnerSettings';
 
 export type GeneralSettingsProps = {
+  disabled?: boolean;
   maps: ReturnType<Roulette['getMaps']>;
   mapIndex: number;
   onMapChange: (index: number) => void;
@@ -22,6 +23,7 @@ export type GeneralSettingsProps = {
 };
 
 export function GeneralSettings({
+  disabled = false,
   maps,
   mapIndex,
   onMapChange,
@@ -40,7 +42,12 @@ export function GeneralSettings({
       <div className="settings-general-list">
         <div className="settings-general-group settings-general-group-map">
           <SettingsRow label={<span data-trans>Map</span>} htmlFor="sltMap" icon={MapIcon}>
-            <select id="sltMap" value={mapIndex} onChange={(event) => onMapChange(Number(event.currentTarget.value))}>
+            <select
+              id="sltMap"
+              value={mapIndex}
+              disabled={disabled}
+              onChange={(event) => onMapChange(Number(event.currentTarget.value))}
+            >
               {maps.map((map) => (
                 <option key={map.index} value={map.index} data-trans>
                   {map.title}
@@ -52,6 +59,7 @@ export function GeneralSettings({
             <select
               id="sltRenderScale"
               value={renderScale}
+              disabled={disabled}
               onChange={(event) => {
                 const value = Number(event.currentTarget.value);
                 if (isRenderScale(value)) onRenderScaleChange(value);
@@ -72,6 +80,7 @@ export function GeneralSettings({
             label={<span data-trans>Recording</span>}
             icon={Camera}
             checked={autoRecording}
+            disabled={disabled}
             onChange={onAutoRecordingChange}
           />
           <SettingsToggle
@@ -79,11 +88,12 @@ export function GeneralSettings({
             label={<span data-trans>Using skills</span>}
             icon={Sparkles}
             checked={useSkills}
+            disabled={disabled}
             onChange={onSkillsChange}
           />
         </div>
         <div className="settings-general-group settings-general-group-winner">
-          <WinnerSettings {...winnerSettings} />
+          <WinnerSettings {...winnerSettings} disabled={disabled} />
         </div>
         <div className="settings-general-group settings-general-group-theme">
           <SettingsRow className="settings-row-theme" label={<span data-trans>Theme</span>} htmlFor="chkDarkMode">
@@ -93,6 +103,7 @@ export function GeneralSettings({
                 type="checkbox"
                 id="chkDarkMode"
                 checked={darkMode}
+                disabled={disabled}
                 aria-label="Dark mode"
                 onChange={(event) => onDarkModeChange(event.currentTarget.checked)}
               />

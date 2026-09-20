@@ -5,6 +5,7 @@ import { SettingsRow } from './SettingsRow';
 import { SettingsToggle } from './SettingsToggle';
 
 export type FairnessSettingsProps = {
+  disabled?: boolean;
   state: FairnessState | null;
   onEnabled: (enabled: boolean) => void;
   onModeChange: (mode: FairnessState['mode']) => void;
@@ -24,6 +25,7 @@ export type FairnessSettingsProps = {
 };
 
 export function FairnessSettings({
+  disabled = false,
   state,
   onEnabled,
   onModeChange,
@@ -51,7 +53,7 @@ export function FairnessSettings({
           id="chkFairness"
           label={<span data-trans>Enabled</span>}
           checked={state?.enabled ?? false}
-          disabled={state !== null && !state.available}
+          disabled={disabled || (state !== null && !state.available)}
           onChange={onEnabled}
           className="settings-fairness-enabled"
         />
@@ -62,6 +64,7 @@ export function FairnessSettings({
             <select
               id="sltFairnessProfile"
               value={state.activeProfileId}
+              disabled={disabled}
               onChange={(event) => onProfileSelect(event.currentTarget.value)}
             >
               {state.profiles.map((profile) => (
@@ -70,13 +73,13 @@ export function FairnessSettings({
                 </option>
               ))}
             </select>
-            <button type="button" onClick={onProfileCreate} data-trans>
+            <button type="button" onClick={onProfileCreate} disabled={disabled} data-trans>
               New
             </button>
-            <button type="button" onClick={onProfileRename} data-trans>
+            <button type="button" onClick={onProfileRename} disabled={disabled} data-trans>
               Rename
             </button>
-            <button type="button" onClick={onProfileDuplicate} data-trans>
+            <button type="button" onClick={onProfileDuplicate} disabled={disabled} data-trans>
               Duplicate
             </button>
           </SettingsRow>
@@ -88,6 +91,7 @@ export function FairnessSettings({
             <select
               id="sltFairnessMode"
               value={state.mode}
+              disabled={disabled}
               onChange={(event) => {
                 if (event.currentTarget.value === 'simple' || event.currentTarget.value === 'complete') {
                   onModeChange(event.currentTarget.value);
@@ -104,12 +108,12 @@ export function FairnessSettings({
           </SettingsRow>
           {state.error ? <div className="fairness-error">{state.error}</div> : null}
           <div className="settings-fairness-actions">
-            <button type="button" onClick={onNewEpoch} data-trans>
+            <button type="button" onClick={onNewEpoch} disabled={disabled} data-trans>
               Start a new fairness period
             </button>
             {complete ? (
               <>
-                <button type="button" onClick={onExport} data-trans>
+                <button type="button" onClick={onExport} disabled={disabled} data-trans>
                   Export
                 </button>
                 <label className="settings-fairness-import" htmlFor="inFairnessImport">
@@ -118,6 +122,7 @@ export function FairnessSettings({
                     type="file"
                     id="inFairnessImport"
                     accept="application/json,.json"
+                    disabled={disabled}
                     onChange={(event) => {
                       const file = event.currentTarget.files?.[0];
                       event.currentTarget.value = '';
@@ -129,7 +134,7 @@ export function FairnessSettings({
                     }}
                   />
                 </label>
-                <button type="button" onClick={onDelete} data-trans>
+                <button type="button" onClick={onDelete} disabled={disabled} data-trans>
                   Delete history
                 </button>
               </>
@@ -150,11 +155,12 @@ export function FairnessSettings({
           >
             <input
               value={newParticipant}
+              disabled={disabled}
               onChange={(event) => setNewParticipant(event.currentTarget.value)}
               aria-label="Add fairness participant"
               placeholder="Add participant"
             />
-            <button type="submit" data-trans>
+            <button type="submit" disabled={disabled} data-trans>
               Add
             </button>
           </form>
@@ -228,6 +234,7 @@ export function FairnessSettings({
                           id={`active-${participant.id}`}
                           aria-label={`Activate ${participant.displayName}`}
                           checked={participant.active}
+                          disabled={disabled}
                           onChange={(event) => onActive(participant.id, event.currentTarget.checked)}
                         />
                       </label>
@@ -239,6 +246,7 @@ export function FairnessSettings({
                           id={`exclude-${participant.id}`}
                           aria-label={`Exclude ${participant.displayName}`}
                           checked={participant.excluded}
+                          disabled={disabled}
                           onChange={(event) => onExcluded(participant.id, event.currentTarget.checked)}
                         />
                       </label>
@@ -246,6 +254,7 @@ export function FairnessSettings({
                     <td>
                       <button
                         type="button"
+                        disabled={disabled}
                         onClick={() => onRename(participant.id, participant.displayName)}
                         data-trans
                       >
@@ -328,7 +337,7 @@ export function FairnessSettings({
                             <td>{String(draw.seed)}</td>
                             <td>
                               {draw.status === 'confirmed' ? (
-                                <button type="button" onClick={() => onVoid(draw.id)} data-trans>
+                                <button type="button" onClick={() => onVoid(draw.id)} disabled={disabled} data-trans>
                                   Void
                                 </button>
                               ) : null}

@@ -34,6 +34,11 @@
 - 선택형 누적 공정성과 기록/리플레이 제어 플레인 (`A`, `B+C`, `D`처럼 `+`로 대상을 하나의 추첨 항목으로 묶을 수 있음)
 - Cloudflare Workers Static Assets 기반 자체 호스팅
 - 입력, 녹화, 에셋 로딩 및 여러 렌더링 예외 처리 강화
+- QR로 참가할 수 있는 **Shared Rooms**. 호스트가 방을 만들면 Cloudflare Durable Object가 참가자·라운드 제어를 담당하고, 각 브라우저가 같은 ReplayDescriptor를 로컬에서 실행합니다.
+
+### Shared Rooms
+
+호스트가 Shared room을 만들면 화면에 공개 join URL과 QR이 표시됩니다. 모바일 참가자는 QR을 스캔해 이름을 입력하고, 호스트가 준비한 라운드가 예약된 시각에 각 브라우저에서 로컬 재생됩니다. Durable Object는 room roster, 권한, revision, schedule, 결과만 관리하며 Box2D나 프레임/마블 좌표를 서버에서 실행하거나 전송하지 않습니다. 현재 라운드 중간에 참여한 클라이언트는 진행 중인 물리 상태에 합류하지 않고 다음 라운드를 기다립니다.
 
 ## 개발
 
@@ -51,6 +56,8 @@ yarn build
 ```sh
 yarn deploy
 ```
+
+Cloudflare 배포에는 `RoomDurableObject` SQLite migration이 포함되어 있으므로 Wrangler 설정의 Durable Object migration을 함께 관리해야 합니다.
 
 ### Public simulation API
 

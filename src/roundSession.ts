@@ -53,6 +53,7 @@ type DeferredSimulationCleanup = {
 
 export class RoundSession {
   private simulation: RaceSimulation;
+  private simulationActive = false;
   private state: RoundState = 'initializing';
   private stage: StageDef | null = null;
   private participantInputs: string[] = [];
@@ -132,6 +133,7 @@ export class RoundSession {
     if (this.hasDeferredCleanup(this.simulation) || this.simulation.getCount() > 0) this.clearCurrentMarbles();
     this.stage = stage;
     this.simulation.loadStage(stage);
+    this.simulationActive = false;
     // loadStage() replaces the Box2D world, so any cleanup record for that
     // same simulation has already lost ownership of its old bodies. Do not
     // leave a stale record that would block the new world's stepping.
@@ -368,6 +370,7 @@ export class RoundSession {
     this.configuredCount = standby.count;
     this.seed = seed;
     this.state = 'ready';
+    this.simulationActive = false;
     this.retireSimulation(previousSimulation);
     return standby.layout;
   }
@@ -411,6 +414,7 @@ export class RoundSession {
     this.configuredCount = 0;
     this.clearResults();
     this.state = 'ready';
+    this.simulationActive = false;
     if (this.stage) {
       this.simulation.loadStage(this.stage);
       this.forgetDeferredCleanup(this.simulation);
@@ -428,6 +432,7 @@ export class RoundSession {
     this.configuredCount = 0;
     this.clearResults();
     this.state = 'ready';
+    this.simulationActive = false;
   }
 
   prepareStart(): number | null {
@@ -446,15 +451,33 @@ export class RoundSession {
     this.reservedNextRoundSeed = null;
     this.simulation.resetInterpolationSnapshots();
     this.state = 'running';
+    this.simulationActive = false;
     this.roundId++;
     this.winnerRange = clipWinnerRange(this.winnerRange.start, this.winnerRange.end, this.simulation.getCount());
     return this.roundId;
+  }
+
+  /**
+   * Return a prepared (but not activated) round to the ready state. Shared
+   * rooms use this when the control-plane schedule is rejected or cancelled
+   * before the local physics world starts moving.
+   */
+  cancelPreparedStart(generation: number): boolean {
+    if (this.state !== 'running' || this.roundId !== generation) return false;
+    this.clearCurrentMarbles();
+    this.previewMarbles = [];
+    this.clearResults();
+    this.invalidateRound();
+    this.state = 'ready';
+    this.simulationActive = false;
+    return this.rebuildPreview(false) !== null;
   }
 
   activate(generation: number): boolean {
     if (this.state !== 'running' || this.roundId !== generation) return false;
 
     this.simulation.start();
+    this.simulationActive = true;
     return true;
   }
 
@@ -463,7 +486,7 @@ export class RoundSession {
   }
 
   advance(frameDelta: number, speed: number, fastForwardSpeed: number, callbacks: RoundStepCallbacks): number {
-    if (this.state === 'initializing' || this.hasDeferredCleanup(this.simulation)) return 0;
+    if (this.state === 'initializing' || (this.state === 'running' && !this.simulationActive) || this.hasDeferredCleanup(this.simulation)) return 0;
     const simulationCallbacks: SimulationStepCallbacks = {
       onImpact: callbacks.onImpact,
       onFinish: (marble) => {
@@ -588,6 +611,7 @@ export class RoundSession {
     this.invalidateRound();
     this.clearResults();
     this.state = 'ready';
+    this.simulationActive = false;
     this.configuredCount = setup.totalCount;
     if (chooseNewSeed) {
       this.seed = this.simulation.prepareSeedForRebuild();

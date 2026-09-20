@@ -31,6 +31,15 @@ function sameStrings(left: readonly string[], right: readonly string[]): boolean
   return left.length === right.length && left.every((value, index) => value === right[index]);
 }
 
+function createLocalRoundToken(): string {
+  const bytes = new Uint8Array(16);
+  if (typeof crypto !== 'undefined' && typeof crypto.getRandomValues === 'function') {
+    crypto.getRandomValues(bytes);
+    return Array.from(bytes, (value) => value.toString(16).padStart(2, '0')).join('');
+  }
+  return `${Date.now()}-${Math.random()}`;
+}
+
 export type {
   FairnessCurrentEpoch,
   FairnessDrawEntrySnapshot,
@@ -46,6 +55,11 @@ export type {
   FairnessWinnerMemberSnapshot,
 } from './fairness';
 export type { ReplayDescriptor, ReplayDescriptorV1, RouletteState, ThemeName } from './replay';
+export type SharedPreparedRound = Readonly<{
+  token: string;
+  replay: ReplayDescriptor;
+  generation: number;
+}>;
 export type { RoundState } from './roundSession';
 export type {
   SimulationExpectation,
@@ -103,6 +117,7 @@ export class Roulette extends EventTarget {
   private _fairnessBatchPrecomputeDelay: number | null = null;
   private _replayPending = false;
   private _applyingReplay = false;
+  private _sharedPreparedRound: (SharedPreparedRound & { activate: () => void }) | null = null;
 
   private _lastTime: number = 0;
 
@@ -124,6 +139,7 @@ export class Roulette extends EventTarget {
   private _recordingStopTimer: ReturnType<typeof setTimeout> | null = null;
   private _recordingStartGeneration: number | null = null;
   private _activeRecordingGeneration: number | null = null;
+  private _sharedRecordingReadyGeneration: number | null = null;
   private _sponsorManager = new SponsorManager();
 
   protected fastForwarder!: FastForwader;
@@ -276,6 +292,7 @@ export class Roulette extends EventTarget {
     this._clearRecordingStopTimer();
     this._recordingStartGeneration = null;
     this._activeRecordingGeneration = null;
+    this._sharedRecordingReadyGeneration = null;
     if (this._recorder?.isRecording) {
       this._recorder.stop();
     }
@@ -782,6 +799,7 @@ export class Roulette extends EventTarget {
 
   public clearMarbles() {
     if (!this._roundSession.isInitialized) return;
+    if (this._sharedPreparedRound) return;
 
     this._replayPending = false;
     this._cancelActiveFairnessDraw('Fairness draw was cancelled because the participants changed');
@@ -826,7 +844,97 @@ export class Roulette extends EventTarget {
     return this._startWithoutFairness();
   }
 
-  private _startWithoutFairness(recordHistory = true) {
+  /**
+   * Prepare a room round without activating its physics world. Shared Room
+   * uses the same Fairness/reservation path as local Start, then lets the
+   * Durable Object choose the common future activation time.
+   */
+  public async prepareRoundForSharedStart(): Promise<SharedPreparedRound | null> {
+    if (
+      !this._roundSession.isInitialized ||
+      (this._roundSession.roundState !== 'ready' && this._roundSession.roundState !== 'finished') ||
+      this._roundSession.getCount() === 0
+    ) {
+      return null;
+    }
+    if (this._sharedPreparedRound) return this._sharedPreparedRound;
+
+    if (this._replayPending) {
+      this._replayPending = false;
+      this._startWithoutFairness(false, true);
+    } else if (this._fairnessCoordinator.getFairnessEnabled()) {
+      await this._startWithFairness(true);
+    } else {
+      this._startWithoutFairness(true, true);
+    }
+    const prepared = this._sharedPreparedRound;
+    if (prepared && this._autoRecording) await this._prepareSharedRecording(prepared.generation);
+    return this._sharedPreparedRound;
+  }
+
+  private async _prepareSharedRecording(generation: number): Promise<void> {
+    this._recordingStartGeneration = generation;
+    try {
+      await this._recorder.start();
+    } catch (error) {
+      this._recordingStartGeneration = null;
+      if (this._sharedPreparedRound?.generation === generation) {
+        console.error('recording failed to start', error);
+        this._sharedRecordingReadyGeneration = generation;
+      }
+      return;
+    }
+
+    if (this._sharedPreparedRound?.generation !== generation) {
+      this._recordingStartGeneration = null;
+      if (this._recorder.isRecording) this._recorder.stop();
+      return;
+    }
+    this._recordingStartGeneration = null;
+    this._activeRecordingGeneration = generation;
+    this._sharedRecordingReadyGeneration = generation;
+  }
+
+  /** Activate the exact local world returned by prepareRoundForSharedStart. */
+  public activatePreparedRound(token: string): boolean {
+    const prepared = this._sharedPreparedRound;
+    if (!prepared || prepared.token !== token) return false;
+    this._sharedPreparedRound = null;
+    prepared.activate();
+    this._fairnessCoordinator.recordDiagnostic('shared-round.activate', { generation: prepared.generation });
+    return true;
+  }
+
+  /**
+   * Cancel a room schedule before activation. Claimed Fairness draws are
+   * terminalized through the existing coordinator path; they are never
+   * returned to the reusable reservation pool.
+   */
+  public async cancelPreparedRound(token: string, reason = 'Shared round was cancelled'): Promise<boolean> {
+    const prepared = this._sharedPreparedRound;
+    if (!prepared || prepared.token !== token) return false;
+    this._sharedPreparedRound = null;
+    this._invalidateRecording();
+    this._invalidateStandby();
+    const fairnessRound = this._fairnessRound;
+    this._fairnessRound = null;
+    if (fairnessRound) {
+      await this._fairnessCoordinator.cancelDraw(fairnessRound.drawId, reason).catch(() => undefined);
+    }
+    const normalDraw = this._normalDraw;
+    this._normalDraw = null;
+    if (normalDraw) {
+      await normalDraw.prepared
+        .then((draw) => (draw ? this._fairnessCoordinator.cancelDraw(draw.drawId, reason) : undefined))
+        .catch(() => undefined);
+    }
+    this._fairnessCoordinator.invalidateStart();
+    this._roundSession.cancelPreparedStart(prepared.generation);
+    this.dispatchEvent(new Event('startcancelled'));
+    return true;
+  }
+
+  private _startWithoutFairness(recordHistory = true, deferActivation = false) {
     this._fairnessCoordinator.invalidatePrecompute();
     const roundGeneration = this._roundSession.prepareStart();
     if (roundGeneration === null) return;
@@ -855,7 +963,16 @@ export class Roulette extends EventTarget {
       this._roundSession.activate(roundGeneration);
     };
 
-    if (this._autoRecording) {
+    const activateWithRecording = () => {
+      if (this._sharedRecordingReadyGeneration === roundGeneration) {
+        this._sharedRecordingReadyGeneration = null;
+        startPhysics();
+        return;
+      }
+      if (!this._autoRecording) {
+        startPhysics();
+        return;
+      }
       this._recordingStartGeneration = roundGeneration;
       this._recorder
         .start()
@@ -888,16 +1005,26 @@ export class Roulette extends EventTarget {
           console.error('recording failed to start', e);
           startPhysics();
         });
-    } else {
-      startPhysics();
+    };
+
+    if (deferActivation) {
+      this._sharedPreparedRound = {
+        token: createLocalRoundToken(),
+        replay: this.exportReplay(),
+        generation: roundGeneration,
+        activate: activateWithRecording,
+      };
+      return;
     }
+
+    activateWithRecording();
   }
 
   private _restoreRandomSeedMode(): void {
     this._roundSession.setRandomSeedMode();
   }
 
-  private async _startWithFairness(): Promise<void> {
+  private async _startWithFairness(deferActivation = false): Promise<void> {
     if (
       !this._roundSession.isInitialized ||
       (this._roundSession.roundState !== 'ready' && this._roundSession.roundState !== 'finished')
@@ -952,6 +1079,7 @@ export class Roulette extends EventTarget {
           this._invalidateStandby();
           this._scheduleFairnessPrecompute(0, true);
         }
+        if (deferActivation) throw error;
         this.dispatchEvent(new Event('startcancelled'));
         return;
       }
@@ -959,7 +1087,10 @@ export class Roulette extends EventTarget {
       this._emitMessage(error instanceof Error ? error.message : 'Fairness could not start this draw');
       // A storage failure disables fairness and leaves the old roulette path
       // usable. Search/policy failures deliberately do not fall back to a draw.
-      if (!state.available) this._startWithoutFairness();
+      if (!state.available) {
+        if (deferActivation) throw error instanceof Error ? error : new Error('Fairness could not start this draw');
+        this._startWithoutFairness();
+      }
       return;
     }
 
@@ -1057,7 +1188,16 @@ export class Roulette extends EventTarget {
       this._roundSession.activate(roundGeneration);
     };
 
-    if (this._autoRecording) {
+    const activateWithRecording = () => {
+      if (this._sharedRecordingReadyGeneration === roundGeneration) {
+        this._sharedRecordingReadyGeneration = null;
+        startPhysics();
+        return;
+      }
+      if (!this._autoRecording) {
+        startPhysics();
+        return;
+      }
       this._recordingStartGeneration = roundGeneration;
       this._recorder
         .start()
@@ -1090,9 +1230,19 @@ export class Roulette extends EventTarget {
           console.error('recording failed to start', error);
           startPhysics();
         });
-    } else {
-      startPhysics();
+    };
+
+    if (deferActivation) {
+      this._sharedPreparedRound = {
+        token: createLocalRoundToken(),
+        replay: this.exportReplay(),
+        generation: roundGeneration,
+        activate: activateWithRecording,
+      };
+      return;
     }
+
+    activateWithRecording();
     this._fairnessCoordinator.recordDiagnostic('start.activate-requested', { roundGeneration });
   }
 
@@ -1122,6 +1272,7 @@ export class Roulette extends EventTarget {
   }
 
   public setSeed(seed: Seed) {
+    if (this._sharedPreparedRound) return;
     this._allowPersistedFairnessReservationSeed = false;
     if (!this._applyingReplay) this._cancelActiveFairnessDraw('Fairness draw was cancelled because the seed changed');
     this._roundSession.setSeed(seed);
@@ -1132,6 +1283,7 @@ export class Roulette extends EventTarget {
   }
 
   public useRandomSeed(): void {
+    if (this._sharedPreparedRound) return;
     this._allowPersistedFairnessReservationSeed = false;
     if (!this._applyingReplay) this._cancelActiveFairnessDraw('Fairness draw was cancelled because the seed changed');
     this._roundSession.setRandomSeedMode();
@@ -1146,6 +1298,7 @@ export class Roulette extends EventTarget {
   }
 
   public setWinnerRange(start: number, end: number, fairnessPrecomputeDelay = 150) {
+    if (this._sharedPreparedRound) return false;
     const changed = this._roundSession.setWinnerRange(start, end);
     if (!changed) return true;
     this._allowPersistedFairnessReservationSeed = false;
@@ -1168,6 +1321,7 @@ export class Roulette extends EventTarget {
   }
 
   public setSkillsEnabled(enabled: boolean): void {
+    if (this._sharedPreparedRound) return;
     const changed = this._roundSession.setSkillsEnabled(enabled);
     if (!changed) return;
     this._allowPersistedFairnessReservationSeed = false;
@@ -1184,6 +1338,7 @@ export class Roulette extends EventTarget {
   }
 
   public async setFairnessEnabled(enabled: boolean): Promise<void> {
+    if (this._sharedPreparedRound) throw new Error('Shared round preparation is in progress');
     if (!enabled && this._roundSession.roundState !== 'running') {
       this._cancelActiveFairnessDraw('Fairness was disabled', false);
     }
@@ -1196,6 +1351,7 @@ export class Roulette extends EventTarget {
   }
 
   public setFairnessMode(mode: FairnessMode): Promise<void> {
+    if (this._sharedPreparedRound) return Promise.reject(new Error('Shared round preparation is in progress'));
     return this._fairnessCoordinator.setMode(mode);
   }
 
@@ -1204,6 +1360,7 @@ export class Roulette extends EventTarget {
   }
 
   public setFairnessParticipantExcluded(participantId: string, excluded: boolean): Promise<void> {
+    if (this._sharedPreparedRound) return Promise.reject(new Error('Shared round preparation is in progress'));
     this._invalidateStandby();
     return this._fairnessCoordinator.setParticipantExcluded(participantId, excluded).then(() => {
       this._scheduleFairnessPrecompute();
@@ -1211,6 +1368,7 @@ export class Roulette extends EventTarget {
   }
 
   public addFairnessParticipant(name: string): Promise<string> {
+    if (this._sharedPreparedRound) return Promise.reject(new Error('Shared round preparation is in progress'));
     this._invalidateStandby();
     return this._fairnessCoordinator.addParticipant(name).then((participantId) => {
       this._scheduleFairnessPrecompute();
@@ -1219,6 +1377,7 @@ export class Roulette extends EventTarget {
   }
 
   public setFairnessParticipantActive(participantId: string, active: boolean): Promise<void> {
+    if (this._sharedPreparedRound) return Promise.reject(new Error('Shared round preparation is in progress'));
     this._invalidateStandby();
     return this._fairnessCoordinator.setParticipantActive(participantId, active).then(() => {
       this._scheduleFairnessPrecompute();
@@ -1226,6 +1385,7 @@ export class Roulette extends EventTarget {
   }
 
   public renameFairParticipant(participantId: string, name: string): Promise<void> {
+    if (this._sharedPreparedRound) return Promise.reject(new Error('Shared round preparation is in progress'));
     this._invalidateStandby();
     return this._fairnessCoordinator.renameParticipant(participantId, name).then(() => {
       this._scheduleFairnessPrecompute();
@@ -1233,14 +1393,17 @@ export class Roulette extends EventTarget {
   }
 
   public createFairnessProfile(name: string): Promise<FairnessProfile> {
+    if (this._sharedPreparedRound) return Promise.reject(new Error('Shared round preparation is in progress'));
     return this._fairnessCoordinator.createProfile(name);
   }
 
   public renameFairnessProfile(profileId: string, name: string): Promise<void> {
+    if (this._sharedPreparedRound) return Promise.reject(new Error('Shared round preparation is in progress'));
     return this._fairnessCoordinator.renameProfile(profileId, name);
   }
 
   public selectFairnessProfile(profileId: string): Promise<void> {
+    if (this._sharedPreparedRound) return Promise.reject(new Error('Shared round preparation is in progress'));
     this._invalidateStandby();
     return this._fairnessCoordinator.selectProfile(profileId).then(() => {
       this._scheduleFairnessPrecompute(0, true);
@@ -1248,10 +1411,12 @@ export class Roulette extends EventTarget {
   }
 
   public duplicateFairnessProfile(profileId: string, name: string): Promise<FairnessProfile> {
+    if (this._sharedPreparedRound) return Promise.reject(new Error('Shared round preparation is in progress'));
     return this._fairnessCoordinator.duplicateProfile(profileId, name);
   }
 
   public startNewFairnessEpoch(): Promise<void> {
+    if (this._sharedPreparedRound) return Promise.reject(new Error('Shared round preparation is in progress'));
     this._invalidateStandby();
     return this._fairnessCoordinator.startNewEpoch().then(() => {
       this._scheduleFairnessPrecompute();
@@ -1259,6 +1424,7 @@ export class Roulette extends EventTarget {
   }
 
   public voidFairnessDraw(drawId: string): Promise<void> {
+    if (this._sharedPreparedRound) return Promise.reject(new Error('Shared round preparation is in progress'));
     this._invalidateStandby();
     return this._fairnessCoordinator.voidDraw(drawId).then(() => {
       this._scheduleFairnessPrecompute();
@@ -1270,6 +1436,7 @@ export class Roulette extends EventTarget {
   }
 
   public importFairnessData(value: unknown): Promise<void> {
+    if (this._sharedPreparedRound) return Promise.reject(new Error('Shared round preparation is in progress'));
     this._invalidateStandby();
     return this._fairnessCoordinator.importData(value).then(() => {
       this._scheduleFairnessPrecompute();
@@ -1277,6 +1444,7 @@ export class Roulette extends EventTarget {
   }
 
   public deleteFairnessData(): Promise<void> {
+    if (this._sharedPreparedRound) return Promise.reject(new Error('Shared round preparation is in progress'));
     this._invalidateStandby();
     return this._fairnessCoordinator.clearData().then(() => {
       this._scheduleFairnessPrecompute();
@@ -1324,6 +1492,7 @@ export class Roulette extends EventTarget {
 
   public setMarbles(names: string[], fairnessPrecomputeDelay = 150) {
     if (!this._roundSession.isInitialized) return;
+    if (this._sharedPreparedRound) return;
 
     if (this._initialParticipantSetupPending) {
       this._initialParticipantSetupPending = false;
@@ -1364,6 +1533,7 @@ export class Roulette extends EventTarget {
 
   public reset() {
     if (!this._roundSession.isInitialized) return;
+    if (this._sharedPreparedRound) return;
 
     this._replayPending = false;
     this._cancelActiveFairnessDraw('Fairness draw was cancelled because the round reset');
@@ -1420,6 +1590,7 @@ export class Roulette extends EventTarget {
 
   public loadReplay(value: unknown): void {
     if (!this._roundSession.isInitialized) throw new Error('Cannot load replay before initialization');
+    if (this._sharedPreparedRound) throw new Error('Shared round preparation is in progress');
     const replay = validateReplayDescriptor(value, stages.length);
 
     this._cancelActiveFairnessDraw('Fairness draw was cancelled because a replay was loaded');
@@ -1461,6 +1632,7 @@ export class Roulette extends EventTarget {
 
   public setMap(index: number) {
     if (!this._roundSession.isInitialized) return;
+    if (this._sharedPreparedRound) return;
 
     if (index < 0 || index > stages.length - 1) {
       throw new Error('Incorrect map number');

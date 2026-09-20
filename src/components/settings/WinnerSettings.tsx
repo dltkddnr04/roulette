@@ -6,6 +6,7 @@ export type WinnerType = 'first' | 'last' | 'multi' | 'custom';
 export type EditedRange = 'start' | 'end';
 
 export type WinnerSettingsProps = {
+  disabled?: boolean;
   winnerType: WinnerType;
   rank: string;
   rangeStart: string;
@@ -17,6 +18,7 @@ export type WinnerSettingsProps = {
 };
 
 export function WinnerSettings({
+  disabled = false,
   winnerType,
   rank,
   rangeStart,
@@ -39,6 +41,7 @@ export function WinnerSettings({
             type="button"
             className={`btn-winner btn-first-winner${winnerType === 'first' ? ' active' : ''}`}
             data-trans
+            disabled={disabled}
             onClick={() => onSelect('first')}
           >
             First
@@ -47,6 +50,7 @@ export function WinnerSettings({
             type="button"
             className={`btn-winner btn-last-winner${winnerType === 'last' ? ' active' : ''}`}
             data-trans
+            disabled={disabled}
             onClick={() => onSelect('last')}
           >
             Last
@@ -58,6 +62,7 @@ export function WinnerSettings({
             value={rank}
             min="1"
             aria-label="Custom winner rank"
+            disabled={disabled}
             onChange={(event) => onRankChange(event.currentTarget.value)}
             onBlur={() => onSelect('custom')}
           />
@@ -65,6 +70,7 @@ export function WinnerSettings({
             type="button"
             className={`btn-winner btn-multi-winner${winnerType === 'multi' ? ' active' : ''}`}
             data-trans
+            disabled={disabled}
             onClick={() => onSelect('multi')}
           >
             Multiple
@@ -83,6 +89,7 @@ export function WinnerSettings({
             value={rangeStart}
             min="1"
             aria-label="Range start"
+            disabled={disabled}
             onChange={(event) => onRangeChange('start', event.currentTarget.value)}
             onBlur={() => onRangeBlur('start')}
           />
@@ -93,6 +100,7 @@ export function WinnerSettings({
             value={rangeEnd}
             min="1"
             aria-label="Range end"
+            disabled={disabled}
             onChange={(event) => onRangeChange('end', event.currentTarget.value)}
             onBlur={() => onRangeBlur('end')}
           />
