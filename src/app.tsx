@@ -9,6 +9,7 @@ import { translateElement, translateTree } from './localization';
 import type { WinnerRange } from './options';
 import type { Roulette } from './roulette';
 import {
+  createRoomJoinUrl,
   getRoomCodeFromLocation,
   SharedRoomClient,
   type SharedRoomClientEvent,
@@ -83,6 +84,7 @@ export function App({ roulette }: { roulette: Roulette }) {
     sharedClient?.status ?? 'idle'
   );
   const [sharedError, setSharedError] = useState<string | null>(null);
+  const [sharedCreating, setSharedCreating] = useState(false);
   const [sharedRound, setSharedRound] = useState<ScheduledRound | null>(null);
   const [sharedPreparedToken, setSharedPreparedToken] = useState<string | null>(null);
   const [sharedPreparing, setSharedPreparing] = useState(false);
@@ -110,6 +112,7 @@ export function App({ roulette }: { roulette: Roulette }) {
   const reportedSharedRounds = useRef(new Set<string>());
   const sharedPreparedTokenRef = useRef<string | null>(null);
   const sharedStartInFlightRef = useRef(false);
+  const sharedStartRequestRef = useRef(0);
   const guestResultRef = useRef<{ roundId: string; winners: string[] } | null>(null);
   const guestMode = sharedClient?.role === 'guest' || roomRouteActive;
   const sharedControlsLocked =
@@ -168,9 +171,25 @@ export function App({ roulette }: { roulette: Roulette }) {
     [roulette, sharedClient]
   );
 
+  const restoreLocalNamesIfSafe = useCallback(
+    (allowFinished = false, allowWhileHosting = false): boolean => {
+      const restore = localNamesBeforeSharedRoom.current;
+      const state = roulette.roundState;
+      if (sharedClient?.role === 'host' && !allowWhileHosting) return false;
+      if (!restore || (state !== 'ready' && (!allowFinished || state !== 'finished'))) return false;
+      localNamesBeforeSharedRoom.current = null;
+      setNames(restore.join('\n'));
+      roulette.setMarbles(restore);
+      writeLocalStorage(NAMES_STORAGE_KEY, restore.join(','));
+      return true;
+    },
+    [roulette, sharedClient]
+  );
+
   useEffect(() => {
     if (!sharedClient) return;
     const cancelLocalPreparation = (reason: string) => {
+      sharedStartRequestRef.current += 1;
       const token = sharedPreparedTokenRef.current;
       if (!token) return;
       sharedPreparedTokenRef.current = null;
@@ -419,10 +438,16 @@ export function App({ roulette }: { roulette: Roulette }) {
     const onMessage = (event: Event) => {
       const message = (event as CustomEvent<string>).detail;
       if (typeof message === 'string') showToast(message);
-      if (roulette.roundState === 'ready') setSettingsHidden(false);
+      if (roulette.roundState === 'ready') {
+        restoreLocalNamesIfSafe();
+        setSettingsHidden(false);
+      }
     };
     const onStartCancelled = () => {
-      if (roulette.roundState !== 'running') setSettingsHidden(false);
+      if (roulette.roundState !== 'running') {
+        restoreLocalNamesIfSafe();
+        setSettingsHidden(false);
+      }
     };
     roulette.addEventListener('goal', onGoal);
     roulette.addEventListener('message', onMessage);
@@ -438,7 +463,7 @@ export function App({ roulette }: { roulette: Roulette }) {
         settingsTimer.current = null;
       }
     };
-  }, [refreshFairness, roulette, sharedClient, sharedRound, showToast]);
+  }, [refreshFairness, restoreLocalNamesIfSafe, roulette, sharedClient, sharedRound, showToast]);
 
   const handleWinnerType = (type: WinnerType) => {
     setWinnerType(type);
@@ -660,15 +685,21 @@ export function App({ roulette }: { roulette: Roulette }) {
   };
 
   const handleCreateSharedRoom = async () => {
+    if (sharedCreating || sharedClient?.role === 'host' || roulette.roundState === 'running') return;
+    setSharedCreating(true);
+    setSharedError(null);
+    localNamesBeforeSharedRoom.current = getParticipantNames(names);
     try {
-      localNamesBeforeSharedRoom.current = getParticipantNames(names);
       const client = await SharedRoomClient.createHost();
       setSharedClient(client);
       setSharedSnapshot(client.currentSnapshot);
       setSharedConnectionStatus(client.status);
       setSharedError(null);
     } catch (error) {
+      localNamesBeforeSharedRoom.current = null;
       setSharedError(error instanceof Error ? error.message : 'Shared room could not be created');
+    } finally {
+      setSharedCreating(false);
     }
   };
 
@@ -683,11 +714,13 @@ export function App({ roulette }: { roulette: Roulette }) {
   };
 
   const handleStopSharedRoom = () => {
-    if (!sharedClient) return;
+    if (!sharedClient || sharedClient.role !== 'host') return;
+    sharedStartRequestRef.current += 1;
+    let preparedCancellation: Promise<boolean> | null = null;
     if (sharedPreparedTokenRef.current) {
       const token = sharedPreparedTokenRef.current;
       sharedPreparedTokenRef.current = null;
-      void roulette.cancelPreparedRound(token, 'Shared room stopped');
+      preparedCancellation = roulette.cancelPreparedRound(token, 'Shared room stopped');
     }
     if (sharedRound?.status === 'scheduled') sharedClient.cancelRound(sharedRound.roundId);
     if (sharedClient.role === 'host') sharedClient.closeRoom();
@@ -699,14 +732,17 @@ export function App({ roulette }: { roulette: Roulette }) {
     setSharedPreparedToken(null);
     sharedStartInFlightRef.current = false;
     setSharedPreparing(false);
+    setSharedCreating(false);
     setSharedError(null);
-    const restore = localNamesBeforeSharedRoom.current;
-    localNamesBeforeSharedRoom.current = null;
-    if (restore) {
-      setNames(restore.join('\n'));
-      roulette.setMarbles(restore);
-      writeLocalStorage(NAMES_STORAGE_KEY, restore.join(','));
+    if (preparedCancellation) {
+      void preparedCancellation.then(() => restoreLocalNamesIfSafe(false, true), () => undefined);
+    } else {
+      restoreLocalNamesIfSafe(false, true);
     }
+  };
+
+  const handleJoinRoomByCode = (roomCode: string) => {
+    window.location.assign(createRoomJoinUrl(roomCode));
   };
 
   const handleLeaveSharedRoom = () => {
@@ -722,22 +758,33 @@ export function App({ roulette }: { roulette: Roulette }) {
 
   const handleSharedStart = async () => {
     if (!sharedClient || sharedClient.role !== 'host' || sharedPreparing || sharedStartInFlightRef.current) return;
+    const requestId = sharedStartRequestRef.current + 1;
+    sharedStartRequestRef.current = requestId;
     sharedStartInFlightRef.current = true;
     if (sharedSnapshot) applySharedRoster(sharedSnapshot, true);
     setSharedPreparing(true);
-    setSettingsHidden(true);
     let preparedToken: string | null = null;
     try {
       const prepared = await roulette.prepareRoundForSharedStart();
       if (!prepared) throw new Error('The shared round could not be prepared');
       preparedToken = prepared.token;
+      if (sharedStartRequestRef.current !== requestId || !sharedStartInFlightRef.current) {
+        await roulette.cancelPreparedRound(prepared.token, 'Shared room stopped');
+        return;
+      }
       sharedPreparedTokenRef.current = prepared.token;
       setSharedPreparedToken(prepared.token);
       const round = await sharedClient.scheduleRound(prepared.replay);
+      if (sharedStartRequestRef.current !== requestId || !sharedStartInFlightRef.current) {
+        sharedClient.cancelRound(round.roundId);
+        await roulette.cancelPreparedRound(prepared.token, 'Shared room stopped');
+        return;
+      }
       setSharedRound(round);
       setSharedError(null);
     } catch (error) {
       if (preparedToken) await roulette.cancelPreparedRound(preparedToken, 'Shared round scheduling failed');
+      if (sharedStartRequestRef.current !== requestId) return;
       sharedPreparedTokenRef.current = null;
       setSharedPreparedToken(null);
       sharedStartInFlightRef.current = false;
@@ -785,6 +832,9 @@ export function App({ roulette }: { roulette: Roulette }) {
 
   const maps = roulette.getMaps();
   const onStart = () => {
+    if (!sharedClient && (roulette.roundState === 'ready' || roulette.roundState === 'finished')) {
+      restoreLocalNamesIfSafe(roulette.roundState === 'finished');
+    }
     if (!ready || (roulette.roundState !== 'ready' && roulette.roundState !== 'finished') || roulette.getCount() === 0)
       return;
     if (sharedClient?.role === 'host') {
@@ -875,6 +925,19 @@ export function App({ roulette }: { roulette: Roulette }) {
             onImport: (value) => void handleFairnessImport(value),
             onDelete: () => void handleFairnessDelete(),
           }}
+          sharingSettings={{
+            disabled: sharedCreating || (!sharedClient && roulette.roundState === 'running'),
+            active: sharedClient?.role === 'host',
+            creating: sharedCreating,
+            connectionStatus: sharedConnectionStatus,
+            participantCount: sharedSnapshot?.participants.length ?? 0,
+            error: sharedError,
+            onEnabled: (enabled) => {
+              if (enabled) void handleCreateSharedRoom();
+              else handleStopSharedRoom();
+            },
+            onJoinRoom: handleJoinRoomByCode,
+          }}
         />
         <ParticipantInput
           value={names}
@@ -901,17 +964,17 @@ export function App({ roulette }: { roulette: Roulette }) {
           onStart={onStart}
         />
       </div> : null}
-      <SharedRoomPanel
-        client={sharedClient}
-        snapshot={sharedSnapshot}
-        connectionStatus={sharedConnectionStatus}
-        roomCode={roomRouteActive ? initialRoomCode : null}
-        error={sharedError}
-        onCreate={() => void handleCreateSharedRoom()}
-        onJoin={(name) => void handleJoinSharedRoom(name)}
-        onStop={handleStopSharedRoom}
-        onLeave={handleLeaveSharedRoom}
-      />
+      {guestMode || sharedClient?.role === 'host' ? (
+        <SharedRoomPanel
+          client={sharedClient}
+          snapshot={sharedSnapshot}
+          connectionStatus={sharedConnectionStatus}
+          roomCode={roomRouteActive ? initialRoomCode : null}
+          error={sharedError}
+          onJoin={(name) => void handleJoinSharedRoom(name)}
+          onLeave={handleLeaveSharedRoom}
+        />
+      ) : null}
       <div className="copyright">
         <span className="copyright-owner">
           &copy; 2026 <a href="https://github.com/dltkddnr04">dltkddnr04</a>

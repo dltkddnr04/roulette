@@ -56,7 +56,6 @@ div.copyright a {
   vertical-align: middle;
 }
 
-.shared-room-local,
 .shared-room-host,
 .shared-room-guest {
   position: fixed;
@@ -71,7 +70,6 @@ div.copyright a {
   box-shadow: 0 8px 28px rgba(0, 0, 0, 0.35);
 }
 
-.shared-room-local button,
 .shared-room-host button,
 .shared-room-guest button {
   color: #fff;
@@ -122,11 +120,22 @@ div.copyright a {
 }
 
 .shared-room-code {
+  display: block;
   margin: 4px 0;
   font-size: 20px;
   font-weight: 700;
   letter-spacing: 0.14em;
   text-align: center;
+}
+
+.shared-room-entry-code {
+  text-align: center;
+}
+
+.shared-room-entry-code-label {
+  display: block;
+  color: #ddd;
+  font-size: 11px;
 }
 
 .shared-room-link {
@@ -186,6 +195,66 @@ div.copyright a {
 
 .shared-room-lobby p {
   margin: 10px 0;
+}
+
+.settings-sharing {
+  width: 100%;
+  min-width: 0;
+  color: white;
+}
+
+.settings-sharing-help {
+  margin: 8px 0 0;
+  color: #ddd;
+  font-size: 11px;
+}
+
+.settings-sharing-status {
+  margin-top: 8px;
+  padding-top: 8px;
+  border-top: 1px solid rgba(255, 255, 255, 0.28);
+  font-size: 12px;
+}
+
+.settings-sharing-join {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  margin-top: 12px;
+}
+
+.settings-sharing-join label {
+  color: white;
+  font-size: 12px;
+}
+
+.settings-sharing-join-controls {
+  display: flex;
+  gap: 6px;
+  min-width: 0;
+}
+
+.settings-sharing-join-controls input {
+  min-width: 0;
+  flex: 1 1 auto;
+  height: 28px;
+  padding: 4px 8px;
+  border: 0;
+  border-radius: 5px;
+  background: #999;
+  color: #111;
+  font-family: monospace;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.settings-sharing-join-controls button {
+  flex: 0 0 auto;
+}
+
+.settings-sharing-error {
+  margin: 8px 0 0;
+  font-size: 11px;
 }
 
 
@@ -325,7 +394,8 @@ div.copyright a {
 
     .settings-general,
     .settings-branding,
-    .settings-fairness {
+    .settings-fairness,
+    .settings-sharing {
       width: 100%;
       min-width: 0;
     }
@@ -433,7 +503,8 @@ div.copyright a {
     }
 
     .settings-row-sponsors,
-    .settings-row-fairness {
+    .settings-row-fairness,
+    .settings-row-sharing {
       .settings-row-label {
         width: auto;
         flex: 1 1 auto;
@@ -914,7 +985,8 @@ div.copyright a {
       }
 
       &.settings-row-sponsors,
-      &.settings-row-fairness {
+      &.settings-row-fairness,
+      &.settings-row-sharing {
         .settings-row-label {
           width: auto;
           flex: 1 1 auto;

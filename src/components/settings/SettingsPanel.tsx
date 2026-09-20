@@ -4,6 +4,8 @@ import type { FairnessSettingsProps } from './FairnessSettings';
 import { FairnessSettings } from './FairnessSettings';
 import type { GeneralSettingsProps } from './GeneralSettings';
 import { GeneralSettings } from './GeneralSettings';
+import type { SharingSettingsProps } from './SharingSettings';
+import { SharingSettings } from './SharingSettings';
 import { type SettingsTabDefinition, SettingsTabs } from './SettingsTabs';
 
 export type SettingsPanelProps = {
@@ -12,6 +14,7 @@ export type SettingsPanelProps = {
   generalSettings: GeneralSettingsProps;
   brandingSettings: BrandingSettingsProps;
   fairnessSettings: FairnessSettingsProps;
+  sharingSettings: SharingSettingsProps;
 };
 
 export function SettingsPanel({
@@ -20,6 +23,7 @@ export function SettingsPanel({
   generalSettings,
   brandingSettings,
   fairnessSettings,
+  sharingSettings,
 }: SettingsPanelProps) {
   const tabs: readonly SettingsTabDefinition[] = [
     {
@@ -31,6 +35,11 @@ export function SettingsPanel({
       id: 'fairness',
       label: 'Fairness',
       content: <FairnessSettings {...fairnessSettings} />,
+    },
+    {
+      id: 'sharing',
+      label: 'Sharing',
+      content: <SharingSettings {...sharingSettings} />,
     },
     {
       id: 'branding',

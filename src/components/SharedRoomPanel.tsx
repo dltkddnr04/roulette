@@ -13,9 +13,7 @@ export type SharedRoomPanelProps = {
   connectionStatus: SharedRoomConnectionStatus;
   roomCode: string | null;
   error: string | null;
-  onCreate: () => void;
   onJoin: (name: string) => void;
-  onStop: () => void;
   onLeave: () => void;
 };
 
@@ -40,8 +38,7 @@ function HostRoom({
   client,
   snapshot,
   connectionStatus,
-  onStop,
-}: Pick<SharedRoomPanelProps, 'client' | 'snapshot' | 'connectionStatus' | 'onStop'>) {
+}: Pick<SharedRoomPanelProps, 'client' | 'snapshot' | 'connectionStatus'>) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const joinUrl = client ? createRoomJoinUrl(client.roomCode) : '';
 
@@ -73,16 +70,18 @@ function HostRoom({
       <div className="shared-room-qr-wrap">
         <canvas ref={canvasRef} aria-label="Shared room join QR code" />
       </div>
-      <div className="shared-room-code">{client?.roomCode}</div>
+      <div className="shared-room-entry-code">
+        <span className="shared-room-entry-code-label" data-trans>
+          Entry code
+        </span>
+        <code className="shared-room-code">{client?.roomCode}</code>
+      </div>
       <div className="shared-room-link" title={joinUrl}>
         {joinUrl}
       </div>
       <div className="shared-room-actions">
         <button type="button" onClick={() => void copyLink()} data-trans>
           Copy link
-        </button>
-        <button type="button" onClick={onStop} data-trans>
-          Stop sharing
         </button>
       </div>
       <div className="shared-room-roster">
@@ -107,17 +106,16 @@ export function SharedRoomPanel({
   connectionStatus,
   roomCode,
   error,
-  onCreate,
   onJoin,
-  onStop,
   onLeave,
 }: SharedRoomPanelProps) {
   const [name, setName] = useState('');
-  const isGuest = client?.role === 'guest' || (roomCode !== null && client === null);
+  const guestRoomCode = roomCode ?? client?.roomCode ?? null;
+  const isGuest = client?.role === 'guest' || guestRoomCode !== null;
   const joined = Boolean(client?.currentParticipantId);
 
   if (client?.role === 'host') {
-    return <HostRoom client={client} snapshot={snapshot} connectionStatus={connectionStatus} onStop={onStop} />;
+    return <HostRoom client={client} snapshot={snapshot} connectionStatus={connectionStatus} />;
   }
 
   if (isGuest) {
@@ -128,7 +126,7 @@ export function SharedRoomPanel({
             <strong data-trans>Join shared room</strong>
             {client ? <ConnectionLabel status={connectionStatus} /> : null}
           </div>
-          <div className="shared-room-code">Room {roomCode}</div>
+          <div className="shared-room-code">Room {guestRoomCode}</div>
           <form
             onSubmit={(event) => {
               event.preventDefault();
@@ -178,12 +176,5 @@ export function SharedRoomPanel({
     );
   }
 
-  return (
-    <div className="shared-room-local">
-      <button type="button" onClick={onCreate} data-trans>
-        Share room
-      </button>
-      {error ? <p className="shared-room-error">{error}</p> : null}
-    </div>
-  );
+  return null;
 }
