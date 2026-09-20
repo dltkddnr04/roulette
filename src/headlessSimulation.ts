@@ -124,9 +124,32 @@ export function mapMarbleIdsToLabels(
   return mapping;
 }
 
-async function yieldToHost(): Promise<void> {
-  await new Promise<void>((resolve) => {
-    if (typeof setTimeout === 'function') setTimeout(resolve, 0);
-    else resolve();
+let hostYieldChannel: MessageChannel | null = null;
+const hostYieldWaiters: Array<() => void> = [];
+
+function getHostYieldChannel(): MessageChannel | null {
+  if (typeof MessageChannel !== 'function') return null;
+  if (hostYieldChannel) return hostYieldChannel;
+
+  const channel = new MessageChannel();
+  channel.port1.onmessage = () => {
+    hostYieldWaiters.shift()?.();
+  };
+  hostYieldChannel = channel;
+  return channel;
+}
+
+function yieldToHost(): Promise<void> {
+  const channel = getHostYieldChannel();
+  if (!channel) {
+    return new Promise<void>((resolve) => {
+      if (typeof setTimeout === 'function') setTimeout(resolve, 0);
+      else resolve();
+    });
+  }
+
+  return new Promise<void>((resolve) => {
+    hostYieldWaiters.push(resolve);
+    channel.port2.postMessage(undefined);
   });
 }
