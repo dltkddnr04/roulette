@@ -15,7 +15,7 @@ export interface DurableObjectStubLike {
 }
 
 export interface DurableObjectNamespaceLike {
-  idFromName(name: string): DurableObjectStubLike;
+  getByName(name: string): DurableObjectStubLike;
 }
 
 export interface Env {
@@ -89,7 +89,7 @@ async function createRoom(request: Request, env: Env): Promise<Response> {
     const expiresAt = Date.now() + SHARED_ROOM_TTL_MS;
     let response: Response;
     try {
-      const stub = env.ROOMS.idFromName(roomCode);
+      const stub = env.ROOMS.getByName(roomCode);
       const internalUrl = new URL('/internal/create', request.url);
       const internalRequest = new Request(internalUrl, {
         method: 'POST',
@@ -123,7 +123,7 @@ async function forwardWebSocket(request: Request, env: Env, roomCode: string): P
   }
 
   try {
-    const stub = env.ROOMS.idFromName(roomCode);
+    const stub = env.ROOMS.getByName(roomCode);
     const internalUrl = new URL('/ws', request.url);
     return await stub.fetch(new Request(internalUrl, request));
   } catch {
