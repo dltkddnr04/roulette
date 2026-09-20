@@ -1,6 +1,6 @@
 import QRCode from 'qrcode';
 import { useEffect, useRef, useState } from 'react';
-import type { RoomSnapshot } from '../sharedRoomProtocol';
+import type { RoomRoundStatus, RoomSnapshot } from '../sharedRoomProtocol';
 import {
   createRoomJoinUrl,
   type SharedRoomClient,
@@ -12,6 +12,8 @@ export type SharedRoomPanelProps = {
   snapshot: RoomSnapshot | null;
   connectionStatus: SharedRoomConnectionStatus;
   roomCode: string | null;
+  roundStatus: RoomRoundStatus | null;
+  playbackActive: boolean;
   error: string | null;
   onJoin: (name: string) => void;
   onLeave: () => void;
@@ -105,6 +107,8 @@ export function SharedRoomPanel({
   snapshot,
   connectionStatus,
   roomCode,
+  roundStatus,
+  playbackActive,
   error,
   onJoin,
   onLeave,
@@ -113,6 +117,7 @@ export function SharedRoomPanel({
   const guestRoomCode = roomCode ?? client?.roomCode ?? null;
   const isGuest = client?.role === 'guest' || guestRoomCode !== null;
   const joined = Boolean(client?.currentParticipantId);
+  const currentRoundStatus = roundStatus ?? snapshot?.scheduledRound?.status ?? null;
 
   if (client?.role === 'host') {
     return <HostRoom client={client} snapshot={snapshot} connectionStatus={connectionStatus} />;
@@ -151,6 +156,8 @@ export function SharedRoomPanel({
       );
     }
 
+    if (playbackActive) return null;
+
     return (
       <div className="shared-room-guest shared-room-lobby">
         <div className="shared-room-header">
@@ -161,9 +168,11 @@ export function SharedRoomPanel({
           <span data-trans>Joined as</span> {client?.currentDisplayName}
         </p>
         <p data-trans>
-          {snapshot?.scheduledRound?.status === 'running'
-            ? 'Round in progress — the next round will sync.'
-            : 'Waiting for the host to start the next round.'}
+          {currentRoundStatus === 'scheduled'
+            ? 'Starting…'
+            : currentRoundStatus === 'running'
+              ? "Round in progress — you'll join the next round."
+              : 'Waiting for the host to start the next round.'}
         </p>
         <p>
           <span data-trans>Participants</span>: {snapshot?.participants.length ?? 0}

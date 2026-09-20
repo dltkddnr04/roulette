@@ -114,6 +114,9 @@ export function App({ roulette }: { roulette: Roulette }) {
   const sharedStartInFlightRef = useRef(false);
   const sharedStartRequestRef = useRef(0);
   const guestResultRef = useRef<{ roundId: string; winners: string[] } | null>(null);
+  const guestPreparedRoundRef = useRef<string | null>(null);
+  const guestStartedRoundRef = useRef<string | null>(null);
+  const [guestPlaybackRoundId, setGuestPlaybackRoundId] = useState<string | null>(null);
   const guestMode = sharedClient?.role === 'guest' || roomRouteActive;
   const sharedControlsLocked =
     sharedPreparing || sharedRound?.status === 'scheduled' || sharedRound?.status === 'running';
@@ -204,23 +207,8 @@ export function App({ roulette }: { roulette: Roulette }) {
           break;
         case 'snapshot':
           setSharedSnapshot(detail.snapshot);
-          setSharedRound((current) => {
-            const next = detail.snapshot.scheduledRound ?? null;
-            if (
-              current &&
-              next &&
-              current.roundId === next.roundId &&
-              current.status === 'scheduled' &&
-              next.status === 'running'
-            ) {
-              return current;
-            }
-            return next;
-          });
+          setSharedRound(detail.snapshot.scheduledRound ?? null);
           if (sharedClient.role === 'host') applySharedRoster(detail.snapshot);
-          if (sharedClient.role === 'guest' && detail.snapshot.scheduledRound?.status === 'running') {
-            setSharedError('Round in progress — the next round will sync.');
-          }
           if (detail.snapshot.status !== 'open' || detail.snapshot.scheduledRound?.status === 'cancelled') {
             cancelLocalPreparation('The shared round is no longer active');
             setSharedRound(null);
@@ -232,9 +220,6 @@ export function App({ roulette }: { roulette: Roulette }) {
         case 'joined':
           setSharedSnapshot(detail.snapshot);
           setSharedRound(detail.snapshot.scheduledRound ?? null);
-          if (sharedClient.role === 'guest' && detail.snapshot.scheduledRound?.status === 'running') {
-            setSharedError('Round in progress — the next round will sync.');
-          }
           if (detail.snapshot.status !== 'open' || detail.snapshot.scheduledRound?.status === 'cancelled') {
             cancelLocalPreparation('The shared round is no longer active');
             setSharedRound(null);
@@ -248,9 +233,7 @@ export function App({ roulette }: { roulette: Roulette }) {
           setSharedError(null);
           break;
         case 'started':
-          setSharedRound((current) =>
-            current && current.roundId === detail.round.roundId && current.status === 'scheduled' ? current : detail.round,
-          );
+          setSharedRound(detail.round);
           break;
         case 'result':
           setSharedSnapshot(detail.snapshot);
@@ -734,6 +717,9 @@ export function App({ roulette }: { roulette: Roulette }) {
     setSharedPreparing(false);
     setSharedCreating(false);
     setSharedError(null);
+    guestPreparedRoundRef.current = null;
+    guestStartedRoundRef.current = null;
+    setGuestPlaybackRoundId(null);
     if (preparedCancellation) {
       void preparedCancellation.then(() => restoreLocalNamesIfSafe(false, true), () => undefined);
     } else {
@@ -753,6 +739,9 @@ export function App({ roulette }: { roulette: Roulette }) {
     setSharedSnapshot(null);
     setSharedRound(null);
     setSharedError(null);
+    guestPreparedRoundRef.current = null;
+    guestStartedRoundRef.current = null;
+    setGuestPlaybackRoundId(null);
     window.history.replaceState(null, '', `${window.location.pathname}${window.location.hash}`);
   };
 
@@ -794,21 +783,28 @@ export function App({ roulette }: { roulette: Roulette }) {
     }
   };
 
+  // The activation timer belongs to a round identity and deadline. Do not
+  // re-run it when the DO reports scheduled -> running; that update can arrive
+  // before the local deadline and must never cancel the local playback.
   useEffect(() => {
-    if (!ready || !sharedClient || !sharedRound || sharedRound.status !== 'scheduled') return;
-    if (sharedClient.role === 'guest' && sharedClient.getLocalStartTime(sharedRound.startAt) < Date.now() - 1000) {
+    const round = sharedRound;
+    if (!ready || !sharedClient || !round || round.status !== 'scheduled') return;
+    if (sharedClient.role === 'guest' && sharedClient.getLocalStartTime(round.startAt) < Date.now() - 1000) {
       setSharedError('Round in progress — the next round will sync.');
       return;
     }
     if (sharedClient.role === 'guest') {
-      try {
-        roulette.loadReplay(sharedRound.replay);
-      } catch (error) {
-        setSharedError(error instanceof Error ? error.message : 'Shared replay could not be loaded');
-        return;
+      if (guestPreparedRoundRef.current !== round.roundId) {
+        try {
+          roulette.loadReplay(round.replay);
+          guestPreparedRoundRef.current = round.roundId;
+        } catch (error) {
+          setSharedError(error instanceof Error ? error.message : 'Shared replay could not be loaded');
+          return;
+        }
       }
     }
-    const cancel = sharedClient.scheduleAt(sharedRound.startAt, () => {
+    const cancel = sharedClient.scheduleAt(round.startAt, () => {
       if (sharedClient.role === 'host') {
         const token = sharedPreparedTokenRef.current;
         if (token) {
@@ -822,13 +818,18 @@ export function App({ roulette }: { roulette: Roulette }) {
         sharedStartInFlightRef.current = false;
         setSharedPreparing(false);
       } else {
+        if (guestStartedRoundRef.current === round.roundId) return;
+        guestStartedRoundRef.current = round.roundId;
+        setGuestPlaybackRoundId(round.roundId);
         void Promise.resolve(roulette.start()).catch((error) => {
+          guestStartedRoundRef.current = null;
+          setGuestPlaybackRoundId((current) => (current === round.roundId ? null : current));
           setSharedError(error instanceof Error ? error.message : 'Shared round could not start');
         });
       }
     });
     return cancel;
-  }, [ready, roulette, sharedClient, sharedRound]);
+  }, [ready, roulette, sharedClient, sharedRound?.roundId, sharedRound?.startAt]);
 
   const maps = roulette.getMaps();
   const onStart = () => {
@@ -846,6 +847,8 @@ export function App({ roulette }: { roulette: Roulette }) {
       showToast(error instanceof Error ? error.message : 'The roulette could not start');
     });
   };
+
+  const activeSharedRoundId = sharedRound?.roundId ?? null;
 
   return (
     <div ref={rootRef}>
@@ -970,6 +973,8 @@ export function App({ roulette }: { roulette: Roulette }) {
           snapshot={sharedSnapshot}
           connectionStatus={sharedConnectionStatus}
           roomCode={roomRouteActive ? initialRoomCode : null}
+          roundStatus={sharedRound?.status ?? sharedSnapshot?.scheduledRound?.status ?? null}
+          playbackActive={guestPlaybackRoundId === activeSharedRoundId}
           error={sharedError}
           onJoin={(name) => void handleJoinSharedRoom(name)}
           onLeave={handleLeaveSharedRoom}
