@@ -243,6 +243,35 @@ div.copyright a {
   font-size: 12px;
 }
 
+.settings-sharing-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 10px;
+}
+
+.settings-sharing-actions a,
+.settings-sharing-actions button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 28px;
+  padding: 4px 8px;
+  border: 0;
+  border-radius: 5px;
+  background: #999;
+  color: #111;
+  font: inherit;
+  font-size: 11px;
+  text-decoration: none;
+  cursor: pointer;
+}
+
+.settings-sharing-actions a:hover,
+.settings-sharing-actions button:hover {
+  background: #bbb;
+}
+
 .settings-sharing-join {
   display: flex;
   flex-direction: column;

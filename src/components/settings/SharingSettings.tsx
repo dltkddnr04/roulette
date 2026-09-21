@@ -1,6 +1,6 @@
 import { Share2 } from 'lucide-react';
-import { useState, type FormEvent } from 'react';
-import type { SharedRoomConnectionStatus } from '../../sharedRoomClient';
+import { useEffect, useState, type FormEvent } from 'react';
+import { createRoomJoinUrl, type SharedRoomConnectionStatus } from '../../sharedRoomClient';
 import { SettingsRow } from './SettingsRow';
 import { SettingsToggle } from './SettingsToggle';
 
@@ -8,6 +8,7 @@ export type SharingSettingsProps = {
   disabled?: boolean;
   active: boolean;
   creating: boolean;
+  roomCode: string | null;
   connectionStatus: SharedRoomConnectionStatus;
   participantCount: number;
   error: string | null;
@@ -36,19 +37,37 @@ export function SharingSettings({
   disabled = false,
   active,
   creating,
+  roomCode: hostRoomCode,
   connectionStatus,
   participantCount,
   error,
   onEnabled,
   onJoinRoom,
 }: SharingSettingsProps) {
-  const [roomCode, setRoomCode] = useState('');
+  const [joinRoomCode, setJoinRoomCode] = useState('');
+  const [shareLinkCopied, setShareLinkCopied] = useState(false);
+  const shareUrl = hostRoomCode ? createRoomJoinUrl(hostRoomCode) : null;
+
+  useEffect(() => {
+    setShareLinkCopied(false);
+  }, [hostRoomCode]);
 
   const handleJoin = (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
-    const normalized = roomCode.replace(/\s+/g, '').toUpperCase();
+    const normalized = joinRoomCode.replace(/\s+/g, '').toUpperCase();
     if (!normalized) return;
     onJoinRoom(normalized);
+  };
+
+  const handleCopyShareLink = async () => {
+    if (!shareUrl) return;
+    try {
+      if (!navigator.clipboard?.writeText) throw new Error('Clipboard unavailable');
+      await navigator.clipboard.writeText(shareUrl);
+      setShareLinkCopied(true);
+    } catch {
+      window.prompt('Copy this share link', shareUrl);
+    }
   };
 
   return (
@@ -75,6 +94,20 @@ export function SharingSettings({
           <div>
             <span data-trans>Participants</span>: {participantCount}
           </div>
+          {shareUrl ? (
+            <div className="settings-sharing-actions">
+              <a href={shareUrl} target="_blank" rel="noopener noreferrer" data-trans>
+                Open participant page
+              </a>
+              <button
+                type="button"
+                onClick={() => void handleCopyShareLink()}
+                data-trans
+              >
+                {shareLinkCopied ? 'Copied' : 'Copy share link'}
+              </button>
+            </div>
+          ) : null}
           <p className="settings-sharing-help" data-trans>
             The QR code and entry code are shown in the top-right corner.
           </p>
@@ -91,15 +124,15 @@ export function SharingSettings({
             <div className="settings-sharing-join-controls">
               <input
                 id="inSharedRoomCode"
-                value={roomCode}
+                value={joinRoomCode}
                 maxLength={16}
                 autoComplete="off"
                 spellCheck={false}
                 placeholder="Entry code"
                 disabled={disabled || creating}
-                onChange={(event) => setRoomCode(event.currentTarget.value)}
+                onChange={(event) => setJoinRoomCode(event.currentTarget.value)}
               />
-              <button type="submit" disabled={disabled || creating || !roomCode.trim()} data-trans>
+              <button type="submit" disabled={disabled || creating || !joinRoomCode.trim()} data-trans>
                 Join
               </button>
             </div>

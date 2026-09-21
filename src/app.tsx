@@ -944,6 +944,7 @@ export function App({ roulette }: { roulette: Roulette }) {
             disabled: sharedCreating || (!sharedClient && roulette.roundState === 'running'),
             active: sharedClient?.role === 'host',
             creating: sharedCreating,
+            roomCode: sharedClient?.role === 'host' ? sharedClient.roomCode : null,
             connectionStatus: sharedConnectionStatus,
             participantCount: sharedSnapshot?.participants.length ?? 0,
             error: sharedError,
