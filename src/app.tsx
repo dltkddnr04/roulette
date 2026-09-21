@@ -15,7 +15,7 @@ import {
   type SharedRoomClientEvent,
   type SharedRoomConnectionStatus,
 } from './sharedRoomClient';
-import type { RoomSnapshot, ScheduledRound } from './sharedRoomProtocol';
+import type { RoomSnapshot, ScheduledRound, SharedPlaybackPatch } from './sharedRoomProtocol';
 import type { SponsorState } from './sponsorStore';
 import { getParticipantNames, normalizeParticipantNames } from './utils/participants';
 import { readLocalStorage, writeLocalStorage } from './utils/storage';
@@ -113,6 +113,7 @@ export function App({ roulette }: { roulette: Roulette }) {
   const toastTimer = useRef<number | null>(null);
   const settingsTimer = useRef<number | null>(null);
   const localNamesBeforeSharedRoom = useRef<string[] | null>(null);
+  const appliedSharedRosterKeyRef = useRef<string | null>(null);
   const reportedSharedRounds = useRef(new Set<string>());
   const sharedPreparedTokenRef = useRef<string | null>(null);
   const sharedStartInFlightRef = useRef(false);
@@ -120,6 +121,8 @@ export function App({ roulette }: { roulette: Roulette }) {
   const guestResultRef = useRef<{ roundId: string; winners: string[] } | null>(null);
   const guestPreparedRoundRef = useRef<string | null>(null);
   const guestStartedRoundRef = useRef<string | null>(null);
+  const sharedPlaybackRoundRef = useRef<string | null>(null);
+  const sharedPlaybackSequenceRef = useRef(-1);
   const [guestPlaybackRoundId, setGuestPlaybackRoundId] = useState<string | null>(null);
   const guestMode = sharedClient?.role === 'guest' || roomRouteActive;
   const sharedControlsLocked =
@@ -138,6 +141,30 @@ export function App({ roulette }: { roulette: Roulette }) {
       setToast(null);
     }, 1200);
   }, []);
+
+  const requestSharedPlaybackControl = useCallback(
+    (playback: SharedPlaybackPatch): void => {
+      if (!sharedClient || sharedClient.role !== 'host') return;
+      // React state can briefly lag the client's authoritative snapshot while
+      // a scheduled round transitions to running. Use the snapshot as a
+      // fallback so a host input never falls through to local-only control
+      // during an active shared round.
+      const round = sharedClient.currentSnapshot?.scheduledRound ?? sharedRound;
+      if (!round || (round.status !== 'scheduled' && round.status !== 'running')) return;
+      sharedClient.requestPlaybackControl(round.roundId, playback);
+    },
+    [sharedClient, sharedRound]
+  );
+
+  useEffect(() => {
+    if (!sharedClient) {
+      roulette.setPlaybackControlMode('local');
+    } else if (sharedClient.role === 'host') {
+      roulette.setPlaybackControlMode('shared-host', requestSharedPlaybackControl);
+    } else {
+      roulette.setPlaybackControlMode('shared-follower');
+    }
+  }, [requestSharedPlaybackControl, roulette, sharedClient]);
 
   useEffect(() => {
     return () => {
@@ -171,6 +198,11 @@ export function App({ roulette }: { roulette: Roulette }) {
       // next preparation.
       if (roulette.roundState !== 'ready' && !force) return;
       const participantNames = snapshot.participants.map((participant) => participant.displayName);
+      const rosterKey = snapshot.participants
+        .map((participant) => `${participant.participantId}:${participant.order}:${participant.displayName}`)
+        .join('\u0000');
+      if (!force && appliedSharedRosterKeyRef.current === rosterKey) return;
+      appliedSharedRosterKeyRef.current = rosterKey;
       setNames(participantNames.join('\n'));
       roulette.setMarbles(participantNames);
       writeLocalStorage(NAMES_STORAGE_KEY, participantNames.join(','));
@@ -239,6 +271,58 @@ export function App({ roulette }: { roulette: Roulette }) {
           break;
         case 'started':
           setSharedRound(detail.round);
+          if (sharedClient.getLocalStartTime(detail.round.startAt) <= Date.now()) {
+            // A background tab can throttle the final rAF used by scheduleAt.
+            // The DO's started message is the authoritative due-time signal;
+            // apply the same state here without cancelling the original timer.
+            sharedPlaybackRoundRef.current = detail.round.roundId;
+            sharedPlaybackSequenceRef.current = detail.round.playbackSequence;
+            roulette.applySharedPlaybackState(detail.round.playback);
+            if (
+              sharedClient.role === 'host' &&
+              sharedPreparedTokenRef.current
+            ) {
+              const token = sharedPreparedTokenRef.current;
+              if (!roulette.activatePreparedRound(token)) {
+                setSharedError('The shared round could not be activated');
+                void roulette.cancelPreparedRound(token, 'Shared round activation failed');
+              }
+              sharedPreparedTokenRef.current = null;
+              setSharedPreparedToken(null);
+              sharedStartInFlightRef.current = false;
+              setSharedPreparing(false);
+            } else if (
+              sharedClient.role === 'guest' &&
+              guestPreparedRoundRef.current === detail.round.roundId &&
+              guestStartedRoundRef.current !== detail.round.roundId
+            ) {
+              guestStartedRoundRef.current = detail.round.roundId;
+              setGuestPlaybackRoundId(detail.round.roundId);
+              void Promise.resolve(roulette.start()).catch((error) => {
+                guestStartedRoundRef.current = null;
+                setGuestPlaybackRoundId((current) => (current === detail.round.roundId ? null : current));
+                setSharedError(error instanceof Error ? error.message : 'Shared round could not start');
+              });
+            }
+          }
+          break;
+        case 'playback-control':
+          setSharedRound((current) => {
+            if (!current || current.roundId !== detail.roundId || detail.controlSequence <= current.playbackSequence) {
+              return current;
+            }
+            return {
+              ...current,
+              playback: detail.playback,
+              playbackEffectiveAt: detail.effectiveAt,
+              playbackSequence: detail.controlSequence,
+            };
+          });
+          if (sharedClient.getLocalStartTime(detail.effectiveAt) <= Date.now()) {
+            sharedPlaybackRoundRef.current = detail.roundId;
+            sharedPlaybackSequenceRef.current = detail.controlSequence;
+            roulette.applySharedPlaybackState(detail.playback);
+          }
           break;
         case 'result':
           setSharedSnapshot(detail.snapshot);
@@ -688,6 +772,7 @@ export function App({ roulette }: { roulette: Roulette }) {
     if (sharedCreating || sharedClient?.role === 'host' || roulette.roundState === 'running') return;
     setSharedCreating(true);
     setSharedError(null);
+    appliedSharedRosterKeyRef.current = null;
     localNamesBeforeSharedRoom.current = getParticipantNames(names);
     try {
       const client = await SharedRoomClient.createHost();
@@ -724,8 +809,11 @@ export function App({ roulette }: { roulette: Roulette }) {
     setSharedPreparing(false);
     setSharedCreating(false);
     setSharedError(null);
+    appliedSharedRosterKeyRef.current = null;
     guestPreparedRoundRef.current = null;
     guestStartedRoundRef.current = null;
+    sharedPlaybackRoundRef.current = null;
+    sharedPlaybackSequenceRef.current = -1;
     setGuestPlaybackRoundId(null);
     if (preparedCancellation) {
       void preparedCancellation.then(() => restoreLocalNamesIfSafe(false, true), () => undefined);
@@ -749,6 +837,8 @@ export function App({ roulette }: { roulette: Roulette }) {
     setSharedError(null);
     guestPreparedRoundRef.current = null;
     guestStartedRoundRef.current = null;
+    sharedPlaybackRoundRef.current = null;
+    sharedPlaybackSequenceRef.current = -1;
     setGuestPlaybackRoundId(null);
     if (roomCode) {
       window.location.assign(createRoomJoinUrl(roomCode));
@@ -775,7 +865,7 @@ export function App({ roulette }: { roulette: Roulette }) {
       }
       sharedPreparedTokenRef.current = prepared.token;
       setSharedPreparedToken(prepared.token);
-      const round = await sharedClient.scheduleRound(prepared.replay);
+      const round = await sharedClient.scheduleRound(prepared.replay, roulette.getPlaybackState());
       if (sharedStartRequestRef.current !== requestId || !sharedStartInFlightRef.current) {
         sharedClient.cancelRound(round.roundId);
         await roulette.cancelPreparedRound(prepared.token, 'Shared room stopped');
@@ -794,6 +884,30 @@ export function App({ roulette }: { roulette: Roulette }) {
       setSharedError(error instanceof Error ? error.message : 'Shared round could not be scheduled');
     }
   };
+
+  // Shared playback controls are scheduled in the room's server clock domain.
+  // The initial state is applied at startAt; later controls use their own
+  // future effectiveAt and are ignored once an older sequence has been seen.
+  useEffect(() => {
+    const round = sharedRound;
+    if (!ready || !sharedClient || !round || (round.status !== 'scheduled' && round.status !== 'running')) return;
+    if (sharedClient.role === 'guest' && guestStartedRoundRef.current !== round.roundId && round.status === 'running') {
+      return;
+    }
+    if (sharedPlaybackRoundRef.current !== round.roundId) {
+      sharedPlaybackRoundRef.current = round.roundId;
+      sharedPlaybackSequenceRef.current = -1;
+    }
+    if (round.playbackSequence <= sharedPlaybackSequenceRef.current) return;
+
+    const cancel = sharedClient.scheduleAt(round.playbackEffectiveAt, () => {
+      if (sharedPlaybackRoundRef.current !== round.roundId) return;
+      if (round.playbackSequence <= sharedPlaybackSequenceRef.current) return;
+      roulette.applySharedPlaybackState(round.playback);
+      sharedPlaybackSequenceRef.current = round.playbackSequence;
+    });
+    return cancel;
+  }, [ready, roulette, sharedClient, sharedRound?.roundId, sharedRound?.playbackEffectiveAt, sharedRound?.playbackSequence]);
 
   // The activation timer belongs to a round identity and deadline. Do not
   // re-run it when the DO reports scheduled -> running; that update can arrive
@@ -987,7 +1101,9 @@ export function App({ roulette }: { roulette: Roulette }) {
           connectionStatus={sharedConnectionStatus}
           roomCode={roomRouteActive ? initialRoomCode : null}
           roundStatus={sharedRound?.status ?? sharedSnapshot?.scheduledRound?.status ?? null}
-          playbackActive={guestPlaybackRoundId === activeSharedRoundId}
+          playbackActive={
+            guestPlaybackRoundId !== null && guestPlaybackRoundId === activeSharedRoundId
+          }
           guestSessionState={guestSessionState}
           error={sharedError}
           onLeave={handleLeaveSharedRoom}

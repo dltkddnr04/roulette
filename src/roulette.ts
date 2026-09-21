@@ -26,6 +26,7 @@ import type { UIObject } from './UIObject';
 import { bound } from './utils/bound.decorator';
 import type { Seed } from './utils/random';
 import { VideoRecorder } from './utils/videoRecorder';
+import type { SharedPlaybackPatch, SharedPlaybackState } from './sharedRoomProtocol';
 
 function sameStrings(left: readonly string[], right: readonly string[]): boolean {
   return left.length === right.length && left.every((value, index) => value === right[index]);
@@ -60,6 +61,8 @@ export type SharedPreparedRound = Readonly<{
   replay: ReplayDescriptor;
   generation: number;
 }>;
+export type PlaybackControlMode = 'local' | 'shared-host' | 'shared-follower';
+export type PlaybackControlRequest = (playback: SharedPlaybackPatch) => void;
 export type { RoundState } from './roundSession';
 export type {
   SimulationExpectation,
@@ -122,6 +125,8 @@ export class Roulette extends EventTarget {
   private _lastTime: number = 0;
 
   private _speed = 1;
+  private _playbackControlMode: PlaybackControlMode = 'local';
+  private _playbackControlRequest: PlaybackControlRequest | null = null;
 
   private _presentationEffects = new PresentationEffects();
 
@@ -161,7 +166,10 @@ export class Roulette extends EventTarget {
   }
 
   protected createFastForwader(): FastForwader {
-    return new FastForwader();
+    const fastForwarder = new FastForwader();
+    fastForwarder.setInputHandler((enabled) => this._handleFastForwardInput(enabled));
+    fastForwarder.setInputEnabled(this._playbackControlMode !== 'shared-follower');
+    return fastForwarder;
   }
 
   constructor(renderScale: RenderScale = 0.5, fairnessCoordinator = new FairnessCoordinator()) {
@@ -1247,8 +1255,13 @@ export class Roulette extends EventTarget {
   }
 
   public setSpeed(value: number) {
-    if (value <= 0) {
+    if (!Number.isFinite(value) || value <= 0) {
       throw new Error('Speed multiplier must larger than 0');
+    }
+    if (this._playbackControlMode === 'shared-follower') return;
+    if (this._playbackControlMode === 'shared-host') {
+      this._playbackControlRequest?.({ speed: value });
+      return;
     }
     this._speed = value;
   }
@@ -1269,6 +1282,22 @@ export class Roulette extends EventTarget {
 
   public getSpeed() {
     return this._speed;
+  }
+
+  public getPlaybackState(): SharedPlaybackState {
+    return { speed: this._speed, fastForward: this.getFastForward() };
+  }
+
+  public setPlaybackControlMode(mode: PlaybackControlMode, request?: PlaybackControlRequest | null): void {
+    this._playbackControlMode = mode;
+    this._playbackControlRequest = request ?? null;
+    this.fastForwarder?.setInputEnabled(mode !== 'shared-follower');
+  }
+
+  public applySharedPlaybackState(playback: SharedPlaybackState): void {
+    if (!Number.isFinite(playback.speed) || playback.speed <= 0 || typeof playback.fastForward !== 'boolean') return;
+    this._speed = playback.speed;
+    this.fastForwarder?.setEnabled(playback.fastForward);
   }
 
   public setSeed(seed: Seed) {
@@ -1452,11 +1481,25 @@ export class Roulette extends EventTarget {
   }
 
   public setFastForward(enabled: boolean): void {
+    if (this._playbackControlMode === 'shared-follower') return;
+    if (this._playbackControlMode === 'shared-host') {
+      this._playbackControlRequest?.({ fastForward: enabled });
+      return;
+    }
     this.fastForwarder?.setEnabled(enabled);
   }
 
   public getFastForward(): boolean {
     return this.fastForwarder?.enabled ?? false;
+  }
+
+  private _handleFastForwardInput(enabled: boolean): void {
+    if (this._playbackControlMode === 'shared-follower') return;
+    if (this._playbackControlMode === 'shared-host') {
+      this._playbackControlRequest?.({ fastForward: enabled });
+      return;
+    }
+    this.fastForwarder?.setEnabled(enabled);
   }
 
   public getSponsorState(): Promise<SponsorState> {

@@ -24,6 +24,8 @@ export class FastForwader implements UIObject {
   }
 
   private isEnabled: boolean = false;
+  private inputEnabled = true;
+  private inputHandler: ((enabled: boolean) => void) | null = null;
 
   public get speed(): number {
     return this.isEnabled ? 2 : 1;
@@ -35,6 +37,14 @@ export class FastForwader implements UIObject {
 
   public setEnabled(enabled: boolean): void {
     this.isEnabled = enabled;
+  }
+
+  public setInputEnabled(enabled: boolean): void {
+    this.inputEnabled = enabled;
+  }
+
+  public setInputHandler(handler: ((enabled: boolean) => void) | null): void {
+    this.inputHandler = handler;
   }
 
   update(_deltaTime: number): void {}
@@ -62,11 +72,14 @@ export class FastForwader implements UIObject {
   }
 
   onMouseDown?(e?: MouseEventArgs): void {
-    if (!e) return;
-    this.setEnabled(true);
+    if (!e || !this.inputEnabled) return;
+    if (this.inputHandler) this.inputHandler(true);
+    else this.setEnabled(true);
   }
 
   onMouseUp?(_e?: MouseEventArgs): void {
-    this.setEnabled(false);
+    if (!this.inputEnabled) return;
+    if (this.inputHandler) this.inputHandler(false);
+    else this.setEnabled(false);
   }
 }

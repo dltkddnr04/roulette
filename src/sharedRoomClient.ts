@@ -1,5 +1,7 @@
 import {
   SHARED_ROOM_PROTOCOL_VERSION,
+  type SharedPlaybackPatch,
+  type SharedPlaybackState,
   type ReplayDescriptor,
   type RoomParticipant,
   type RoomSnapshot,
@@ -17,6 +19,13 @@ export type SharedRoomClientEvent =
   | Readonly<{ type: 'joined'; participantId: string; snapshot: RoomSnapshot }>
   | Readonly<{ type: 'scheduled'; requestId: string; round: ScheduledRound }>
   | Readonly<{ type: 'started'; round: ScheduledRound }>
+  | Readonly<{
+      type: 'playback-control';
+      roundId: string;
+      controlSequence: number;
+      effectiveAt: number;
+      playback: SharedPlaybackState;
+    }>
   | Readonly<{ type: 'result'; result: RoomSnapshot['lastResult']; snapshot: RoomSnapshot }>
   | Readonly<{ type: 'cancelled'; roundId: string; reason: string; snapshot: RoomSnapshot }>
   | Readonly<{ type: 'closed'; reason: string; snapshot: RoomSnapshot }>
@@ -197,6 +206,7 @@ export class SharedRoomClient extends EventTarget {
   public async connect(): Promise<void> {
     if (this.disposed) throw new Error('Shared room client is closed');
     if (this.connectPromise) return this.connectPromise;
+    if (this.socket?.readyState === WebSocket.OPEN) return;
     this.setStatus(this.socket ? 'reconnecting' : 'connecting');
     this.connectPromise = new Promise<void>((resolve, reject) => {
       const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
@@ -206,6 +216,7 @@ export class SharedRoomClient extends EventTarget {
       this.sawSnapshot = false;
 
       socket.addEventListener('open', () => {
+        if (this.socket !== socket) return;
         this.setStatus('connected');
         this.sendHello();
         this.startClockSync();
@@ -214,10 +225,15 @@ export class SharedRoomClient extends EventTarget {
         this.handleMessage(event.data, resolve, reject);
       });
       socket.addEventListener('error', () => {
+        if (this.socket !== socket) return;
         if (!this.sawSnapshot) reject(new Error('Shared room connection failed'));
         this.setStatus('error');
       });
       socket.addEventListener('close', () => {
+        // A reconnect can replace an older socket in the DO. Its close event
+        // must not tear down the newer connection or schedule another
+        // reconnect, otherwise host replacement becomes a reconnect storm.
+        if (this.socket !== socket) return;
         this.stopClockSync();
         this.socket = null;
         this.connectPromise = null;
@@ -263,7 +279,7 @@ export class SharedRoomClient extends EventTarget {
     await this.connect();
   }
 
-  public async scheduleRound(replay: ReplayDescriptor): Promise<ScheduledRound> {
+  public async scheduleRound(replay: ReplayDescriptor, playback: SharedPlaybackState): Promise<ScheduledRound> {
     await this.connect();
     const requestId = randomId('schedule');
     let rejectSchedule!: (error: Error) => void;
@@ -272,13 +288,27 @@ export class SharedRoomClient extends EventTarget {
       this.pendingSchedules.set(requestId, { resolve, reject });
     });
     try {
-      this.send({ type: 'host.schedule', requestId, replay });
+      this.send({ type: 'host.schedule', requestId, replay, playback });
     } catch (error) {
       this.pendingSchedules.delete(requestId);
       rejectSchedule(error instanceof Error ? error : new Error('Shared room is not connected'));
       throw error;
     }
     return promise;
+  }
+
+  public requestPlaybackControl(roundId: string, playback: SharedPlaybackPatch): boolean {
+    try {
+      this.send({ type: 'host.playback-control', roundId, playback });
+      return true;
+    } catch (error) {
+      this.emit({
+        type: 'error',
+        code: 'connection_lost',
+        message: error instanceof Error ? error.message : 'Shared room connection was lost',
+      });
+      return false;
+    }
   }
 
   public reportResult(roundId: string, winners: readonly string[]): void {
@@ -416,14 +446,42 @@ export class SharedRoomClient extends EventTarget {
         resolve();
         break;
       case 'round.scheduled':
-        if (!this.acceptRound(message.round)) return;
-        this.emit({ type: 'scheduled', requestId: message.requestId, round: message.round });
-        this.pendingSchedules.get(message.requestId)?.resolve(message.round);
+        {
+          const round = this.mergeRoundPlayback(message.round);
+          if (!this.acceptRound(round)) return;
+          this.emit({ type: 'scheduled', requestId: message.requestId, round });
+          this.pendingSchedules.get(message.requestId)?.resolve(round);
+        }
         this.pendingSchedules.delete(message.requestId);
         break;
       case 'round.started':
-        if (!this.acceptRound(message.round)) return;
-        this.emit({ type: 'started', round: message.round });
+        {
+          const round = this.mergeRoundPlayback(message.round);
+          if (!this.acceptRound(round)) return;
+          this.emit({ type: 'started', round });
+        }
+        break;
+      case 'round.playback-control':
+        {
+          const snapshot = this.snapshot;
+          const current = snapshot?.scheduledRound;
+          if (!snapshot || !current || current.roundId !== message.roundId) return;
+          if (message.controlSequence <= current.playbackSequence) return;
+          const round: ScheduledRound = {
+            ...current,
+            playback: message.playback,
+            playbackEffectiveAt: message.effectiveAt,
+            playbackSequence: message.controlSequence,
+          };
+          this.snapshot = { ...snapshot, scheduledRound: round };
+          this.emit({
+            type: 'playback-control',
+            roundId: message.roundId,
+            controlSequence: message.controlSequence,
+            effectiveAt: message.effectiveAt,
+            playback: message.playback,
+          });
+        }
         break;
       case 'round.result':
         if (!this.acceptSnapshot(message.snapshot)) return;
@@ -487,6 +545,19 @@ export class SharedRoomClient extends EventTarget {
       cancelled: 2,
     };
     return statusRank[round.status] >= statusRank[current.status];
+  }
+
+  private mergeRoundPlayback(round: ScheduledRound): ScheduledRound {
+    const current = this.snapshot?.scheduledRound;
+    if (!current || current.roundId !== round.roundId || current.sequence !== round.sequence) return round;
+    return current.playbackSequence > round.playbackSequence
+      ? {
+          ...round,
+          playback: current.playback,
+          playbackEffectiveAt: current.playbackEffectiveAt,
+          playbackSequence: current.playbackSequence,
+        }
+      : round;
   }
 
   private updateOwnDisplayName(snapshot: RoomSnapshot): void {

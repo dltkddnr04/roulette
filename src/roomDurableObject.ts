@@ -10,10 +10,14 @@ import {
   SHARED_ROOM_MAX_REQUEST_ID_LENGTH,
   SHARED_ROOM_MAX_ROUND_ID_LENGTH,
   SHARED_ROOM_MAX_TOKEN_LENGTH,
+  SHARED_ROOM_LEGACY_PROTOCOL_VERSION,
+  SHARED_ROOM_CONTROL_LEAD_MS,
   SHARED_ROOM_PROTOCOL_VERSION,
   SHARED_ROOM_START_LEAD_MS,
   SHARED_ROOM_TTL_MS,
+  validateSharedPlaybackState,
   type ReplayDescriptor,
+  type SharedPlaybackState,
   type RoomClientMessage,
   type RoomParticipant,
   type RoomRoundResult,
@@ -47,6 +51,9 @@ type PersistedScheduledRound = {
   replay: ReplayDescriptor;
   startAt: number;
   status: ScheduledRound['status'];
+  playback: SharedPlaybackState;
+  playbackEffectiveAt: number;
+  playbackSequence: number;
 };
 
 type PersistedRoomState = {
@@ -223,6 +230,9 @@ function cloneRound(round: PersistedScheduledRound): ScheduledRound {
     replay: cloneReplay(round.replay),
     startAt: round.startAt,
     status: round.status,
+    playback: { ...round.playback },
+    playbackEffectiveAt: round.playbackEffectiveAt,
+    playbackSequence: round.playbackSequence,
   };
 }
 
@@ -237,12 +247,19 @@ function cloneResult(result: RoomRoundResult): RoomRoundResult {
 function parsePersistedRound(value: unknown): PersistedScheduledRound | undefined {
   if (!isRecord(value)) return undefined;
   const replay = validateRoomReplay(value.replay);
+  const playback = value.playback === undefined ? { speed: 1, fastForward: false } : validateSharedPlaybackState(value.playback);
+  const playbackEffectiveAt = value.playbackEffectiveAt === undefined ? value.startAt : value.playbackEffectiveAt;
+  const playbackSequence = value.playbackSequence === undefined ? 0 : value.playbackSequence;
   if (
     !isBoundedString(value.roundId, SHARED_ROOM_MAX_ROUND_ID_LENGTH) ||
     !isSafeInteger(value.sequence) ||
     value.sequence <= 0 ||
     !replay ||
     !isFiniteNumber(value.startAt) ||
+    !playback ||
+    !isFiniteNumber(playbackEffectiveAt) ||
+    !isSafeInteger(playbackSequence) ||
+    playbackSequence < 0 ||
     (value.status !== 'scheduled' &&
       value.status !== 'running' &&
       value.status !== 'finished' &&
@@ -256,6 +273,9 @@ function parsePersistedRound(value: unknown): PersistedScheduledRound | undefine
     replay,
     startAt: value.startAt,
     status: value.status,
+    playback,
+    playbackEffectiveAt,
+    playbackSequence,
   };
 }
 
@@ -274,7 +294,8 @@ function parsePersistedResult(value: unknown): RoomRoundResult | undefined {
 function parsePersistedState(value: unknown): PersistedRoomState | null {
   if (!isRecord(value)) return null;
   if (
-    value.protocolVersion !== SHARED_ROOM_PROTOCOL_VERSION ||
+    (value.protocolVersion !== SHARED_ROOM_PROTOCOL_VERSION &&
+      value.protocolVersion !== SHARED_ROOM_LEGACY_PROTOCOL_VERSION) ||
     !isValidRoomCode(value.roomCode) ||
     !isSafeInteger(value.revision) ||
     value.revision < 0 ||
@@ -637,6 +658,8 @@ export class RoomDurableObject {
     const attachment = this.getAttachment(socket);
     if (message.type === 'host.schedule') {
       await this.handleSchedule(socket, attachment, message);
+    } else if (message.type === 'host.playback-control') {
+      await this.handlePlaybackControl(socket, attachment, message);
     } else if (message.type === 'host.result') {
       await this.handleResult(socket, attachment, message);
     } else if (message.type === 'host.cancel') {
@@ -846,6 +869,9 @@ export class RoomDurableObject {
       replay: cloneReplay(replay),
       startAt: now + SHARED_ROOM_START_LEAD_MS,
       status: 'scheduled',
+      playback: { ...message.playback },
+      playbackEffectiveAt: now + SHARED_ROOM_START_LEAD_MS,
+      playbackSequence: 0,
     };
     state.nextSequence = sequence;
     state.scheduledRound = round;
@@ -858,6 +884,59 @@ export class RoomDurableObject {
 
     this.broadcast({ type: 'round.scheduled', requestId: message.requestId, round: cloneRound(round) });
     this.broadcast({ type: 'snapshot', snapshot: this.snapshot(state) });
+  }
+
+  private async handlePlaybackControl(
+    socket: RoomWebSocket,
+    attachment: SocketAttachment,
+    message: Extract<RoomClientMessage, { type: 'host.playback-control' }>,
+  ): Promise<void> {
+    if (!this.requireHost(socket, attachment)) return;
+    const state = this.readState();
+    if (!state) {
+      this.sendError(socket, 'room_not_found', 'Room was not found');
+      return;
+    }
+    const now = Date.now();
+    if (now >= state.expiresAt) {
+      await this.expireRoom(state);
+      this.sendError(socket, 'room_expired', 'Room has expired');
+      return;
+    }
+
+    const round = state.scheduledRound;
+    if (!round || round.roundId !== message.roundId) {
+      this.sendError(socket, 'round_not_found', 'Round was not found');
+      return;
+    }
+    if (round.status !== 'scheduled' && round.status !== 'running') {
+      this.sendError(socket, 'round_not_active', 'Round is not active');
+      return;
+    }
+
+    const playback = validateSharedPlaybackState({ ...round.playback, ...message.playback });
+    if (!playback) {
+      this.sendError(socket, 'invalid_playback', 'Playback state is invalid');
+      return;
+    }
+    if (playback.speed === round.playback.speed && playback.fastForward === round.playback.fastForward) return;
+
+    const effectiveAt = Math.max(now + SHARED_ROOM_CONTROL_LEAD_MS, round.startAt);
+    round.playback = playback;
+    round.playbackEffectiveAt = effectiveAt;
+    round.playbackSequence += 1;
+    state.revision += 1;
+    state.updatedAt = now;
+    refreshRoomExpiry(state, now);
+    this.writeState(state);
+    await this.scheduleAlarm(state);
+    this.broadcast({
+      type: 'round.playback-control',
+      roundId: round.roundId,
+      controlSequence: round.playbackSequence,
+      effectiveAt,
+      playback: { ...playback },
+    });
   }
 
   private async handleResult(

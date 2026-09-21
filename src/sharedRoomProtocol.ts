@@ -5,10 +5,13 @@
  * is safe to bundle in both a browser and a Cloudflare Worker.
  */
 
-export const SHARED_ROOM_PROTOCOL_VERSION = 1 as const;
+export const SHARED_ROOM_PROTOCOL_VERSION = 2 as const;
+export const SHARED_ROOM_LEGACY_PROTOCOL_VERSION = 1 as const;
 export const SHARED_ROOM_REPLAY_VERSION = 1 as const;
 export const SHARED_ROOM_TTL_MS = 24 * 60 * 60 * 1000;
 export const SHARED_ROOM_START_LEAD_MS = 1500;
+export const SHARED_ROOM_CONTROL_LEAD_MS = 150;
+export const SHARED_ROOM_MAX_PLAYBACK_SPEED = 8;
 
 export const SHARED_ROOM_MAX_PARTICIPANTS = 1000;
 export const SHARED_ROOM_MAX_PARTICIPANT_STRING_LENGTH = 256;
@@ -23,6 +26,13 @@ const PARTICIPANT_PATTERN = /^\s*([^/*]+?)(?:(?:\/([0-9]+)(?:\*([0-9]+))?)|(?:\*
 
 export type SharedRoomProtocolVersion = typeof SHARED_ROOM_PROTOCOL_VERSION;
 export type SharedRoomReplayVersion = typeof SHARED_ROOM_REPLAY_VERSION;
+
+export type SharedPlaybackState = Readonly<{
+  speed: number;
+  fastForward: boolean;
+}>;
+
+export type SharedPlaybackPatch = Readonly<Partial<SharedPlaybackState>>;
 
 export type ReplayDescriptor = Readonly<{
   version: SharedRoomReplayVersion;
@@ -52,6 +62,9 @@ export type ScheduledRound = Readonly<{
   replay: ReplayDescriptor;
   startAt: number;
   status: RoomRoundStatus;
+  playback: SharedPlaybackState;
+  playbackEffectiveAt: number;
+  playbackSequence: number;
 }>;
 
 export type RoomRoundResult = Readonly<{
@@ -94,6 +107,13 @@ export type RoomHostScheduleMessage = Readonly<{
   type: 'host.schedule';
   requestId: string;
   replay: ReplayDescriptor;
+  playback: SharedPlaybackState;
+}>;
+
+export type RoomHostPlaybackControlMessage = Readonly<{
+  type: 'host.playback-control';
+  roundId: string;
+  playback: SharedPlaybackPatch;
 }>;
 
 export type RoomHostResultMessage = Readonly<{
@@ -120,6 +140,7 @@ export type RoomClientMessage =
   | RoomHelloMessage
   | RoomPingMessage
   | RoomHostScheduleMessage
+  | RoomHostPlaybackControlMessage
   | RoomHostResultMessage
   | RoomHostCancelMessage
   | RoomHostCloseMessage
@@ -146,6 +167,14 @@ export type RoomRoundScheduledMessage = Readonly<{
 export type RoomRoundStartedMessage = Readonly<{
   type: 'round.started';
   round: ScheduledRound;
+}>;
+
+export type RoomRoundPlaybackControlMessage = Readonly<{
+  type: 'round.playback-control';
+  roundId: string;
+  controlSequence: number;
+  effectiveAt: number;
+  playback: SharedPlaybackState;
 }>;
 
 export type RoomRoundResultMessage = Readonly<{
@@ -191,6 +220,7 @@ export type RoomServerMessage =
   | RoomJoinedMessage
   | RoomRoundScheduledMessage
   | RoomRoundStartedMessage
+  | RoomRoundPlaybackControlMessage
   | RoomRoundResultMessage
   | RoomRoundCancelledMessage
   | RoomClosedMessage
@@ -248,6 +278,46 @@ function copyReplay(replay: ReplayDescriptor): ReplayDescriptor {
     },
     skillsEnabled: replay.skillsEnabled,
   };
+}
+
+const DEFAULT_SHARED_PLAYBACK: SharedPlaybackState = Object.freeze({
+  speed: 1,
+  fastForward: false,
+});
+
+export function validateSharedPlaybackState(value: unknown): SharedPlaybackState | null {
+  if (!isRecord(value)) return null;
+  if (
+    !isFiniteNumber(value.speed) ||
+    value.speed <= 0 ||
+    value.speed > SHARED_ROOM_MAX_PLAYBACK_SPEED ||
+    typeof value.fastForward !== 'boolean'
+  ) {
+    return null;
+  }
+  return { speed: value.speed, fastForward: value.fastForward };
+}
+
+export function validateSharedPlaybackPatch(value: unknown): SharedPlaybackPatch | null {
+  if (!isRecord(value)) return null;
+  if (value.speed === undefined && value.fastForward === undefined) return null;
+  if (
+    (value.speed !== undefined &&
+      (!isFiniteNumber(value.speed) ||
+        value.speed <= 0 ||
+        value.speed > SHARED_ROOM_MAX_PLAYBACK_SPEED)) ||
+    (value.fastForward !== undefined && typeof value.fastForward !== 'boolean')
+  ) {
+    return null;
+  }
+  return {
+    ...(value.speed !== undefined ? { speed: value.speed } : {}),
+    ...(value.fastForward !== undefined ? { fastForward: value.fastForward } : {}),
+  };
+}
+
+function copyPlayback(playback: SharedPlaybackState): SharedPlaybackState {
+  return { speed: playback.speed, fastForward: playback.fastForward };
 }
 
 function parseReplayParticipant(value: unknown): { value: string; count: number } | null {
@@ -453,12 +523,19 @@ function parseRoomSnapshot(value: unknown): RoomSnapshot | null {
 function parseScheduledRound(value: unknown): ScheduledRound | null {
   if (!isRecord(value)) return null;
   const replay = validateRoomReplay(value.replay);
+  const playback = value.playback === undefined ? DEFAULT_SHARED_PLAYBACK : validateSharedPlaybackState(value.playback);
+  const playbackEffectiveAt = value.playbackEffectiveAt === undefined ? value.startAt : value.playbackEffectiveAt;
+  const playbackSequence = value.playbackSequence === undefined ? 0 : value.playbackSequence;
   if (
     !isValidRoundId(value.roundId) ||
     !isSafeInteger(value.sequence) ||
     value.sequence <= 0 ||
     !replay ||
     !isFiniteNumber(value.startAt) ||
+    !playback ||
+    !isFiniteNumber(playbackEffectiveAt) ||
+    !isSafeInteger(playbackSequence) ||
+    playbackSequence < 0 ||
     (value.status !== 'scheduled' &&
       value.status !== 'running' &&
       value.status !== 'finished' &&
@@ -472,6 +549,9 @@ function parseScheduledRound(value: unknown): ScheduledRound | null {
     replay: copyReplay(replay),
     startAt: value.startAt,
     status: value.status,
+    playback: copyPlayback(playback),
+    playbackEffectiveAt,
+    playbackSequence,
   };
 }
 
@@ -501,8 +581,19 @@ export function parseRoomClientMessage(value: unknown): RoomClientMessage | null
   }
   if (value.type === 'host.schedule') {
     const replay = validateRoomReplay(value.replay);
-    if (!isValidRequestId(value.requestId) || !replay) return null;
-    return { type: 'host.schedule', requestId: value.requestId, replay: copyReplay(replay) };
+    const playback = validateSharedPlaybackState(value.playback);
+    if (!isValidRequestId(value.requestId) || !replay || !playback) return null;
+    return {
+      type: 'host.schedule',
+      requestId: value.requestId,
+      replay: copyReplay(replay),
+      playback: copyPlayback(playback),
+    };
+  }
+  if (value.type === 'host.playback-control') {
+    const playback = validateSharedPlaybackPatch(value.playback);
+    if (!isValidRoundId(value.roundId) || !playback) return null;
+    return { type: 'host.playback-control', roundId: value.roundId, playback };
   }
   if (value.type === 'host.result') {
     const requestId = parseRequestId(value.requestId);
@@ -544,6 +635,25 @@ export function parseRoomServerMessage(value: unknown): RoomServerMessage | null
   if (value.type === 'round.started') {
     const round = parseScheduledRound(value.round);
     return round && round.status === 'running' ? { type: 'round.started', round } : null;
+  }
+  if (value.type === 'round.playback-control') {
+    const playback = validateSharedPlaybackState(value.playback);
+    if (
+      !isValidRoundId(value.roundId) ||
+      !isSafeInteger(value.controlSequence) ||
+      value.controlSequence <= 0 ||
+      !isFiniteNumber(value.effectiveAt) ||
+      !playback
+    ) {
+      return null;
+    }
+    return {
+      type: 'round.playback-control',
+      roundId: value.roundId,
+      controlSequence: value.controlSequence,
+      effectiveAt: value.effectiveAt,
+      playback: copyPlayback(playback),
+    };
   }
   if (value.type === 'round.result') {
     const result = parseRoomRoundResult(value.result);
