@@ -2,7 +2,7 @@ import type { ChangeEvent } from 'react';
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { ParticipantInput } from './components/settings/ParticipantInput';
 import { SettingsPanel } from './components/settings/SettingsPanel';
-import { SharedRoomPanel } from './components/SharedRoomPanel';
+import { SharedRoomPanel, type SharedRoomGuestSessionState } from './components/SharedRoomPanel';
 import type { EditedRange, WinnerType } from './components/settings/WinnerSettings';
 import type { FairnessState } from './fairness';
 import { translateElement, translateTree } from './localization';
@@ -77,6 +77,10 @@ export function App({ roulette }: { roulette: Roulette }) {
   const [sharedClient, setSharedClient] = useState<SharedRoomClient | null>(() =>
     initialRoomCode ? SharedRoomClient.forGuest(initialRoomCode) : SharedRoomClient.restoreHost()
   );
+  const [guestSessionState, setGuestSessionState] = useState<SharedRoomGuestSessionState>(() => {
+    if (sharedClient?.role !== 'guest') return 'joined';
+    return sharedClient.currentParticipantId ? 'restoring' : 'error';
+  });
   const [sharedSnapshot, setSharedSnapshot] = useState<RoomSnapshot | null>(() =>
     sharedClient?.currentSnapshot ?? null
   );
@@ -218,6 +222,7 @@ export function App({ roulette }: { roulette: Roulette }) {
           }
           break;
         case 'joined':
+          if (sharedClient.role === 'guest') setGuestSessionState('joined');
           setSharedSnapshot(detail.snapshot);
           setSharedRound(detail.snapshot.scheduledRound ?? null);
           if (detail.snapshot.status !== 'open' || detail.snapshot.scheduledRound?.status === 'cancelled') {
@@ -261,6 +266,7 @@ export function App({ roulette }: { roulette: Roulette }) {
           setSettingsHidden(false);
           break;
         case 'closed':
+          if (sharedClient.role === 'guest') setGuestSessionState('error');
           cancelLocalPreparation(`Shared room closed: ${detail.reason}`);
           setSharedSnapshot(detail.snapshot);
           setSharedRound(null);
@@ -271,6 +277,7 @@ export function App({ roulette }: { roulette: Roulette }) {
           setSettingsHidden(false);
           break;
         case 'error':
+          if (sharedClient.role === 'guest') setGuestSessionState('error');
           cancelLocalPreparation(detail.message);
           sharedStartInFlightRef.current = false;
           setSharedError(detail.message);
@@ -286,34 +293,44 @@ export function App({ roulette }: { roulette: Roulette }) {
       setSharedRound(sharedClient.currentSnapshot.scheduledRound ?? null);
       if (sharedClient.role === 'host') applySharedRoster(sharedClient.currentSnapshot);
     }
-    if (sharedClient.role === 'host' && sharedClient.status === 'idle') {
-      void sharedClient
-        .connect()
-        .then(() => {
-          const restoredRound = sharedClient.currentSnapshot?.scheduledRound;
-          if (restoredRound?.status === 'running' && sharedPreparedTokenRef.current) {
-            const token = sharedPreparedTokenRef.current;
-            if (roulette.activatePreparedRound(token)) {
-              sharedPreparedTokenRef.current = null;
-              setSharedPreparedToken(null);
-              sharedStartInFlightRef.current = false;
-              setSharedPreparing(false);
-            } else {
+    if (sharedClient.status === 'idle') {
+      if (sharedClient.role === 'host') {
+        void sharedClient
+          .connect()
+          .then(() => {
+            const restoredRound = sharedClient.currentSnapshot?.scheduledRound;
+            if (restoredRound?.status === 'running' && sharedPreparedTokenRef.current) {
+              const token = sharedPreparedTokenRef.current;
+              if (roulette.activatePreparedRound(token)) {
+                sharedPreparedTokenRef.current = null;
+                setSharedPreparedToken(null);
+                sharedStartInFlightRef.current = false;
+                setSharedPreparing(false);
+              } else {
+                sharedClient.cancelRound(restoredRound.roundId);
+                setSharedError('The previous shared round was cancelled after reconnect.');
+              }
+            } else if (
+              restoredRound &&
+              (restoredRound.status === 'scheduled' || restoredRound.status === 'running') &&
+              !sharedPreparedTokenRef.current
+            ) {
               sharedClient.cancelRound(restoredRound.roundId);
               setSharedError('The previous shared round was cancelled after reconnect.');
             }
-          } else if (
-            restoredRound &&
-            (restoredRound.status === 'scheduled' || restoredRound.status === 'running') &&
-            !sharedPreparedTokenRef.current
-          ) {
-            sharedClient.cancelRound(restoredRound.roundId);
-            setSharedError('The previous shared round was cancelled after reconnect.');
-          }
-        })
-        .catch((error) => {
+          })
+          .catch((error) => {
+            setSharedError(error instanceof Error ? error.message : 'Shared room could not reconnect');
+          });
+      } else {
+        // A playback-page guest is constructed from the stored participant
+        // session. Resume it after the room listener is installed so the
+        // joined snapshot can drive the existing replay scheduler.
+        void sharedClient.connect().catch((error) => {
+          setGuestSessionState('error');
           setSharedError(error instanceof Error ? error.message : 'Shared room could not reconnect');
         });
+      }
     }
     return () => sharedClient.removeEventListener('room', onRoom);
   }, [applySharedRoster, roulette, sharedClient, showToast]);
@@ -970,6 +987,7 @@ export function App({ roulette }: { roulette: Roulette }) {
           roomCode={roomRouteActive ? initialRoomCode : null}
           roundStatus={sharedRound?.status ?? sharedSnapshot?.scheduledRound?.status ?? null}
           playbackActive={guestPlaybackRoundId === activeSharedRoundId}
+          guestSessionState={guestSessionState}
           error={sharedError}
           onLeave={handleLeaveSharedRoom}
         />

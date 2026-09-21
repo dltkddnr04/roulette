@@ -14,9 +14,12 @@ export type SharedRoomPanelProps = {
   roomCode: string | null;
   roundStatus: RoomRoundStatus | null;
   playbackActive: boolean;
+  guestSessionState: SharedRoomGuestSessionState;
   error: string | null;
   onLeave: () => void;
 };
+
+export type SharedRoomGuestSessionState = 'restoring' | 'joined' | 'error';
 
 function ConnectionLabel({ status }: { status: SharedRoomConnectionStatus }) {
   switch (status) {
@@ -68,12 +71,13 @@ export function SharedRoomPanel({
   roomCode,
   roundStatus,
   playbackActive,
+  guestSessionState,
   error,
   onLeave,
 }: SharedRoomPanelProps) {
   const guestRoomCode = roomCode ?? client?.roomCode ?? null;
   const isGuest = client?.role === 'guest' || guestRoomCode !== null;
-  const joined = Boolean(client?.currentParticipantId);
+  const joined = guestSessionState === 'joined';
   const currentRoundStatus = roundStatus ?? snapshot?.scheduledRound?.status ?? null;
 
   if (client?.role === 'host') {
@@ -88,7 +92,9 @@ export function SharedRoomPanel({
             <strong data-trans>Shared room</strong>
             {client ? <ConnectionLabel status={connectionStatus} /> : null}
           </div>
-          <p data-trans>Restoring participant session…</p>
+          <p data-trans>
+            {guestSessionState === 'restoring' ? 'Restoring participant session…' : 'Participant session is not active.'}
+          </p>
           {error ? <p className="shared-room-error">{error}</p> : null}
           {guestRoomCode ? (
             <button type="button" onClick={onLeave} data-trans>
