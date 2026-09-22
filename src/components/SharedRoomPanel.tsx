@@ -1,5 +1,5 @@
 import QRCode from 'qrcode';
-import { useEffect, useRef } from 'react';
+import { useEffect, useState } from 'react';
 import type { RoomRoundStatus, RoomSnapshot } from '../sharedRoomProtocol';
 import {
   createRoomJoinUrl,
@@ -41,23 +41,39 @@ function ConnectionLabel({ status }: { status: SharedRoomConnectionStatus }) {
 function HostRoom({
   client,
 }: Pick<SharedRoomPanelProps, 'client'>) {
-  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const [qrUrl, setQrUrl] = useState<string | null>(null);
   const joinUrl = client ? createRoomJoinUrl(client.roomCode) : '';
 
   useEffect(() => {
-    if (!canvasRef.current || !joinUrl) return;
-    void QRCode.toCanvas(canvasRef.current, joinUrl, {
+    if (!joinUrl) {
+      setQrUrl(null);
+      return;
+    }
+    let cancelled = false;
+    setQrUrl(null);
+    void QRCode.toDataURL(joinUrl, {
       errorCorrectionLevel: 'M',
       margin: 3,
       width: 220,
       color: { dark: '#111111', light: '#ffffff' },
-    }).catch(() => undefined);
+    }).then((dataUrl) => {
+      if (!cancelled) setQrUrl(dataUrl);
+    }).catch(() => {
+      if (!cancelled) setQrUrl(null);
+    });
+    return () => {
+      cancelled = true;
+    };
   }, [joinUrl]);
 
   return (
     <div className="shared-room-host" aria-label="Shared room join code">
       <div className="shared-room-qr-wrap">
-        <canvas ref={canvasRef} aria-label="Shared room join QR code" />
+        {qrUrl ? (
+          <img src={qrUrl} width="220" height="220" alt="Shared room join QR code" />
+        ) : (
+          <span className="shared-room-qr-placeholder" aria-hidden="true" />
+        )}
       </div>
       <code className="shared-room-code">{client?.roomCode}</code>
     </div>

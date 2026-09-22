@@ -111,10 +111,15 @@ div.copyright a {
   background: #fff;
 }
 
-.shared-room-qr-wrap canvas {
-  position: static;
+.shared-room-qr-wrap img,
+.shared-room-qr-placeholder {
+  display: block;
   width: 220px;
   height: 220px;
+}
+
+.shared-room-qr-placeholder {
+  background: #fff;
 }
 
 .shared-room-code {
